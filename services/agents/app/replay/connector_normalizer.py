@@ -35,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -49,6 +50,27 @@ __all__ = ["PrenormalizedRows", "fetch_normalized", "row_key"]
 
 _SERVICE_URL = os.getenv("CONNECTORS_SERVICE_URL", "http://connectors:8003")
 _TIMEOUT_S = float(os.getenv("AISOC_REPLAY_NORMALIZE_TIMEOUT_S", "60"))
+
+#: The connectors service mounts its router under this prefix
+#: (``app/main.py``: ``include_router(router, prefix="/api/v1")``), and
+#: ``CONNECTORS_SERVICE_URL`` is the bare origin. The API's own caller in
+#: ``endpoints/connectors.py`` appends the same segment for the same reason.
+#:
+#: Connector ids are registry keys: lowercase letters, digits and underscores.
+#: The id reaches this module from a request body, and it is interpolated into
+#: a URL path, so it is validated against that shape before it gets there
+#: rather than encoded after. Encoding would make `../../admin` a literal
+#: segment that 404s; refusing says which value was wrong, and a value outside
+#: this shape could never name a real connector anyway.
+_CONNECTOR_ID_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+
+#: This was wrong when the route shipped: the URL was built without it, so
+#: every normalize request would have 404'd. Nothing called this path until
+#: Phase 1.4 wired the CLI to it, which is the failure shape this program
+#: keeps finding - a mechanism that exists, is unit-tested, and has no caller
+#: on the path that needs it. ``test_the_normalize_url_matches_where_the_route_is_mounted``
+#: pins it against the connectors service's own mount.
+_API_PREFIX = "/api/v1"
 
 
 def row_key(row: Mapping[str, Any]) -> str:
@@ -96,6 +118,11 @@ async def fetch_normalized(
     to measure, and continuing with partial coverage would publish a number
     over whichever rows happened to succeed.
     """
+    if not _CONNECTOR_ID_RE.match(connector_id):
+        raise NormalizerUnavailable(
+            f"{connector_id!r} is not a connector id. Ids are lowercase letters, digits and "
+            f"underscores, and this one reaches a URL path, so it is refused rather than escaped."
+        )
     if not rows:
         return PrenormalizedRows({}, connector_id=connector_id)
 
@@ -107,7 +134,7 @@ async def fetch_normalized(
             "and replay cannot reach the production normalizer"
         )
 
-    url = f"{base}/connectors/{connector_id}/normalize"
+    url = f"{base}{_API_PREFIX}/connectors/{connector_id}/normalize"
     payload = {"rows": [dict(row) for row in rows]}
     # A service token must declare the tenant it acts for; the connectors
     # service refuses one that does not. The tenant comes from the caller's

@@ -22,13 +22,20 @@ on:
       - "services/**"
       - "scripts/check_route_tenant_scope.py"
       - "scripts/check_route_auth.py"
+      - "scripts/check_route_authz.py"
+      - "scripts/check_route_shadowing.py"
       - "scripts/check_tenant_query_predicates.py"
+      - "scripts/check_text_bind_casts.py"
+      - "scripts/check_one_case_table.py"
       - "scripts/sync_vendored_tenant_scope.py"
       # The runtime-DB-role gate reads these, so a change to any of them has
       # to re-run it. A gate whose inputs are outside its own path filter is
       # a gate that stops running exactly when somebody edits what it checks.
       - "scripts/check_runtime_db_role.py"
       - "scripts/check_rls_policy_shape.py"
+      - "scripts/check_scim_contract.py"
+      - "scripts/check_role_grant_scope.py"
+      - "scripts/check_whitelabel_metering.py"
       - "docker-compose.yml"
       - "infra/**"
       - ".env.example"
@@ -40,13 +47,20 @@ on:
       - "services/**"
       - "scripts/check_route_tenant_scope.py"
       - "scripts/check_route_auth.py"
+      - "scripts/check_route_authz.py"
+      - "scripts/check_route_shadowing.py"
       - "scripts/check_tenant_query_predicates.py"
+      - "scripts/check_text_bind_casts.py"
+      - "scripts/check_one_case_table.py"
       - "scripts/sync_vendored_tenant_scope.py"
       # The runtime-DB-role gate reads these, so a change to any of them has
       # to re-run it. A gate whose inputs are outside its own path filter is
       # a gate that stops running exactly when somebody edits what it checks.
       - "scripts/check_runtime_db_role.py"
       - "scripts/check_rls_policy_shape.py"
+      - "scripts/check_scim_contract.py"
+      - "scripts/check_role_grant_scope.py"
+      - "scripts/check_whitelabel_metering.py"
       - "docker-compose.yml"
       - "infra/**"
       - ".env.example"
@@ -147,6 +161,31 @@ jobs:
       - name: Every route authenticates or records why it is public
         run: python scripts/check_route_auth.py
 
+      # Authentication is not authorization. Every route in `remediation.py`
+      # passed the gate above and a `viewer` could still raise the tenant's
+      # autonomy tier to L4 and pre-approve a high blast-radius verb
+      # (GHSA-wj5c-88hg-5926). This asks the other question.
+      - name: Route-authz gate self-test (detects a removed permission)
+        run: python scripts/check_route_authz.py --self-test
+
+      - name: Identity-only write-route inventory
+        run: python scripts/check_route_authz.py --inventory
+
+      - name: State-changing routes that authorize do not decrease
+        run: python scripts/check_route_authz.py
+
+      # A route can authenticate perfectly and still never run. `DELETE
+      # /autonomy-policy/grants` sat behind `DELETE /{action}` from the day it
+      # shipped, so an operator could earn an autonomy grant and had no
+      # working path to hand it back. This is the breadth half of that check;
+      # the fidelity half builds the app and sends a request for every
+      # published operation (services/api/tests/test_route_shadowing.py).
+      - name: Route-shadowing gate self-test (the defect, and four near misses)
+        run: python scripts/check_route_shadowing.py --self-test
+
+      - name: No literal route is unreachable behind a parameterised one
+        run: python scripts/check_route_shadowing.py
+
       # The predicate question, which the parameter gate structurally cannot
       # ask: a route that matches on an id takes no tenant, which is exactly
       # why it was missing the filter.
@@ -158,6 +197,26 @@ jobs:
 
       - name: Every query on a tenant-scoped table filters on a tenant
         run: python scripts/check_tenant_query_predicates.py
+
+      # A tenant predicate is worth nothing in a statement that cannot be
+      # built. `:tenant_id::uuid` declares `tenant_i`, so `.bindparams()`
+      # raises before the query is sent and the predicate gate above still
+      # reads the filter it wanted in the source text.
+      - name: Bind-cast gate self-test (the defect, and three near misses)
+        run: python scripts/check_text_bind_casts.py --self-test
+
+      - name: No bind parameter is followed by a `::` cast
+        run: python scripts/check_text_bind_casts.py
+
+      # Two case tables that never synchronised meant every case metric
+      # was blind to every case an analyst created — MTTR could stay null
+      # while a tenant closed cases all week. Nothing errored: both
+      # tables existed and both queries were valid.
+      - name: One case table gate self-test
+        run: python scripts/check_one_case_table.py --self-test
+
+      - name: One case table, and one status vocabulary
+        run: python scripts/check_one_case_table.py
 
       # The second layer, which was decoration until 061_runtime_app_role.sql:
       # every service connected as a superuser, and a superuser ignores RLS
@@ -178,6 +237,40 @@ jobs:
 
       - name: Every RLS policy admits an unbound session and reads the GUC the tree sets
         run: python scripts/check_rls_policy_shape.py
+
+      # SCIM is an authentication-adjacent write surface whose client decides
+      # what to attempt by reading a document this service publishes. The
+      # documents, the routes, the audit trail and the group-to-role mapping
+      # therefore have to agree, and the self-test proves the gate still
+      # notices when they stop agreeing.
+      - name: SCIM-contract gate self-test (four injected drifts)
+        run: python scripts/check_scim_contract.py --self-test
+
+      - name: The SCIM surface matches what it advertises, audits and grants
+        run: python scripts/check_scim_contract.py
+
+      # A role string from a request body is an authorization decision the
+      # client made. `POST /tenants/me/users` persisted one with no allow-list
+      # and no grant scope, and because `platform_admin` is declared `["*"]` a
+      # `tenant_admin` could mint total authority (GHSA-pm3f-h6gc-rvgp). Five
+      # sibling routes had the same defect, which is why this gate asks the
+      # question of every handler that binds an authority field rather than of
+      # the one the report named.
+      - name: Role-grant gate self-test (six injected drifts)
+        run: python scripts/check_role_grant_scope.py --self-test
+
+      - name: No route confers authority its caller does not hold
+        run: python scripts/check_role_grant_scope.py
+
+      # An uploaded logo renders in the console and inside PDF reports other
+      # people open, so the SVG allowlist is a security control under steady
+      # pressure to widen. And a meter added later with its tenant formatted
+      # in would count every tenant's rows while its own test passed.
+      - name: White-label and metering gate self-test (four injected drifts)
+        run: python scripts/check_whitelabel_metering.py --self-test
+
+      - name: The SVG allowlist admits nothing executable and every meter binds its tenant
+        run: python scripts/check_whitelabel_metering.py
 
       - name: Start Redis for the two-tenant route replay
         run: |

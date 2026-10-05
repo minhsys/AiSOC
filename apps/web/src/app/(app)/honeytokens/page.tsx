@@ -3,11 +3,14 @@
 import { useState } from "react";
 import useSWR, { mutate } from "swr";
 import { useTenantId } from "@/components/layout/TenantProvider";
+import { apiHeaders } from '@/lib/api';
 
 // Same-origin by default — Next.js rewrites proxy `/api/v1/honeytokens/*`
 // to the honeytokens service. Override with `NEXT_PUBLIC_HONEYTOKENS_URL`
 // to debug against a different origin.
-const API = process.env.NEXT_PUBLIC_HONEYTOKENS_URL ?? "";
+const API = ''  // Same origin, through the rewrite in next.config.js. This read a
+        // NEXT_PUBLIC_* base, which Next inlines at build time, so a
+        // published image could not be pointed anywhere by configuration;
 
 // The tenant used to come from `NEXT_PUBLIC_TENANT_ID`, defaulting to the
 // literal `00000000-0000-0000-0000-000000000001`. A `NEXT_PUBLIC_*` value is
@@ -18,7 +21,7 @@ const API = process.env.NEXT_PUBLIC_HONEYTOKENS_URL ?? "";
 // the console's `X-Tenant-Id` header uses.
 
 const fetcher = (url: string) =>
-  fetch(url).then((r) => {
+  fetch(url, { headers: apiHeaders() }).then((r) => {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     return r.json();
   });
@@ -139,7 +142,7 @@ function CreateTokenModal({
     try {
       const res = await fetch(`${API}/api/v1/honeytokens`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: apiHeaders(),
         body: JSON.stringify({
           tenant_id: tenantId,
           name,
@@ -227,7 +230,7 @@ function CreateTokenModal({
 }
 
 function TriggersPanel({ tokenId, onClose }: { tokenId: string; onClose: () => void }) {
-  const { data: triggers, isLoading } = useSWR<Trigger[]>(
+  const { data: triggers, error, isLoading } = useSWR<Trigger[]>(
     `${API}/api/v1/honeytokens/${tokenId}/triggers`,
     fetcher,
     { refreshInterval: 10_000 }
@@ -244,6 +247,11 @@ function TriggersPanel({ tokenId, onClose }: { tokenId: string; onClose: () => v
         </div>
         {isLoading ? (
           <p className="text-sm text-gray-500">Loading…</p>
+        ) : error ? (
+          // "token has not been accessed" is a claim about attacker
+          // behaviour. A failed request is not evidence for it, and on a
+          // deception surface the wrong direction to guess in.
+          <p className="text-sm text-red-400">Could not load trigger history. Whether this token was accessed is unknown.</p>
         ) : !triggers?.length ? (
           <p className="text-sm text-gray-500">No triggers yet — token has not been accessed.</p>
         ) : (
@@ -306,32 +314,38 @@ export default function HoneytokensPage() {
     ? `${API}/api/v1/honeytokens?tenant_id=${tenantId}${statusFilter ? `&status=${statusFilter}` : ""}${typeFilter ? `&token_type=${typeFilter}` : ""}`
     : null;
 
-  const { data: rawTokens, isLoading } = useSWR<HoneytokenRecord[]>(listKey, fetcher, {
+  const { data: rawTokens, error: listError, isLoading } = useSWR<HoneytokenRecord[]>(listKey, fetcher, {
     refreshInterval: 15_000,
   });
   const tokens = Array.isArray(rawTokens) ? rawTokens : undefined;
+  // The stat cards sit outside the loading guard that wraps the table, so
+  // `?? 0` rendered a confident "Triggered 0" beside a table still saying
+  // "Loading tokens…", and kept it there when the read failed.
+  const countsUnknown = tokens === undefined;
 
   const refresh = () => {
     if (listKey) void mutate(listKey);
   };
 
   const revoke = async (id: string) => {
-    await fetch(`${API}/api/v1/honeytokens/${id}/revoke`, { method: "PATCH" });
+    await fetch(`${API}/api/v1/honeytokens/${id}/revoke`, { method: "PATCH", headers: apiHeaders() });
     refresh();
   };
 
   const remove = async (id: string) => {
     if (!confirm("Delete this honeytoken?")) return;
-    await fetch(`${API}/api/v1/honeytokens/${id}`, { method: "DELETE" });
+    await fetch(`${API}/api/v1/honeytokens/${id}`, { method: "DELETE", headers: apiHeaders() });
     refresh();
   };
 
-  const counts = {
-    total: tokens?.length ?? 0,
-    active: tokens?.filter((t) => t.status === "active").length ?? 0,
-    triggered: tokens?.filter((t) => t.status === "triggered").length ?? 0,
-    revoked: tokens?.filter((t) => t.status === "revoked").length ?? 0,
-  };
+  const counts: Record<string, number | null> = countsUnknown
+    ? { total: null, active: null, triggered: null, revoked: null }
+    : {
+        total: tokens.length,
+        active: tokens.filter((t) => t.status === "active").length,
+        triggered: tokens.filter((t) => t.status === "triggered").length,
+        revoked: tokens.filter((t) => t.status === "revoked").length,
+      };
 
   return (
     <div className="p-6 max-w-6xl mx-auto">
@@ -363,7 +377,10 @@ export default function HoneytokensPage() {
         ].map((s) => (
           <div key={s.label} className="bg-gray-900/60 border border-gray-700 rounded-lg p-4">
             <p className="text-xs text-gray-500 uppercase tracking-wide">{s.label}</p>
-            <p className={`text-2xl font-bold mt-1 ${s.color}`}>{s.value}</p>
+            <p className={`text-2xl font-bold mt-1 ${s.value === null ? 'text-gray-600' : s.color}`}>
+              {s.value === null ? '—' : s.value}
+            </p>
+            {s.value === null && <p className="text-[11px] text-gray-500 mt-0.5">not measured</p>}
           </div>
         ))}
       </div>
@@ -401,6 +418,10 @@ export default function HoneytokensPage() {
           <div className="p-8 text-center text-sm text-gray-500">Resolving the active tenant…</div>
         ) : isLoading ? (
           <div className="p-8 text-center text-sm text-gray-500">Loading tokens…</div>
+        ) : listError ? (
+          <div className="p-8 text-center text-sm text-red-400">
+            Could not load honeytokens. This is not a report that none exist.
+          </div>
         ) : !tokens?.length ? (
           <div className="p-8 text-center text-sm text-gray-500">
             No honeytokens found. Create your first one.

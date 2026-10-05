@@ -58,6 +58,7 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 
 # `scripts/` is on sys.path when this file is run as a program, but not when a
 # test loads it by path with importlib. gate_toolkit sits beside it either way.
@@ -748,6 +749,21 @@ def _build_per_investigation_block(model: str, *, keep_records: bool) -> dict:
     return block
 
 
+def grade_agent_quality(runs: list[Any]) -> dict[str, Any]:
+    """Tool selection, evidence completeness and time to verdict.
+
+    Wired into the harness because a metric nothing computes is a
+    module. These three had zero hits anywhere in the tree: the eleven
+    existing suites grade outcomes, and an agent that reaches the
+    right verdict by reading the alert title scores identically to one
+    that investigated.
+    """
+    sys.path.insert(0, str(repo_root() / "services" / "agents"))
+    from app.eval.agent_quality import score_agent_quality  # noqa: PLC0415
+
+    return score_agent_quality(runs).as_dict()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="AiSOC Pillar-1 unified evaluation runner.")
     parser.add_argument(
@@ -852,6 +868,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--wet-model",
+        default=None,
+        help=(
+            "Only meaningful with --wet. The model the run is actually served "
+            "by, written into the report's `model` field. Without it a local "
+            "Ollama run labels itself with the headline rate-card model, so "
+            "the report names a model that was never called and prices the "
+            "tokens against that model's list."
+        ),
+    )
+    parser.add_argument(
         "--wet-require-live",
         action="store_true",
         help=(
@@ -884,6 +911,7 @@ def main() -> None:
         try:
             wet_report = compute_wet_eval(
                 mode=wet_mode,
+                model=args.wet_model or _TELEMETRY_DEFAULT_MODEL,
                 harness_version=(f"scripts/run_evals.py @ {os.environ.get('GITHUB_SHA', 'local')}"),
                 limit=args.wet_limit,
                 require_live=args.wet_require_live,
@@ -911,7 +939,10 @@ def main() -> None:
             print()
             print("=" * 78)
             label = "DRY RUN" if wet_mode == "dry_run" else "LIVE"
-            print(f"  AiSOC wet-eval ({label}) — 200-incident synthetic corpus")
+            # The slice, not the corpus. The banner said "200-incident" while
+            # --wet-limit was dispatching 20, so the sample size a reader took
+            # away was whichever number the header happened to hardcode.
+            print(f"  AiSOC wet-eval ({label}) — {wet_block['incidents']} of 200 synthetic incidents")
             print("=" * 78)
             print(f"  Mode:           {wet_block['mode']}")
             print(f"  Model:          {wet_block['model']}")
@@ -922,8 +953,21 @@ def main() -> None:
             tot = wet_block["tokens"]["total"]
             print(f"  Tokens / inv:   mean={tot['mean']:.0f}  median={tot['median']:.0f}  p95={tot['p95']:.0f}  p99={tot['p99']:.0f}")
             usd = wet_block["usd"]
-            print(f"  USD / inv:      mean=${usd['mean']:.5f}  median=${usd['median']:.5f}  p95=${usd['p95']:.5f}  p99=${usd['p99']:.5f}")
+            if usd.get("measured") is False:
+                print(f"  USD / inv:      {usd.get('note', 'not measured')}")
+            else:
+                print(
+                    f"  USD / inv:      mean=${usd['mean']:.5f}  median=${usd['median']:.5f}  p95=${usd['p95']:.5f}  p99=${usd['p99']:.5f}"
+                )
             print(f"  MITRE accuracy: {wet_block['mitre_accuracy']:.4f}")
+            grounded = wet_block.get("groundedness") or {}
+            if grounded.get("measured"):
+                print(
+                    f"  Groundedness:   mean={grounded['mean']:.4f}  median={grounded['median']:.4f}  "
+                    f"min={grounded['min']:.4f}  p05={grounded['p05']:.4f}  (n={grounded['scored_incidents']})"
+                )
+            else:
+                print(f"  Groundedness:   {grounded.get('note', 'not measured')}")
             if wet_block.get("warnings"):
                 print("-" * 78)
                 print("  Warnings:")
@@ -1051,7 +1095,7 @@ def main() -> None:
     if args.json:
         print(json.dumps(summary, indent=2))
     elif args.telemetry_only:
-        pi = summary["per_investigation"]
+        pi = cast(dict[str, Any], summary["per_investigation"])
         print()
         print("=" * 78)
         print("  AiSOC Eval - per-investigation telemetry (deterministic substrate)")
@@ -1064,14 +1108,14 @@ def main() -> None:
         )
         print(f"  Incidents:     {pi['incidents']}  Templates: {pi['templates']}")
         print("-" * 78)
-        tok = pi["tokens_per_investigation"]
+        tok = cast(dict[str, Any], pi["tokens_per_investigation"])
         print(f"  Tokens / investigation:  mean={tok['mean']:.0f}  median={tok['median']:.0f}  p95={tok['p95']:.0f}  p99={tok['p99']:.0f}")
         print(f"      prompt mean={tok['prompt_mean']:.0f}    completion mean={tok['completion_mean']:.0f}")
-        usd = pi["usd_per_investigation"]
+        usd = cast(dict[str, Any], pi["usd_per_investigation"])
         print(
             f"  USD / investigation:     mean=${usd['mean']:.5f}  median=${usd['median']:.5f}  p95=${usd['p95']:.5f}  p99=${usd['p99']:.5f}"
         )
-        lat = pi["latency_per_investigation_ms"]
+        lat = cast(dict[str, Any], pi["latency_per_investigation_ms"])
         print(f"  Latency (ms / inv):      p50={lat['p50']:.4f}  p95={lat['p95']:.4f}  p99={lat['p99']:.4f}  (substrate-only path)")
         print("=" * 78)
         try:
@@ -1106,7 +1150,7 @@ def main() -> None:
                     suffix = "..." if fail_count > 5 else ""
                     print(f"           regressions: {failing}{suffix}")
         print("-" * 78)
-        tele = summary["telemetry"]
+        tele = cast(dict[str, Any], summary["telemetry"])
         if tele.get("present"):
             print(
                 f"  Synthetic telemetry: {tele['events']} events across "
@@ -1117,7 +1161,7 @@ def main() -> None:
         else:
             print("  Synthetic telemetry: <not generated>")
         print("-" * 78)
-        pi = summary.get("per_investigation") or {}
+        pi = cast(dict[str, Any], summary.get("per_investigation") or {})
         if pi:
             tok = pi.get("tokens_per_investigation", {})
             usd = pi.get("usd_per_investigation", {})
@@ -1141,7 +1185,7 @@ def main() -> None:
         else:
             verdict = "FAIL — REGRESSION DETECTED" if args.suite == "all" else f"FAIL — {args.suite} regressed"
         print(f"  {verdict}")
-        cmp = summary.get("baseline_compare")
+        cmp = cast(dict[str, Any] | None, summary.get("baseline_compare"))
         if cmp and cmp.get("available"):
             arrow = "DROP" if cmp["regressed"] else "OK"
             print(

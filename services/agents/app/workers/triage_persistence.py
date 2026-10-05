@@ -51,17 +51,61 @@ from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
 
-from app.context import organisation_memory
+from app.context import dispositions as dispositions_module
+from app.context import identity as identity_module
+from app.context import knowledge_base, organisation_memory, tenant_skills
+from app.context.dispositions import RecentDispositions
+from app.context.identity import IdentityContext
+from app.context.knowledge_base import RunbookRetrieval
 from app.investigator import ledger as ledger_module
 from app.investigator import siem_writeback
 from app.memory import outcomes as outcomes_module
 
 __all__ = [
+    "CONTEXT_FREEZE_KINDS",
+    "CUTOFF",
     "LiveTriageContextReader",
     "LiveTriageWriter",
+    "SNAPSHOT",
     "TriageContextReader",
     "TriageWriter",
 ]
+
+#: The two ways a replay can hold a context source still, and which one each
+#: source is subject to. Declared here rather than inferred, and read by
+#: ``scripts/check_triage_context_freeze.py`` in both directions: a protocol
+#: method missing from this table fails the gate, and a name here that is no
+#: longer a protocol method fails it too.
+#:
+#: ``SNAPSHOT``
+#:     The whole set is small enough to capture once, before the test window
+#:     runs. ``capture_context`` filters it against the split and
+#:     ``ContextSnapshot.as_method_note`` publishes what it kept and dropped.
+#:     Organisation memory, outcome priors and tenant skills.
+#:
+#: ``CUTOFF``
+#:     A per-alert query against a store too large to capture: a knowledge
+#:     base, a queue's disposition history, a directory. There is nothing to
+#:     freeze up front, so the freeze is a parameter the **reader** supplies,
+#:     and the server is what refuses the late rows. The reader accumulates
+#:     what the server served and refused, and
+#:     ``FrozenTriageContextReader.as_method_note`` publishes it.
+#:
+#: The distinction is not cosmetic. A cutoff source's protocol method must not
+#: accept the cutoff from its caller, because a caller that can supply it is a
+#: caller that can forget to, and the resulting replay reads live with a
+#: method note that still says "frozen". The gate enforces that too.
+SNAPSHOT = "snapshot"
+CUTOFF = "cutoff"
+
+CONTEXT_FREEZE_KINDS: dict[str, str] = {
+    "fetch_statements": SNAPSHOT,
+    "lookup_prior": SNAPSHOT,
+    "fetch_skills": SNAPSHOT,
+    "retrieve_runbooks": CUTOFF,
+    "recent_dispositions": CUTOFF,
+    "fetch_identity_context": CUTOFF,
+}
 
 
 @runtime_checkable
@@ -100,6 +144,26 @@ class TriageWriter(Protocol):
         is declined.
         """
 
+    @property
+    def fires_playbooks(self) -> bool:
+        """Whether a matched playbook may actually run from this triage.
+
+        `alert_trigger.run_for_alert` was called unconditionally, so a replay
+        of last month's alerts would have **fired this month's playbooks** --
+        real notifications, real tickets, real containment previews -- against
+        rows a grader was only meant to score.
+        """
+
+    @property
+    def uses_dedup_cache(self) -> bool:
+        """Whether a cached production verdict may answer for this alert.
+
+        The cost governor returns `Decision.DEDUPLICATED` with a verdict from
+        a live cache. Accepting one during a replay grades the cache rather
+        than the agent, and the figure that comes out is a measurement of
+        something that already happened.
+        """
+
     async def persist_auto_triage(self, **fields: Any) -> None:
         """Write the verdict to the ledger and the ``alerts`` row.
 
@@ -119,6 +183,7 @@ class TriageWriter(Protocol):
         confidence: float,
         author: str,
         alert_id: Any = None,
+        injection_suspected: bool = False,
     ) -> None:
         """Write the per-signature outcome prior that lets a repeat alert suppress."""
 
@@ -164,9 +229,18 @@ class TriageWriter(Protocol):
 class TriageContextReader(Protocol):
     """The durable state a verdict is allowed to depend on.
 
-    Both methods must be total. Production's implementations already are:
-    neither ``fetch_statements`` nor ``lookup_prior`` may take triage down
-    when the store behind it is unreachable.
+    Every method must be total. Production's implementations already are: none
+    of them may take triage down when the store behind it is unreachable.
+
+    This protocol is the seam the replay freeze acts on, so **a new context
+    source belongs here or it is not point-in-time**. A source read directly
+    from the worker would be live during a replay no matter what the snapshot
+    said, and the report would be measuring a world the split point does not
+    describe.
+
+    Every method must also appear in :data:`CONTEXT_FREEZE_KINDS`, which says
+    which of the two freezes holds it still. A source with no declared kind is
+    a source nobody decided how to freeze.
     """
 
     async def fetch_statements(self, tenant_id: str | None) -> list[dict[str, Any]]:
@@ -174,6 +248,39 @@ class TriageContextReader(Protocol):
 
     async def lookup_prior(self, tenant_id: str, signature: str) -> dict[str, Any] | None:
         """The durable outcome prior for an evidence signature, or ``None``."""
+
+    async def fetch_skills(self, tenant_id: str | None) -> list[dict[str, Any]]:
+        """The tenant's active, unexpired investigation skills."""
+
+    async def retrieve_runbooks(self, tenant_id: str | None, *, query: str) -> RunbookRetrieval:
+        """Knowledge-base runbook chunks relevant to one alert, with citations.
+
+        A ``CUTOFF`` source: the implementation decides the point in time, and
+        no caller may pass one. The worker knows the alert and nothing about
+        the split, which is exactly the division that keeps a replay honest.
+        """
+
+    async def recent_dispositions(
+        self,
+        tenant_id: str | None,
+        *,
+        rule_id: str,
+        entities: list[str],
+    ) -> RecentDispositions:
+        """The last few analyst decisions on alerts of this shape, with reasons.
+
+        A ``CUTOFF`` source, and the leakiest of the three by construction: a
+        decision recorded inside the test window is literally an analyst's
+        answer to an alert in that window.
+        """
+
+    async def fetch_identity_context(self, tenant_id: str | None, *, accounts: list[str]) -> IdentityContext:
+        """Directory context for the principals this alert names.
+
+        A ``CUTOFF`` source whose freeze is partial and says so: an
+        ``Employee`` node carries when it was imported, never when the fact it
+        records became true.
+        """
 
 
 class LiveTriageWriter:
@@ -195,6 +302,28 @@ class LiveTriageWriter:
     def persists_cost(self) -> bool:
         return True
 
+    @property
+    def fires_playbooks(self) -> bool:
+        """Whether a matched playbook may actually run from this triage.
+
+        `alert_trigger.run_for_alert` was called unconditionally, so a replay
+        of last month's alerts would have **fired this month's playbooks** --
+        real notifications, real tickets, real containment previews -- against
+        rows a grader was only meant to score.
+        """
+        return True
+
+    @property
+    def uses_dedup_cache(self) -> bool:
+        """Whether a cached production verdict may answer for this alert.
+
+        The cost governor returns `Decision.DEDUPLICATED` with a verdict from
+        a live cache. Accepting one during a replay grades the cache rather
+        than the agent, and the figure that comes out is a measurement of
+        something that already happened.
+        """
+        return True
+
     async def persist_auto_triage(self, **fields: Any) -> None:
         await ledger_module.persist_auto_triage(**fields)
 
@@ -207,6 +336,7 @@ class LiveTriageWriter:
         confidence: float,
         author: str,
         alert_id: Any = None,
+        injection_suspected: bool = False,
     ) -> None:
         await outcomes_module.record_outcome(
             tenant_id,
@@ -215,6 +345,7 @@ class LiveTriageWriter:
             confidence=confidence,
             author=author,
             alert_id=alert_id,
+            injection_suspected=injection_suspected,
         )
 
     async def record_suppression(
@@ -277,3 +408,30 @@ class LiveTriageContextReader:
 
     async def lookup_prior(self, tenant_id: str, signature: str) -> dict[str, Any] | None:
         return await outcomes_module.lookup_prior(tenant_id, signature)
+
+    async def fetch_skills(self, tenant_id: str | None) -> list[dict[str, Any]]:
+        return await tenant_skills.fetch_skills(tenant_id)
+
+    async def retrieve_runbooks(self, tenant_id: str | None, *, query: str) -> RunbookRetrieval:
+        # ``as_of=None`` is production: retrieve against the knowledge base as
+        # it stands. Stated explicitly rather than left to the default, so the
+        # one line that differs from the frozen reader is visible in a diff of
+        # the two classes.
+        return await knowledge_base.fetch_runbooks(tenant_id, query=query, as_of=None)
+
+    async def recent_dispositions(
+        self,
+        tenant_id: str | None,
+        *,
+        rule_id: str,
+        entities: list[str],
+    ) -> RecentDispositions:
+        return await dispositions_module.fetch_recent_dispositions(
+            tenant_id,
+            rule_id=rule_id,
+            entities=entities,
+            as_of=None,
+        )
+
+    async def fetch_identity_context(self, tenant_id: str | None, *, accounts: list[str]) -> IdentityContext:
+        return await identity_module.fetch_identity_context(tenant_id, accounts=accounts, as_of=None)

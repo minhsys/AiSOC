@@ -45,17 +45,30 @@ from app.agents.auto_triage_agent import run_auto_triage
 from app.agents.dispositions import AUTO_CLOSEABLE_DISPOSITIONS, NEEDS_REVIEW, normalize_disposition
 from app.agents.triage_agent import run_triage
 from app.confidence.groundedness import score_groundedness
+from app.context import dispositions as dispositions_module
+from app.context import identity as identity_module
+from app.context import knowledge_base
+from app.context.tenant_skills import select_skill
 from app.core.cost_governor import Decision, get_governor
 from app.core.cost_telemetry import CostSummary, CostTracker
+from app.core.kafka_security import kafka_client_kwargs
 from app.graph.runner import default_budget, run_escalation
 from app.investigator import ledger as ledger_module
 from app.investigator.bundle_prompt import prefetch_context_bundle_dict
 from app.llm.factory import llm_override
-from app.memory.outcomes import AI, should_auto_suppress
+from app.memory.outcomes import AI, suppression_refusal
 from app.models.state import AgentStatus, InvestigationState
+from app.playbook import alert_trigger
 from app.routing.model_router import is_deterministic_mode
 from app.security.llm_resolver import resolve_llm_config
 from app.workers.business_context import BusinessContextApplier
+from app.workers.shadow_mode import (
+    LiveShadowModePolicy,
+    ShadowDecision,
+    ShadowModePolicy,
+    ShadowModeTriageWriter,
+    alert_class_of,
+)
 from app.workers.triage_persistence import (
     LiveTriageContextReader,
     LiveTriageWriter,
@@ -98,6 +111,24 @@ _METRICS = {
     # rather than a broken integration.
     "writeback_attempted": 0,
     "writeback_executed": 0,
+    # Phase 2.1. Two counters for the same reason as the writeback pair: a
+    # shadow run whose decision row never lands measures nothing, and the
+    # symptom of that is a scorecard that stays empty rather than an error.
+    "shadow_triaged": 0,
+    "shadow_decisions_recorded": 0,
+    # Phase 6.1. An operator who authored, backtested and activated a skill
+    # needs to see that it is reaching alerts; zero here with an active skill
+    # is the difference between "my guidance is not helping" and "my guidance
+    # was never read".
+    "tenant_skill_applied": 0,
+    # Phase 6.3. Same reasoning as the skill counter, plus the refusal beside
+    # it: a library whose documents keep being withheld is a library somebody
+    # needs to look at, and a silent drop would leave the operator wondering
+    # why triage never cites the runbook they wrote.
+    "runbooks_retrieved": 0,
+    "runbooks_refused_for_injection": 0,
+    "recent_dispositions_read": 0,
+    "identity_context_read": 0,
     "errors": 0,
 }
 
@@ -179,6 +210,17 @@ def _cost_payload(cost: CostSummary, tokens: int) -> dict[str, Any]:
     }
 
 
+def _opt_text(value: Any) -> str | None:
+    """A trimmed string, or ``None`` for absent and empty alike.
+
+    The shadow decision row distinguishes the two: a null rule id means the
+    alert carried none, and an empty string would become a segment key named
+    after nothing in the per-rule breakdown.
+    """
+    text = str(value).strip() if value is not None else ""
+    return text or None
+
+
 def _rationale_of(state: InvestigationState) -> str:
     """Human-readable rationale for the verdict, for the ledger + alerts row."""
     if state.confidence_basis:
@@ -258,6 +300,10 @@ class FusedAlertTriageWorker:
     #: instance carries nothing between workers.
     _writer: TriageWriter = LiveTriageWriter()
     _reader: TriageContextReader = LiveTriageContextReader()
+    #: Phase 2.1. Not a sink: it decides *which* sink each alert gets. Stated
+    #: at class level for the same reason as the two above, so a worker built
+    #: with ``__new__`` still resolves a policy rather than raising.
+    _shadow_policy: ShadowModePolicy = LiveShadowModePolicy()
 
     def __init__(
         self,
@@ -270,6 +316,7 @@ class FusedAlertTriageWorker:
         business_context: BusinessContextApplier | None = None,
         writer: TriageWriter | None = None,
         context_reader: TriageContextReader | None = None,
+        shadow_policy: ShadowModePolicy | None = None,
     ) -> None:
         self._bootstrap = bootstrap_servers
         self._topic = topic
@@ -280,6 +327,7 @@ class FusedAlertTriageWorker:
         # byte-for-byte the same behaviour.
         self._writer: TriageWriter = writer or LiveTriageWriter()
         self._reader: TriageContextReader = context_reader or LiveTriageContextReader()
+        self._shadow_policy: ShadowModePolicy = shadow_policy or LiveShadowModePolicy()
         self._dlq_topic = dlq_topic or os.getenv("KAFKA_TOPIC_ALERTS_FUSED_DLQ", f"{topic}.dlq")
         self._max_attempts = max(1, max_attempts)
         self._consumer: Any | None = None
@@ -302,6 +350,7 @@ class FusedAlertTriageWorker:
             # mid-triage re-delivers the alert instead of dropping it.
             enable_auto_commit=False,
             value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+            **kafka_client_kwargs(),
         )
         await self._consumer.start()
         self._running = True
@@ -383,6 +432,7 @@ class FusedAlertTriageWorker:
             self._producer = AIOKafkaProducer(
                 bootstrap_servers=self._bootstrap,
                 value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+                **kafka_client_kwargs(),
             )
             await self._producer.start()
             return self._producer
@@ -477,12 +527,20 @@ class FusedAlertTriageWorker:
         governor = get_governor()
         fingerprint = governor.evidence_fingerprint(str(state.tenant_id), state.raw_alert)
 
+        # Phase 2.1 — which sink this alert's writes go to is a per-alert
+        # question, because shadow mode is per tenant *and* per alert class.
+        # The constructor sinks stay untouched: `writer` is the tenant's live
+        # sink or a shadow wrapper around it, chosen here and passed down
+        # explicitly rather than swapped onto `self`, which would leak across
+        # concurrently triaged alerts.
+        writer = await self._sink_for(state, fingerprint)
+
         # Wave 1 — forward auto-suppression: if this signature has a trusted
         # prior benign/FP outcome, auto-resolve the repeat WITHOUT re-triage
         # (this is what makes alert volume actually shrink over time). Gated on
         # trust (human prior, or corroborated high-confidence AI prior).
         if _memory_suppression_enabled():
-            suppressed = await self._maybe_suppress_from_memory(state, fingerprint, bc_matched)
+            suppressed = await self._maybe_suppress_from_memory(state, fingerprint, bc_matched, writer=writer)
             if suppressed is not None:
                 return suppressed
 
@@ -493,7 +551,11 @@ class FusedAlertTriageWorker:
         # and "no call was made" is a different fact from "the call was free".
         cost: CostSummary = CostSummary()
         tokens = 0
-        if decision.decision is Decision.DEDUPLICATED and decision.cached_verdict:
+        # `writer.uses_dedup_cache` because a replay must not be graded on a
+        # verdict production already produced: that measures the cache rather
+        # than the agent, and the figure describes something that already
+        # happened.
+        if decision.decision is Decision.DEDUPLICATED and decision.cached_verdict and writer.uses_dedup_cache:
             _METRICS["deduplicated"] += 1
             verdict = decision.cached_verdict.get("verdict")
             confidence = float(decision.cached_verdict.get("confidence", 0.0))
@@ -508,13 +570,30 @@ class FusedAlertTriageWorker:
                 # LLM call is going to happen. Never raises; an empty list just
                 # means the prompt is what it was before.
                 state.organisation_memory = await self._reader.fetch_statements(str(state.tenant_id))
+                # Phase 6.1: the tenant's own skill for this shape of alert.
+                # Read through the same port for the same reason: it is durable
+                # state a verdict depends on, so the replay freeze has to be
+                # able to reach it. Selection is per alert and cheap; the fetch
+                # behind it is cached.
+                await self._attach_tenant_skill(state)
+                # Phase 6.3: the tenant's own runbooks for this shape of alert.
+                # Same port again, and for a source the freeze holds still by
+                # a server-side cutoff rather than by capture, which is why
+                # the worker passes a query and never a point in time.
+                await self._attach_runbooks(state)
+                # Phase 6.3: what this tenant's analysts decided the last few
+                # times, and who is behind the account. Both are cutoff-frozen
+                # sources like runbooks, so neither takes a point in time from
+                # here.
+                await self._attach_recent_dispositions(state)
+                await self._attach_identity_context(state)
             # Bind a CostTracker so every LLM call on this path records its
             # token/cost (safe_ainvoke -> record_llm_call) — previously the
             # highest-volume LLM spend was recorded as $0 and invisible.
             async with CostTracker(
                 run_id=str(state.run_id),
                 tenant_id=str(state.tenant_id),
-                persist=self._writer.persists_cost,
+                persist=writer.persists_cost,
             ) as tracker:
                 if use_llm and cfg is not None:
                     # Route the LLM call through the tenant's BYOK key/model so
@@ -543,6 +622,44 @@ class FusedAlertTriageWorker:
                     _METRICS["deterministic"] += 1
                 cost = CostSummary.from_tracker(tracker)
                 tokens = tracker.total_tokens
+                # From the call that answered, not from the pin. The shadow
+                # writer stamps a decision with `state.model_used`, and the
+                # field did not exist, so every shadow decision recorded a
+                # null model and per-model agreement was empty on every
+                # deployment. `resolved_models` is what the tracker observed,
+                # so the deterministic path correctly leaves this `None`.
+                if cost.resolved_models:
+                    state.model_used = ", ".join(sorted({str(m) for m in cost.resolved_models}))
+
+            # Parity 5.1. `find_matching()` had no production caller, so no
+            # playbook ever ran from an alert. Three switches must agree
+            # before one acts (deployment, tenant, playbook) and anything
+            # short of all three runs in **preview**, with its plan and
+            # simulated steps attached to the alert.
+            #
+            # After triage, because a playbook's conditions read the
+            # verdict and the confidence, and before them it would be
+            # matching on an alert nobody has assessed.
+            try:
+                # `writer.fires_playbooks` because this was unconditional, so a
+                # replay of last month's alerts would have fired this month's
+                # playbooks -- real notifications, real tickets -- against rows a
+                # grader was only meant to score.
+                playbook_outcome = (
+                    await alert_trigger.run_for_alert(state)
+                    if writer.fires_playbooks
+                    else alert_trigger.TriggerOutcome(skipped_reason="replay: playbooks are not fired")
+                )
+                if playbook_outcome.matched:
+                    state.add_finding(
+                        f"Playbooks matched: {', '.join(playbook_outcome.matched)}"
+                        + (f" ({len(playbook_outcome.executed)} ran, {len(playbook_outcome.previewed)} previewed)")
+                    )
+            except Exception as exc:  # noqa: BLE001
+                # A playbook failure must not lose the triage result it was
+                # attached to.
+                logger.warning("auto_triage_worker.playbook_trigger_failed", error=str(exc))
+
             verdict = state.verdict
             confidence = state.confidence
             # Never complete with a null/empty verdict (issue #571): if both the
@@ -565,7 +682,7 @@ class FusedAlertTriageWorker:
                 # spent. An unmeasured call contributes no dollars — it still
                 # contributes tokens, which is the cap that can be enforced
                 # honestly without a price.
-                self._writer.cache_verdict(
+                writer.cache_verdict(
                     governor,
                     str(state.tenant_id),
                     fingerprint,
@@ -584,19 +701,24 @@ class FusedAlertTriageWorker:
         verdict, confidence = self._apply_groundedness_gate(state, verdict, confidence)
 
         _METRICS["triaged"] += 1
-        await self._record(state, tier=tier, verdict=verdict, confidence=confidence, tokens=tokens, cost=cost)
+        await self._record(state, tier=tier, verdict=verdict, confidence=confidence, tokens=tokens, cost=cost, writer=writer)
 
         # Wave 1 — write the durable outcome back as a per-signature prior so
         # autonomous closures compound (a later identical alert can suppress).
         if _memory_writeback_enabled() and verdict:
             with contextlib.suppress(Exception):
-                await self._writer.record_outcome(
+                await writer.record_outcome(
                     str(state.tenant_id),
                     fingerprint,
                     disposition=str(verdict),
                     confidence=float(confidence or 0.0),
                     author=AI,
                     alert_id=(state.raw_alert or {}).get("id"),
+                    # The guard already ran over this alert's runbook
+                    # retrieval; carrying its verdict onto the prior is what
+                    # stops a disposition derived from attacker-reachable
+                    # text from auto-closing the next one.
+                    injection_suspected=bool(getattr(state, "injection_suspected", False)),
                 )
                 _METRICS["outcome_written"] += 1
 
@@ -606,21 +728,30 @@ class FusedAlertTriageWorker:
         # skip enrichment. Best-effort: the verdict is already durable, so an
         # enrichment/investigation failure never fails the triage outcome.
         if state.status is not AgentStatus.COMPLETED:
-            await self._maybe_escalate(state)
+            await self._maybe_escalate(state, writer=writer)
 
         # Queue every action that needs sign-off so a human can actually give
         # it. Until v9.0 proposed actions were persisted as JSON and stopped
         # there, so "requires_approval" described an approval nobody could
         # grant — the responder app's queue had no producer at all.
-        approvals = await self._raise_approvals(state)
+        approvals = await self._raise_approvals(state, writer=writer)
 
         # Close the loop with the SIEM that raised this alert. Runs last and
         # fails soft: the verdict is already durable, and an unreachable
         # Splunk must not re-drive the retry path and dead-letter an alert
         # that was triaged correctly.
-        source_writeback = await self._write_back_to_source(state, verdict, confidence, rationale=_rationale_of(state))
+        source_writeback = await self._write_back_to_source(state, verdict, confidence, rationale=_rationale_of(state), writer=writer)
+
+        shadow = isinstance(writer, ShadowModeTriageWriter)
+        if isinstance(writer, ShadowModeTriageWriter) and writer.recorded:
+            _METRICS["shadow_decisions_recorded"] += 1
 
         return {
+            # Phase 2.1. Stated on the summary rather than inferred from the
+            # empty writeback and approval lists, because "shadow mode" and
+            # "nothing needed doing" produce the same empty lists and lead an
+            # operator to opposite conclusions.
+            "shadow": shadow,
             "run_id": str(state.run_id),
             "incident_id": str(state.incident_id),
             "tenant_id": str(state.tenant_id),
@@ -641,6 +772,41 @@ class FusedAlertTriageWorker:
             "proposed_actions": [{"action_type": a.action_type, "requires_approval": a.requires_approval} for a in state.proposed_actions],
         }
 
+    async def _sink_for(self, state: InvestigationState, fingerprint: str) -> TriageWriter:
+        """The sink this alert's writes go to: the tenant's live one, or a shadow wrapper.
+
+        Resolved per alert because shadow mode is per tenant *and* per alert
+        class, and the class is not known until the alert is in hand. The
+        wrapper delegates to whatever sink the worker was constructed with, so
+        a replay passing its own sink keeps it and a production worker wraps
+        the live one.
+
+        A policy read that fails is treated as shadow by
+        :class:`~app.workers.shadow_mode.LiveShadowModePolicy`, which is the
+        conservative direction: the cost of being wrong is a few seconds of
+        suppressed writeback, against acting on an alert a tenant asked us
+        only to observe.
+        """
+        raw = state.raw_alert or {}
+        alert_class = alert_class_of(raw)
+        if not await self._shadow_policy.is_shadow(str(state.tenant_id), alert_class):
+            return self._writer
+
+        _METRICS["shadow_triaged"] += 1
+        return ShadowModeTriageWriter(
+            self._writer,
+            ShadowDecision(
+                tenant_ref=str(state.tenant_id),
+                alert_class=alert_class,
+                alert_id=raw.get("id"),
+                external_id=_opt_text(raw.get("external_id")),
+                rule_id=_opt_text(raw.get("rule_id")),
+                source=_opt_text(raw.get("connector_type") or raw.get("source")),
+                model=_opt_text(getattr(state, "model_used", None)),
+                evidence_signature=fingerprint,
+            ),
+        )
+
     async def _write_back_to_source(
         self,
         state: InvestigationState,
@@ -648,6 +814,7 @@ class FusedAlertTriageWorker:
         confidence: float,
         *,
         rationale: str,
+        writer: TriageWriter,
     ) -> dict[str, Any] | None:
         """Ask the API to project this verdict onto the source finding.
 
@@ -660,7 +827,7 @@ class FusedAlertTriageWorker:
         if not alert_id or not verdict:
             return None
         try:
-            report = await self._writer.write_back_disposition(
+            report = await writer.write_back_disposition(
                 tenant_id=str(state.tenant_id),
                 alert_id=alert_id,
                 disposition=str(verdict),
@@ -677,7 +844,7 @@ class FusedAlertTriageWorker:
             _METRICS["writeback_executed"] += 1
         return report
 
-    async def _raise_approvals(self, state: InvestigationState) -> list[str]:
+    async def _raise_approvals(self, state: InvestigationState, *, writer: TriageWriter) -> list[str]:
         """Queue each approval-requiring proposed action; return the ids.
 
         Only actions the agent itself marked ``requires_approval`` are
@@ -693,7 +860,7 @@ class FusedAlertTriageWorker:
             if not action.requires_approval:
                 continue
             risk = action.risk_level.value if hasattr(action.risk_level, "value") else str(action.risk_level)
-            approval_id = await self._writer.raise_approval(
+            approval_id = await writer.raise_approval(
                 tenant_ref=str(state.tenant_id),
                 run_id=state.run_id,
                 alert_id=(state.raw_alert or {}).get("id"),
@@ -713,26 +880,152 @@ class FusedAlertTriageWorker:
                 _METRICS["approvals_raised"] += 1
         return raised
 
+    async def _attach_tenant_skill(self, state: InvestigationState) -> None:
+        """Resolve the tenant skill matching this alert and record it on the state.
+
+        Best-effort in exactly one direction: a lookup that fails leaves the
+        state without a skill and triage proceeds as it did before. The
+        opposite failure, a skill that matched and was not recorded, is the one
+        that matters, because the verdict would then carry guidance with no
+        provenance. So the selection and the record happen together.
+        """
+        try:
+            rows = await self._reader.fetch_skills(str(state.tenant_id))
+        except Exception as exc:  # noqa: BLE001 - guidance is advisory, triage is not
+            logger.warning("auto_triage_worker.skill_lookup_failed", error=str(exc)[:200])
+            return
+        if not rows:
+            return
+
+        raw = state.raw_alert or {}
+        skill = select_skill(
+            rows,
+            summary=state.alert_summary or "",
+            techniques=list(state.mitre_mappings or []),
+            rule_id=str(raw.get("rule_id") or "") or None,
+            source=str(raw.get("connector_type") or raw.get("source") or "") or None,
+        )
+        if skill is None:
+            return
+
+        state.tenant_skill = skill.as_provenance()
+        guidance = skill.triage_guidance()
+        if guidance:
+            state.tenant_skill["triage_guidance"] = guidance
+        _METRICS["tenant_skill_applied"] += 1
+
+    async def _attach_runbooks(self, state: InvestigationState) -> None:
+        """Retrieve the tenant's runbooks for this alert and record them on the state.
+
+        Best-effort in one direction only, the same shape
+        :meth:`_attach_tenant_skill` uses: a retrieval that fails leaves the
+        state without runbooks and triage proceeds as it did before. The
+        failure that matters is the other one, a chunk that reached the prompt
+        with nothing recording which document it came from, so the retrieval
+        and the citation record happen together.
+        """
+        query = knowledge_base.query_for(state.alert_summary or "", state.raw_alert)
+        if not query:
+            return
+        try:
+            retrieval = await self._reader.retrieve_runbooks(str(state.tenant_id), query=query)
+        except Exception as exc:  # noqa: BLE001 - guidance is advisory, triage is not
+            logger.warning("auto_triage_worker.runbook_lookup_failed", error=str(exc)[:200])
+            return
+        if not retrieval.runbooks and not retrieval.dropped_for_injection:
+            return
+
+        state.knowledge_base = retrieval.as_state()
+        if retrieval.runbooks:
+            _METRICS["runbooks_retrieved"] += len(retrieval.runbooks)
+        if retrieval.dropped_for_injection:
+            _METRICS["runbooks_refused_for_injection"] += retrieval.dropped_for_injection
+            # Recorded on the state so it reaches the outcome prior. Without
+            # this the flag threaded into `record_outcome` would read a field
+            # nobody sets and the whole injection rule would be dead code
+            # that looks like a control.
+            state.injection_suspected = True
+
+    async def _attach_recent_dispositions(self, state: InvestigationState) -> None:
+        """Record what this tenant's analysts decided the last few times.
+
+        Best-effort in one direction, like the two above: a lookup that fails
+        leaves the state without decisions and triage proceeds as it did.
+        """
+        raw = state.raw_alert or {}
+        rule_id = str(raw.get("rule_id") or "").strip()
+        entities = dispositions_module.entities_for(raw)
+        if not rule_id and not entities:
+            return
+        try:
+            found = await self._reader.recent_dispositions(str(state.tenant_id), rule_id=rule_id, entities=entities)
+        except Exception as exc:  # noqa: BLE001 - past decisions are advisory, triage is not
+            logger.warning("auto_triage_worker.disposition_lookup_failed", error=str(exc)[:200])
+            return
+        if not found.decisions:
+            return
+        state.recent_dispositions = found.as_state()
+        _METRICS["recent_dispositions_read"] += len(found.decisions)
+
+    async def _attach_identity_context(self, state: InvestigationState) -> None:
+        """Record who is behind the accounts this alert names, if anyone knows.
+
+        A tenant with no directory connector gets nothing here and nothing in
+        the prompt, which is the correct outcome: an empty block is silence,
+        and a block saying the principal is unidentified is a claim.
+        """
+        accounts = identity_module.accounts_for(state.raw_alert)
+        if not accounts:
+            return
+        try:
+            found = await self._reader.fetch_identity_context(str(state.tenant_id), accounts=accounts)
+        except Exception as exc:  # noqa: BLE001 - directory context is advisory, triage is not
+            logger.warning("auto_triage_worker.identity_lookup_failed", error=str(exc)[:200])
+            return
+        if not found.identities:
+            return
+        state.identity_context = found.as_state()
+        _METRICS["identity_context_read"] += len(found.identities)
+
     async def _maybe_suppress_from_memory(
         self,
         state: InvestigationState,
         signature: str,
         bc_matched: list[str],
+        *,
+        writer: TriageWriter,
     ) -> dict[str, Any] | None:
         """Auto-resolve a repeat alert from a trusted prior outcome (Wave 1).
 
         Returns a summary dict (and short-circuits triage) when suppressed, else
         None. Best-effort: any lookup failure falls through to normal triage.
+
+        Under a shadow sink this still runs and still reaches a verdict, and
+        still resolves nothing: suppression is what production would have done
+        with this alert, so it is exactly the decision worth measuring. The
+        sink declines the outcome and suppression writes, and the shadow flag
+        keeps the alert row open, so the analyst closes it themselves and the
+        agreement is real.
         """
         try:
             prior = await self._reader.lookup_prior(str(state.tenant_id), signature)
         except Exception as exc:  # noqa: BLE001 — memory read is advisory
             logger.debug("auto_triage_worker.memory_lookup_failed", error=str(exc))
             return None
-        if not should_auto_suppress(prior):
+        refusal = suppression_refusal(prior)
+        if refusal is not None:
+            # Logged with the reason. "Suppression declined" alone makes a
+            # control that has silently stopped working look identical to one
+            # that is working, and these rules decline far more often now
+            # than the old corroboration threshold did.
+            logger.debug(
+                "auto_triage_worker.suppression_declined",
+                signature=signature,
+                reason=refusal,
+            )
             return None
 
-        assert prior is not None  # narrowed by should_auto_suppress
+        assert prior is not None  # narrowed by suppression_refusal
         disposition = normalize_disposition(prior.get("disposition"), default=NEEDS_REVIEW)
         confidence = float(prior.get("confidence", 0.9))
         count = int(prior.get("count", 1))
@@ -749,9 +1042,9 @@ class FusedAlertTriageWorker:
 
         _METRICS["outcome_suppressed"] += 1
         _METRICS["triaged"] += 1
-        await self._record(state, tier="memory", verdict=disposition, confidence=confidence)
+        await self._record(state, tier="memory", verdict=disposition, confidence=confidence, writer=writer)
         with contextlib.suppress(Exception):
-            await self._writer.record_outcome(
+            await writer.record_outcome(
                 str(state.tenant_id),
                 signature,
                 disposition=disposition,
@@ -760,7 +1053,7 @@ class FusedAlertTriageWorker:
                 alert_id=(state.raw_alert or {}).get("id"),
             )
         with contextlib.suppress(Exception):
-            await self._writer.record_suppression(
+            await writer.record_suppression(
                 tenant_ref=str(state.tenant_id),
                 signature=signature,
                 alert_id=(state.raw_alert or {}).get("id"),
@@ -792,7 +1085,7 @@ class FusedAlertTriageWorker:
             "proposed_actions": [],
         }
 
-    async def _maybe_escalate(self, state: InvestigationState) -> None:
+    async def _maybe_escalate(self, state: InvestigationState, *, writer: TriageWriter) -> None:
         """Run the full investigation graph for an escalated alert (issue #569).
 
         Shares the same graph runner as the manual investigations API. Every
@@ -803,7 +1096,7 @@ class FusedAlertTriageWorker:
         # Two independent switches. The env flag is the operator's; the
         # writer's is the caller's, and a shadow run declines because every
         # graph node records itself to the ledger.
-        if not _escalation_enabled() or not self._writer.escalation_allowed:
+        if not _escalation_enabled() or not writer.escalation_allowed:
             return
         # Pre-fetch the same context an analyst-initiated investigation gets.
         # The manual orchestrator has built a ContextBundle since T2.1; the
@@ -821,7 +1114,7 @@ class FusedAlertTriageWorker:
             async with CostTracker(
                 run_id=str(state.run_id),
                 tenant_id=str(state.tenant_id),
-                persist=self._writer.persists_cost,
+                persist=writer.persists_cost,
             ):
                 await run_escalation(state, budget=default_budget(), seq_start=1)
             _METRICS["escalated"] += 1
@@ -919,6 +1212,7 @@ class FusedAlertTriageWorker:
         confidence: float,
         tokens: int = 0,
         cost: CostSummary | None = None,
+        writer: TriageWriter,
     ) -> None:
         """Durably persist the triage outcome (issue #571).
 
@@ -939,7 +1233,7 @@ class FusedAlertTriageWorker:
             }
             for a in state.proposed_actions
         ]
-        await self._writer.persist_auto_triage(
+        await writer.persist_auto_triage(
             run_id=state.run_id,
             alert_id=(state.raw_alert or {}).get("id"),
             tenant_ref=str(state.tenant_id),

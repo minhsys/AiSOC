@@ -11,7 +11,9 @@ FP / benign / benign_true_positive verdicts are auto-closed; true_positive and
 needs_review escalate into the full triage → enrichment → investigation
 pipeline.
 
-Metrics (module-level counters) are exposed via the /triage/stats API.
+Metrics are module-level counters. **No route exposes them**: the
+``/triage/stats`` endpoint this used to name has never existed in the tree.
+They are read in-process and by tests.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from typing import Any
 import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from app import closure as closure_policy
 from app.agents.dispositions import (
     AUTO_CLOSEABLE_DISPOSITIONS,
     BENIGN,
@@ -34,10 +37,18 @@ from app.agents.dispositions import (
     TRUE_POSITIVE,
     normalize_disposition,
 )
+from app.closure.qa_sampling import ClosureQaSampler
+from app.context.dispositions import basis as disposition_basis
+from app.context.dispositions import render_for_prompt as render_dispositions
+from app.context.identity import basis as identity_basis
+from app.context.identity import render_for_prompt as render_identity
+from app.context.knowledge_base import citation_basis, unresolvable_citations
+from app.context.knowledge_base import render_for_prompt as render_runbooks
 from app.context.organisation_memory import render_for_prompt
 from app.investigator.prompt_sanitizer import sanitize_text, wrap_untrusted
 from app.llm import safe_ainvoke
 from app.llm.factory import make_chat_model
+from app.llm.prompt_registry import prompt_text
 from app.llm.structured_output import extract_json_block
 from app.models.state import AgentStatus, InvestigationState
 from app.prompt_serialization import format_extra_fields_for_llm
@@ -46,6 +57,19 @@ from app.prompting.envelope import make_nonce, scan_evidence_fields, system_rule
 logger = structlog.get_logger()
 
 AUTO_CLOSE_THRESHOLD: float = float(os.getenv("AISOC_AUTO_CLOSE_THRESHOLD", "0.85"))
+
+#: Ceiling on the tenant-skill block in the triage prompt. The API caps each
+#: field at authoring time; this is the floor under a body written before
+#: those caps existed, and under a skill whose individually-legal fields sum
+#: to more prompt than the evidence gets.
+_MAX_SKILL_PROMPT_CHARS = 4000
+
+#: Ceiling on each first-party context block. Every renderer caps its own
+#: fields; this is the ceiling on the assembled block, and it exists because
+#: the default `sanitize_text` cap of 2000 would silently cut five analyst
+#: decisions mid-sentence. A truncated list of decisions reads to the model
+#: like a complete one.
+_MAX_CONTEXT_BLOCK_CHARS = 3000
 
 
 class AutoTriageError(RuntimeError):
@@ -69,51 +93,12 @@ _metrics: dict[str, Any] = {
     "btp_count": 0,
     "tp_count": 0,
     "injection_demoted": 0,
+    # Phase 6.3. A rationale citing a runbook marker no retrieved chunk
+    # carries. Counted rather than only logged: this is the one hallucination
+    # the groundedness scorer cannot see, because a marker is not an indicator
+    # and would never appear in the evidence text it checks against.
+    "kb_citations_unresolvable": 0,
 }
-
-_SYSTEM_PROMPT = """\
-You are the Auto-Triage Agent of an AI Security Operations Centre.
-
-Judge two INDEPENDENT questions, then pick one verdict:
-  1. Detection validity — did the rule correctly detect its intended condition?
-  2. Activity maliciousness — was the detected activity an actual threat?
-
-Classify the alert into exactly one of these verdicts:
-
-  • true_positive — a VALID detection of MALICIOUS or unauthorized activity
-    that requires investigation and potential response.
-  • benign_true_positive — a VALID detection of AUTHORIZED, expected, or
-    otherwise non-malicious activity. The rule fired correctly, but the
-    behaviour was sanctioned (e.g. a scheduled vulnerability scan, an approved
-    penetration test, sanctioned admin/red-team tooling). This is NOT a false
-    positive: the detection was right, so recording it as false_positive would
-    unfairly penalize the rule and corrupt its false-positive-rate metric.
-  • false_positive — an INVALID or noisy detection: the rule's intended
-    condition was not actually present (misfire, bad signature, mis-parsed
-    field). Only use this when the detection itself was wrong.
-  • benign — real but non-threatening activity that is not a detection-validity
-    statement (informational log, expected configuration change).
-  • needs_review — insufficient evidence to decide safely; route to a human.
-
-You MUST respond with a JSON object and nothing else:
-{
-  "verdict": "true_positive" | "benign_true_positive" | "false_positive" | "benign" | "needs_review",
-  "confidence": <float 0.0–1.0>,
-  "rationale": "<2-4 sentence explanation of your reasoning>"
-}
-
-Reasoning guidelines:
-- Consider the severity, IOC presence, MITRE technique IDs, and alert context.
-- Vendor risk_score > 0.7 with critical keywords strongly suggests true_positive.
-- Scheduled scans and authorized penetration tests, when the rule correctly
-  detected the behaviour, are benign_true_positive — NOT false_positive.
-- Reserve false_positive for cases where the rule misfired or its intended
-  detection condition was not actually present.
-- Informational alerts with no IOCs and low risk lean benign.
-- Be conservative: when uncertain, prefer true_positive or needs_review over
-  auto-closing, to avoid missing threats.
-- confidence should reflect how certain you are, not the severity of the threat.
-"""
 
 
 def get_metrics() -> dict[str, Any]:
@@ -129,6 +114,26 @@ def get_metrics() -> dict[str, Any]:
     return m
 
 
+def _alert_class_of(state: InvestigationState) -> str | None:
+    """The class a closure policy row keys on.
+
+    Prefers the explicit category the fused alert carries; falls back to the
+    detection rule's category, which is what the shadow-mode grants are
+    scoped by, so a grant and a policy row agree on what "this class" means.
+    """
+    for attribute in ("alert_class", "category", "alert_category"):
+        value = getattr(state, attribute, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    raw = getattr(state, "raw_alert", None) or {}
+    if isinstance(raw, dict):
+        for key in ("alert_class", "category", "rule_category"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
 def get_threshold() -> float:
     """Return the current auto-close confidence threshold."""
     return AUTO_CLOSE_THRESHOLD
@@ -142,7 +147,7 @@ def set_threshold(value: float) -> float:
     return AUTO_CLOSE_THRESHOLD
 
 
-def _build_alert_context(state: InvestigationState) -> str:
+def _build_alert_context(state: InvestigationState, *, nonce: str) -> str:
     """Serialise the alert into a compact string the LLM can reason over.
 
     ``state.organisation_memory`` is prepended, outside the untrusted-evidence
@@ -151,6 +156,21 @@ def _build_alert_context(state: InvestigationState) -> str:
     sanitised and length-capped — the statements interpolate alert-derived
     values like a process name, so they are tenant-authored but not
     operator-typed.
+
+    ``state.tenant_skill`` sits beside it on the same reasoning and with the
+    same treatment. It is typed into the console by a user holding
+    ``settings:write``, which is the same trust class, and it is capped for
+    the reason that applies regardless of trust: the prompt budget is shared
+    with the evidence the verdict is supposed to rest on. The block the
+    resolver rendered is used verbatim rather than re-rendered here, so the
+    text that steered the verdict is the text the provenance record names.
+
+    ``state.knowledge_base`` is the one that does **not** sit beside them, and
+    that is the whole reason this function now takes a nonce. A runbook is
+    long, frequently imported in bulk, edited by more people than a skill, and
+    routinely quotes attacker output verbatim while doing its job. So it goes
+    inside a nonce fence of its own, with the boundary sentence stated inline,
+    exactly as an MCP reply does. See ``app.context.knowledge_base``.
     """
     raw = state.raw_alert
     parts = [
@@ -184,10 +204,37 @@ def _build_alert_context(state: InvestigationState) -> str:
 
     telemetry = wrap_untrusted("\n".join(parts), label="alert_telemetry")
 
+    preamble: list[str] = []
+    skill = state.tenant_skill or {}
+    skill_guidance = str(skill.get("triage_guidance") or "").strip()
+    if skill_guidance:
+        preamble.append(sanitize_text(skill_guidance)[:_MAX_SKILL_PROMPT_CHARS])
     memory = render_for_prompt(state.organisation_memory)
-    if not memory:
+    if memory:
+        preamble.append(sanitize_text(memory))
+
+    # Both first-party, so both sit in the preamble beside organisation memory
+    # rather than inside the fence. A disposition and a reason code come from
+    # a closed server-owned vocabulary and the note is typed by an
+    # authenticated analyst; a directory record comes from the tenant's own
+    # import. Each renderer sanitises and caps its own fields, and
+    # `sanitize_text` here is the second pass the memory block already gets.
+    decisions = render_dispositions(state.recent_dispositions)
+    if decisions:
+        preamble.append(sanitize_text(decisions, max_len=_MAX_CONTEXT_BLOCK_CHARS))
+    who = render_identity(state.identity_context)
+    if who:
+        preamble.append(sanitize_text(who, max_len=_MAX_CONTEXT_BLOCK_CHARS))
+
+    # Not sanitised again on the way in: the retrieval already capped and
+    # sanitised each chunk, and `render_runbooks` fences the result. Running
+    # `sanitize_text` over the rendered block would rewrite the nonce markers
+    # it just placed, which is the one thing holding the fence together.
+    runbooks = render_runbooks(state.knowledge_base, nonce=nonce)
+
+    if not preamble and not runbooks:
         return telemetry
-    return f"{sanitize_text(memory)}\n\n{telemetry}"
+    return "\n\n".join([*preamble, *([runbooks] if runbooks else []), telemetry])
 
 
 def _close_truncated_json(fragment: str) -> str:
@@ -329,6 +376,27 @@ def _parse_llm_response(text: str) -> dict[str, Any]:
     }
 
 
+async def _sample_for_qa(state: InvestigationState, *, verdict: str, confidence: float) -> None:
+    """Record this closure for review, if it falls in the sample."""
+    tenant_id = str(getattr(state, "tenant_id", "") or "")
+    alert_id = str(getattr(state, "incident_id", "") or "")
+    if not tenant_id or not alert_id:
+        return
+    try:
+        sampler = ClosureQaSampler(await closure_policy.shared_pool())
+        decision = await sampler.record(
+            tenant_id=tenant_id,
+            alert_id=alert_id,
+            alert_class=_alert_class_of(state),
+            disposition=verdict,
+            confidence=confidence,
+        )
+        if decision.sampled:
+            state.add_finding(f"Selected for closure QA review: an analyst will score this auto-closure (sample rate {decision.rate:.0%}).")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("auto_triage.qa_sample_failed", error=str(exc), incident_id=alert_id)
+
+
 async def run_auto_triage(state: InvestigationState) -> InvestigationState:
     """
     LLM-based auto-triage: classify the alert and decide whether to
@@ -347,7 +415,7 @@ async def run_auto_triage(state: InvestigationState) -> InvestigationState:
     injection = scan_evidence_fields((str(k), v) for k, v in raw.items() if isinstance(v, str | int | float | list | dict))
     nonce = make_nonce()
 
-    alert_context = _build_alert_context(state)
+    alert_context = _build_alert_context(state, nonce=nonce)
 
     t0 = time.monotonic()
     try:
@@ -361,7 +429,7 @@ async def run_auto_triage(state: InvestigationState) -> InvestigationState:
         response = await safe_ainvoke(
             llm,
             [
-                SystemMessage(content=_SYSTEM_PROMPT + "\n\n" + system_rule(nonce)),
+                SystemMessage(content=prompt_text("triage.system") + "\n\n" + system_rule(nonce)),
                 HumanMessage(content=alert_context),
             ],
         )
@@ -410,13 +478,60 @@ async def run_auto_triage(state: InvestigationState) -> InvestigationState:
         f"LLM confidence: {confidence:.2f}",
         f"Rationale: {rationale}",
     ]
+    # Which version of which skill was in the prompt that produced this
+    # verdict. On the basis rather than only in a log line, because this is
+    # the field a disputed auto-close is explained from, and a log line is
+    # gone long before the dispute arrives.
+    skill_ref = str((state.tenant_skill or {}).get("ref") or "")
+    if skill_ref:
+        owner = str((state.tenant_skill or {}).get("owner") or "unrecorded")
+        state.confidence_basis.append(f"Tenant skill applied: {skill_ref} (owner: {owner})")
+
+    # Which runbook chunks the prompt carried, by the markers the rationale
+    # cites. Recorded on the basis for the same reason the skill reference is:
+    # a citation whose target nobody can find is not a citation, and the
+    # retrieval that produced it is cached and gone by the time anyone asks.
+    state.confidence_basis.extend(citation_basis(state.knowledge_base))
+    state.confidence_basis.extend(disposition_basis(state.recent_dispositions))
+    state.confidence_basis.extend(identity_basis(state.identity_context))
+    unresolvable = unresolvable_citations(rationale, state.knowledge_base)
+    if unresolvable:
+        # The model cited a runbook that was never retrieved. Named rather
+        # than left in the rationale looking like the others, because a marker
+        # that resolves to nothing is indistinguishable from one that resolves
+        # until somebody goes looking for the document.
+        state.confidence_basis.append(f"Knowledge base: the rationale cites {', '.join(unresolvable)}, which no retrieved chunk carries")
+        _metrics["kb_citations_unresolvable"] += 1
+        logger.warning(
+            "auto_triage.unresolvable_kb_citation",
+            incident_id=str(state.incident_id),
+            cited=unresolvable,
+        )
 
     state.add_finding(f"Auto-triage: verdict={verdict}, confidence={confidence:.2f}, latency={elapsed_ms}ms")
     state.add_finding(f"Auto-triage rationale: {rationale}")
 
     # Auto-close FP / benign / benign_true_positive (no active threat, no
     # response needed); true_positive and needs_review always escalate.
-    should_auto_close = verdict in AUTO_CLOSEABLE_DISPOSITIONS and confidence >= AUTO_CLOSE_THRESHOLD
+    #
+    # The threshold comes from the tenant's closure policy rather than the
+    # process-wide env var. Additive: a tenant with no policy row gets
+    # `AUTO_CLOSE_THRESHOLD` exactly as before. The policy also consults the
+    # earned `auto_close` grant, which until now had no reader at all, and
+    # the kill switch, which refuses closure outright.
+    closure = await closure_policy.decide(
+        tenant_id=str(state.tenant_id) if getattr(state, "tenant_id", None) else None,
+        alert_class=_alert_class_of(state),
+        confidence=confidence,
+        default_threshold=AUTO_CLOSE_THRESHOLD,
+    )
+    should_auto_close = verdict in AUTO_CLOSEABLE_DISPOSITIONS and closure.allowed
+
+    if verdict in AUTO_CLOSEABLE_DISPOSITIONS and not closure.allowed:
+        # Say why. An operator asking "why was this not closed" gets an
+        # answer rather than an alert that silently stayed open.
+        state.add_finding(f"Auto-close withheld: {closure.reason}")
+        state.confidence_basis.append(f"closure_policy={closure.source}")
 
     # Prompt-injection L0 demotion: a high-severity injection signal always
     # blocks auto-close and routes to a human, regardless of the LLM's verdict.
@@ -436,12 +551,19 @@ async def run_auto_triage(state: InvestigationState) -> InvestigationState:
     if should_auto_close:
         _metrics["auto_resolved_count"] += 1
         state.status = AgentStatus.COMPLETED
-        state.add_finding(f"Auto-closed as {verdict} (confidence {confidence:.2f} >= threshold {AUTO_CLOSE_THRESHOLD:.2f})")
+        # Parity 3.5. A fraction of closures goes to an analyst, so there
+        # is a measured closure accuracy on the tenant's own data rather
+        # than only a synthetic-corpus grade and a count of how many were
+        # closed. Best-effort: a sampling failure must not stop a closure
+        # the policy allowed.
+        await _sample_for_qa(state, verdict=verdict, confidence=confidence)
+        state.add_finding(f"Auto-closed as {verdict} (confidence {confidence:.2f} >= threshold {closure.threshold:.2f}, {closure.source})")
         logger.info(
             "Auto-triage: auto-closed",
             verdict=verdict,
             confidence=round(confidence, 2),
-            threshold=AUTO_CLOSE_THRESHOLD,
+            threshold=closure.threshold,
+            threshold_source=closure.source,
             incident_id=str(state.incident_id),
             elapsed_ms=elapsed_ms,
         )
@@ -455,7 +577,8 @@ async def run_auto_triage(state: InvestigationState) -> InvestigationState:
             "Auto-triage: escalating",
             verdict=verdict,
             confidence=round(confidence, 2),
-            threshold=AUTO_CLOSE_THRESHOLD,
+            threshold=closure.threshold,
+            threshold_source=closure.source,
             incident_id=str(state.incident_id),
             elapsed_ms=elapsed_ms,
         )

@@ -208,6 +208,39 @@ IN_BAND_CREDENTIAL_ROUTES: dict[str, tuple[str, str]] = {
         "osqueryd holds no bearer token at enrolment — this call is what establishes one — and the per-tenant enroll secret is checked "
         "before any write",
     ),
+    "services/api/app/api/v1/endpoints/mcp_servers.py::resolve_mcp_servers": (
+        "service_token_valid",
+        "the agents service reads its tenant's MCP servers here and holds no session; the shared X-AiSOC-Service-Token is compared in "
+        "constant time and fails closed when unset. Deliberately no session fallback, unlike the other dual-mode routes: this one "
+        "returns plaintext third-party credentials, and a console session is not a credential to read those",
+    ),
+    "services/api/app/api/v1/endpoints/feedback.py::recent_dispositions": (
+        "service_token_valid",
+        "the agents service reads this tenant's last few analyst decisions here on the path of a triage and holds no session; the "
+        "shared X-AiSOC-Service-Token is compared in constant time and fails closed when unset. No session fallback, unlike "
+        "/feedback/context-statements next door, because that route serves a console panel as well and this one has a single "
+        "caller",
+    ),
+    "services/api/app/api/v1/endpoints/graph.py::identity_context_for_triage": (
+        "service_token_valid",
+        "the agents service reads directory context for the principals an alert names here and holds no session; the shared "
+        "X-AiSOC-Service-Token is compared in constant time and fails closed when unset. An analyst reaches the same data through "
+        "GET /graph/incident-context/{alert_id}, which authenticates by session and traverses from the alert",
+    ),
+    "services/api/app/api/v1/endpoints/knowledge_base.py::retrieve_runbooks_for_triage": (
+        "service_token_valid",
+        "the agents service retrieves this tenant's runbooks here on the path of a triage and holds no session; the shared "
+        "X-AiSOC-Service-Token is compared in constant time and fails closed when unset. No session fallback, on the same "
+        "ground as the tenant-skill resolver: this route exists for one caller, and a route with one caller should accept "
+        "one kind of credential. An analyst reads the same chunks through POST /kb/query, which returns more",
+    ),
+    "services/api/app/api/v1/endpoints/tenant_skills.py::resolve_tenant_skills": (
+        "service_token_valid",
+        "the agents service reads its tenant's active investigation skills here on the path of an investigation and holds no session; "
+        "the shared X-AiSOC-Service-Token is compared in constant time and fails closed when unset. No session fallback, on a simpler "
+        "ground than the MCP registry's: this route exists for one caller, and a route with one caller should accept one kind of "
+        "credential. The console reads the same rows through GET /tenant-skills, which returns more",
+    ),
 }
 
 

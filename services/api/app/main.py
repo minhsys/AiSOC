@@ -10,10 +10,13 @@ import structlog
 from fastapi import FastAPI, HTTPException, Request, Response, Security, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 
 from app._health import install_health_routes
+from app.api.v1.endpoints.scim import ScimAuthFailed
+from app.api.v1.endpoints.scim import router as scim_router
 from app.api.v1.router import api_router
 from app.auth.oidc import router as oidc_router
 from app.auth.saml import router as saml_router
@@ -31,9 +34,14 @@ from app.middleware.audit_middleware import AuditMiddleware
 from app.middleware.demo_mode import DemoModeMiddleware
 from app.models import Base
 from app.services.plugin_manager import get_plugin_manager
+from app.services.scim.resources import SCIM_CONTENT_TYPE
+from app.services.scim.resources import error_response as scim_error_response
+from app.workers.approval_expiry import run_forever as run_approval_expiry
 from app.workers.hunt_scheduler import run_forever as run_hunt_scheduler
 from app.workers.oauth_refresh import run_forever as run_oauth_refresh
 from app.workers.retention_purge import run_forever as run_retention_purge
+from app.workers.retro_hunt_consumer import run_forever as run_retro_hunt_consumer
+from app.workers.shadow_reconcile import run_forever as run_shadow_reconcile
 from app.workers.weekly_digest_task import run_forever as run_weekly_digest
 
 _metrics_bearer = HTTPBearer(auto_error=False)
@@ -55,6 +63,15 @@ _HUNT_SCHEDULER_LOCK_TTL_SECONDS = 300
 # ClickHouse mutation with mutations_sync=1 blocks until it lands. 30m keeps
 # a second replica from starting a concurrent sweep mid-delete.
 _RETENTION_PURGE_LOCK_TTL_SECONDS = 1800
+# Shorter than the others: the sweep is a single bounded UPDATE, so a lock
+# held for half an hour after a crashed replica would leave approvals
+# un-expired for far longer than the work takes.
+_APPROVAL_EXPIRY_LOCK_TTL_SECONDS = 300
+# A shadow-reconciliation pass makes up to SHADOW_RECONCILE_MAX_CONNECTORS_PER_TICK
+# vendor searches, each bounded at 120s. 30m covers a slow pass without letting
+# a second replica start one on top of it, which would double a customer's
+# search load for no extra evidence.
+_SHADOW_RECONCILE_LOCK_TTL_SECONDS = 1800
 
 
 async def _run_guarded_scheduler_worker(
@@ -432,6 +449,85 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         except Exception as exc:
             logger.warning("hunt_scheduler worker failed to start", error=str(exc))
 
+    # Gap-closure Phase 2.1 (D15). Polls each measuring tenant's own SIEM for
+    # the closures their analysts made there. Without this the shadow-agreement
+    # scorecard only ever fills in for tenants whose analysts close alerts in
+    # this console, and a tenant working entirely in Splunk ES sees an empty
+    # page that reads as "the agent is not being evaluated".
+    #
+    # Default off: this reaches a third party's API on a timer, and the plan's
+    # standing rule is that a feature which calls out ships off by default.
+    shadow_reconcile_task: asyncio.Task | None = None
+    if settings.SHADOW_RECONCILE_ENABLED:
+        try:
+            shadow_reconcile_task = asyncio.create_task(
+                _run_guarded_scheduler_worker(
+                    job_name="shadow_reconcile",
+                    ttl_seconds=_SHADOW_RECONCILE_LOCK_TTL_SECONDS,
+                    worker=run_shadow_reconcile,
+                ),
+                name="shadow_reconcile_worker",
+            )
+            logger.info("shadow_reconcile worker started")
+        except Exception as exc:
+            logger.warning("shadow_reconcile worker failed to start", error=str(exc))
+    else:
+        # Said out loud, because the state this closes is one where an operator
+        # reads an empty scorecard and cannot tell a sweep that is off from one
+        # that is broken.
+        logger.info(
+            "shadow_reconcile worker disabled; closures made in a tenant's own SIEM will not be "
+            "reconciled. Set SHADOW_RECONCILE_ENABLED=true to poll them"
+        )
+
+    # Approval-SLA expiry (9b). `agent_approvals` has carried an `expires_at`
+    # and an `expired` status since migration 009; nothing wrote the status
+    # and nothing swept the column, so a console-raised approval nobody
+    # answered waited forever instead of timing out to its declared safe
+    # default. Expiring dispatches nothing -- `/decide` still accepts an
+    # expired row -- so this removes the pretence that the request is live
+    # without spending the decision on the operator's behalf.
+    approval_expiry_task: asyncio.Task | None = None
+    if settings.APPROVAL_EXPIRY_ENABLED:
+        try:
+            approval_expiry_task = asyncio.create_task(
+                _run_guarded_scheduler_worker(
+                    job_name="approval_expiry",
+                    ttl_seconds=_APPROVAL_EXPIRY_LOCK_TTL_SECONDS,
+                    worker=run_approval_expiry,
+                ),
+                name="approval_expiry_worker",
+            )
+            logger.info("approval_expiry worker started")
+        except Exception as exc:
+            logger.warning("approval_expiry worker failed to start", error=str(exc))
+    else:
+        # Said out loud: with this off, a pending approval never times out,
+        # and an operator reading the queue cannot tell an abandoned request
+        # from one still being considered.
+        logger.info(
+            "approval_expiry worker disabled; approvals with an expires_at will never move to 'expired'. "
+            "Set APPROVAL_EXPIRY_ENABLED=true to sweep them"
+        )
+
+    # Gap-closure Phase 8.1. The consumer for the `NEW_IOC` events
+    # `services/threatintel` has always emitted and nothing has ever read.
+    #
+    # Default off, and deliberately not guarded by the scheduler lock the
+    # three workers above use: this is a Kafka consumer group, so the broker
+    # already assigns partitions across replicas, and adding a lock on top
+    # would leave every replica but one subscribed to nothing.
+    retro_hunt_task: asyncio.Task | None = None
+    if settings.RETRO_HUNT_ENABLED:
+        try:
+            retro_hunt_task = asyncio.create_task(
+                run_retro_hunt_consumer(),
+                name="retro_hunt_consumer",
+            )
+            logger.info("retro_hunt consumer started")
+        except Exception as exc:
+            logger.warning("retro_hunt consumer failed to start", error=str(exc))
+
     # Phase 2.6 — flip /readyz to 200. All lifespan-managed
     # dependencies have been touched at this point (DB, Redis,
     # Neo4j, schedulers); the load balancer can route traffic
@@ -473,6 +569,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         except Exception as exc:
             logger.warning("hunt_scheduler worker shutdown error", error=type(exc).__name__)
 
+    if approval_expiry_task is not None and not approval_expiry_task.done():
+        approval_expiry_task.cancel()
+        try:
+            await approval_expiry_task
+        except asyncio.CancelledError:
+            logger.debug("approval_expiry worker cancelled during shutdown")
+        except Exception as exc:
+            logger.warning("approval_expiry worker shutdown error", error=type(exc).__name__)
+
     if retention_purge_task is not None and not retention_purge_task.done():
         retention_purge_task.cancel()
         try:
@@ -481,6 +586,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.debug("retention_purge worker cancelled during shutdown")
         except Exception as exc:
             logger.warning("retention_purge worker shutdown error", error=type(exc).__name__)
+
+    if shadow_reconcile_task is not None and not shadow_reconcile_task.done():
+        shadow_reconcile_task.cancel()
+        try:
+            await shadow_reconcile_task
+        except asyncio.CancelledError:
+            logger.debug("shadow_reconcile worker cancelled during shutdown")
+        except Exception as exc:
+            logger.warning("shadow_reconcile worker shutdown error", error=type(exc).__name__)
+
+    if retro_hunt_task is not None and not retro_hunt_task.done():
+        retro_hunt_task.cancel()
+        try:
+            await retro_hunt_task
+        except asyncio.CancelledError:
+            logger.debug("retro_hunt consumer cancelled during shutdown")
+        except Exception as exc:
+            logger.warning("retro_hunt consumer shutdown error", error=type(exc).__name__)
 
     if demo_bootstrap_task is not None and not demo_bootstrap_task.done():
         demo_bootstrap_task.cancel()
@@ -552,7 +675,29 @@ def create_application() -> FastAPI:
     app.include_router(api_router)
     app.include_router(saml_router)
     app.include_router(oidc_router)
+    # SCIM is mounted at /scim/v2 rather than under /api/v1. An identity
+    # provider is configured with a base URL and appends /Users and /Groups
+    # to it, and the discovery documents this service publishes name that
+    # same base, so the path has to be the one an administrator can paste.
+    app.include_router(scim_router)
     app.include_router(graphql_router, prefix="/graphql", tags=["graphql"])
+
+    # A SCIM client that presents a bad credential must receive a SCIM error
+    # document, not FastAPI's default. A provider shows an administrator
+    # whatever it got back, and `{"detail": "..."}` gives them nothing to act
+    # on while looking like the service is broken rather than the secret wrong.
+    @app.exception_handler(ScimAuthFailed)
+    async def _scim_auth_failed(request: Request, exc: ScimAuthFailed) -> JSONResponse:
+        # The reason is logged, never returned: telling an unauthenticated
+        # caller whether a secret was wrong, revoked or expired tells it
+        # which secrets exist.
+        logger.warning("scim: refused a request — %s", str(exc).replace("\r", "").replace("\n", " ")[:200])
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content=scim_error_response(status.HTTP_401_UNAUTHORIZED, "Invalid SCIM credential"),
+            media_type=SCIM_CONTENT_TYPE,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     return app
 

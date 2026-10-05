@@ -79,7 +79,7 @@ aisoc db upgrade
 #    which ships a partially-applied schema silently.
 
 # 5. Start the API service back up.
-docker compose -f infra/compose/docker-compose.dev.yml up -d api
+docker compose -f docker-compose.yml -f infra/compose/docker-compose.dev.yml up -d api
 
 # 6. Verify health and remove the maintenance gate.
 curl -fsS http://localhost:8000/healthz
@@ -120,10 +120,34 @@ pnpm install --frozen-lockfile
 # Additive migrations (the common case) are backward compatible, so the previous
 # code runs against the newer schema. If a migration was destructive, restore the
 # snapshot instead — the CHANGELOG flags those as irreversible.
-docker compose -f infra/compose/docker-compose.dev.yml up -d api
+docker compose -f docker-compose.yml -f infra/compose/docker-compose.dev.yml up -d api
 ```
 
 Major releases occasionally ship one-way migrations (e.g. column drops). When that's the case, the CHANGELOG flags the migration as "irreversible" and the only rollback is restoring from the database snapshot you took in step 2 of the pre-upgrade checklist.
+
+## Upgrading across a major
+
+Every major below changes behaviour rather than only schema, so read the row
+for each one you are crossing. The authoritative list of what breaks is the
+`### BREAKING` section of [`CHANGELOG.md`](https://github.com/beenuar/AiSOC/blob/main/CHANGELOG.md);
+this table says what an operator has to **do**.
+
+| From, to | What changes | What you do |
+|---|---|---|
+| any, **v10.0.0** | Services stop connecting to Postgres as a superuser, so the 92 row-level security policies begin to apply. The four services running their own alembic chain migrate as the owner, not as the app role. | Run the migrations with `DATABASE_MIGRATION_URL` set to the owning role. A service that still connects as a superuser bypasses every policy, so check the role before and after. |
+| v10, **v11.0.0** | `POST /v1/ingest` and `/v1/ingest/batch` require a credential. CORE needs **8 GB of memory and 20 GB of disk**, up from about 6.5 GB. | Mint an ingest token and set it on every producer before upgrading, or ingestion stops. Check the host has the headroom first. |
+| v11, **v12.0.0** | The actions service returns 503 on every mutating route, and the realtime edge rejects every connection, until their required secrets are set. | Set them before you start the stack. Both failures are deliberate and loud. |
+| v12, **v13.0.0** | 75 state-changing routes require a permission they did not require before, and several move to `settings:write`, which `soc_analyst`, `soc_lead` and `threat_hunter` do not hold. | Expect HTTP 403 where operators previously got 200. Review who needs `settings:write` before upgrading, not after. |
+| v13, **v14.0.0** | No route will confer a role, scope or organisation membership beyond the caller's own authority, and `platform_admin` and `admin` are unreachable from every API route. | The only way to mint a wildcard role is `python -m app.scripts.bootstrap_admin` against the database. Any automation that created one through the API stops working. |
+| v14, **v15.0.0** | `/api/v1/shifts` is removed and `/api/v1/threatintel/stix/*` reads answer 404 outside demo mode. `make up` starts a production-class stack and `AISOC_DEV_MODE` no longer defaults to on. | Delete any caller of those routes; neither served data anyone entered. Set `ENVIRONMENT=development` explicitly if you were relying on the dev auth bypass, and expect previously silent warnings to become boot refusals. |
+| v15.0.0, **v15.1.0** | Nothing breaks — two routes are added and none removed. Two behaviours change noticeably all the same: **CloudTrail deployments will see more alerts**, because every event previously collapsed onto a single one; and alert-triggered playbooks now actually run, where `find_matching()` had no production caller before. | No action required to upgrade. Expect the CloudTrail alert volume you should have been getting all along, and review which playbooks are enabled before upgrading, since a playbook that never fired will now fire — in preview by default, with three opt-ins needed before it can act. |
+| v15.1.0, **v16.0.0** | **The `cases` table is gone.** Migration 083 moves its rows into `aisoc_cases`, repoints the child foreign keys, and renames the old table to `cases_pre_consolidation` so nothing is lost. The two tables never synchronised: the console wrote one and every case metric read the other, so MTTR and the case counts were blind to every case an analyst created. Separately, SAML and OIDC sign-in now works — it returned 403 on every deployment because the connection table had no writer. | **Check your own SQL.** Anything querying `cases` — a Grafana panel, a scheduled export, a report — must read `aisoc_cases`. It will fail loudly with "relation does not exist" rather than returning stale rows, which is deliberate. The archive table is readable if you need to compare. Expect case metrics to change the moment you upgrade: they were under-reporting, not over-reporting. If you use SSO, create a connection at `POST /api/v1/sso-connections` before pointing users at it. |
+| v16.0.0, **v16.0.1** | **Nothing breaks.** A security release closing a high-severity privilege escalation (GHSA-4gx4-x7gm-4xq8): the check deciding whether a caller may *confer* authority read the caller's static role, while the check admitting it to the route read its database-resolved permissions. Where a tenant uses the `roles` and `user_roles` tables to narrow an account, those are different answers, and the narrowed account could grant itself anything its unnarrowed role carried. | **Upgrade if you restrict accounts through database-backed RBAC.** A deployment with no RBAC rows was never exposed — the static map was already the correct answer for it. After upgrading, a grant is refused when it exceeds what the caller actually holds, so an operator who had been relying on the wider static role to assign roles will now get HTTP 403; grant that operator the permissions through RBAC rather than widening its static role. |
+| v16.0.1, **v17.0.0** | **Three routes are removed**: `POST /detection-loop/suggest` and the two `GET /detection-loop/suggestions` reads, with their three schemas. No migration is needed because none of them ever worked — they queried `aisoc_alerts`, `aisoc_detection_rules` and `alerts.evidence`, none of which any migration creates, so every caller was already receiving an error. The governed equivalent is `POST /api/v1/detection-proposals`. **One number changes meaning without erroring, which is the one to read twice:** `alerts.total` on `/api/v1/metrics/dashboard` now counts *open* work — `new`, `triaging`, `in_progress` — rather than every alert ever received, and the severity counts beside it are scoped the same way. A panel charting cumulative intake from that field will drop to the size of your queue. Closed work is reported separately as `alerts.resolved`. Migration `090` adds three nullable columns to `aisoc_cases`; it is additive and runs automatically. |
+
+Upgrading more than one major at a time is supported but untested as a single
+step. Do them one at a time, running migrations between each, so that a
+failure names the version that caused it.
 
 ## Version skew
 

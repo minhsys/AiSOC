@@ -22,18 +22,23 @@ Configuration (env vars):
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
 import secrets
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
 from typing import Any
 from urllib.parse import urlencode, urlparse
 
 import httpx
 import jwt as _jwt
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse, Response
+
+from app.api.v1.deps import DBSession
+from app.auth.sso_provisioning import SsoProvisioningError, complete_sso_login
 
 logger = logging.getLogger(__name__)
 
@@ -82,22 +87,149 @@ async def _discover(issuer: str) -> dict[str, Any]:
     return data
 
 
-# ─── In-memory state store (replace with Redis in production) ─────────────────
+# ─── id_token verification ────────────────────────────────────────────────────
 
+
+class _IdTokenInvalid(Exception):
+    """The id_token did not verify. Carries why, for the log line only."""
+
+
+#: One JWKS client per issuer. `PyJWKClient` caches signing keys itself and
+#: re-fetches on an unknown `kid`, which is what makes provider key rotation
+#: work without a restart.
+_jwks_clients: dict[str, Any] = {}
+
+
+def _jwks_client_for(provider: dict[str, Any]) -> Any:
+    uri = provider.get("jwks_uri")
+    if not uri:
+        raise _IdTokenInvalid("the discovery document declares no jwks_uri")
+    client = _jwks_clients.get(uri)
+    if client is None:
+        client = _jwt.PyJWKClient(uri, cache_keys=True)
+        _jwks_clients[uri] = client
+    return client
+
+
+async def _verify_id_token(id_token: str, *, issuer: str, provider: dict[str, Any]) -> dict[str, Any]:
+    """Verify signature, issuer, audience and expiry, or raise.
+
+    Every failure mode raises rather than returning partial claims. An
+    id_token that fails any check is not a weaker token, it is a token
+    from somebody else.
+    """
+    client_id = os.getenv("OIDC_CLIENT_ID", "")
+    try:
+        signing_key = _jwks_client_for(provider).get_signing_key_from_jwt(id_token)
+    except _IdTokenInvalid:
+        raise
+    except Exception as exc:  # noqa: BLE001 - any JWKS failure is a refusal
+        raise _IdTokenInvalid(f"could not resolve a signing key: {exc}") from exc
+
+    # `iss` is compared against the issuer this deployment is configured
+    # for, not against the one inside the token.
+    expected_issuer = provider.get("issuer") or issuer
+    try:
+        return dict(
+            _jwt.decode(
+                id_token,
+                signing_key.key,
+                algorithms=provider.get("id_token_signing_alg_values_supported") or ["RS256"],
+                audience=client_id or None,
+                issuer=expected_issuer or None,
+                options={
+                    "verify_signature": True,
+                    "verify_exp": True,
+                    "verify_aud": bool(client_id),
+                    "verify_iss": bool(expected_issuer),
+                },
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _IdTokenInvalid(str(exc)) from exc
+
+
+# ─── State store ──────────────────────────────────────────────────────────────
+#
+# Redis-backed, with an in-process fallback for single-replica and test
+# deployments. This was a plain module dict, which breaks the flow outright
+# on more than one replica: the browser is redirected by the instance that
+# generated the state and comes back to whichever instance the load
+# balancer picks, so roughly (n-1)/n of sign-ins failed with "Invalid or
+# expired OIDC state" on an n-replica deployment.
+#
+# The entry holds the PKCE verifier and the nonce, so it is short-lived by
+# design — `_STATE_TTL_SECONDS` bounds how long an authorization code may
+# sit unredeemed.
+
+_STATE_TTL_SECONDS = 600
+_STATE_PREFIX = "aisoc:oidc:state:"
+
+#: Fallback only. Used when Redis is absent, which is a supported
+#: single-replica configuration.
 _state_store: dict[str, dict[str, str]] = {}
 
 
-def _store_state(state: str, data: dict[str, str]) -> None:
+@lru_cache(maxsize=1)
+def _state_redis() -> Any | None:
+    try:
+        from redis.asyncio import from_url  # noqa: PLC0415
+
+        from app.core.config import settings  # noqa: PLC0415
+
+        return from_url(str(settings.REDIS_URL), decode_responses=True)
+    except Exception:  # noqa: BLE001 - absence is a supported configuration
+        return None
+
+
+async def _store_state(state: str, data: dict[str, str]) -> None:
+    client = _state_redis()
+    if client is not None:
+        try:
+            await client.set(_STATE_PREFIX + state, json.dumps(data), ex=_STATE_TTL_SECONDS)
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "oidc.state_store_unavailable falling back to in-process: %s",
+                str(exc).replace("\r", "").replace("\n", " ")[:200],
+            )
     _state_store[state] = data
 
 
-def _pop_state(state: str) -> dict[str, str] | None:
+async def _pop_state(state: str) -> dict[str, str] | None:
+    """Read and delete in one step, so a state cannot be replayed."""
+    client = _state_redis()
+    if client is not None:
+        try:
+            raw = await client.getdel(_STATE_PREFIX + state)
+            if raw:
+                return dict(json.loads(raw))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "oidc.state_read_unavailable falling back to in-process: %s",
+                str(exc).replace("\r", "").replace("\n", " ")[:200],
+            )
     return _state_store.pop(state, None)
 
 
 _SAFE_REDIRECT_RE = re.compile(r"^/[\w\-./]*$")
 # Characters allowed in a safe relative redirect path.
 _SAFE_PATH_CHARS_RE = re.compile(r"[^\w\-./]")
+
+
+def _sso_feature_enabled() -> bool:
+    """SSO rides behind an explicit opt-in until a deployment verifies it."""
+    return (os.getenv("SSO_ENABLED") or "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _require_sso_enabled() -> None:
+    if not _sso_feature_enabled():
+        # One generic answer for disabled and unconfigured: the browser has
+        # no reason to learn which providers exist on this deployment.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="SSO sign-in is not enabled on this deployment.",
+        )
 
 
 def _safe_redirect(url: str) -> str:
@@ -121,6 +253,7 @@ def _safe_redirect(url: str) -> str:
 @router.get("/login")
 async def oidc_login(request: Request, redirect: str = "/") -> Response:
     """Initiate OIDC authorization code flow."""
+    _require_sso_enabled()
     issuer = os.getenv("OIDC_ISSUER")
     client_id = os.getenv("OIDC_CLIENT_ID")
     redirect_uri = os.getenv("OIDC_REDIRECT_URI", str(request.url_for("oidc_callback")))
@@ -129,12 +262,16 @@ async def oidc_login(request: Request, redirect: str = "/") -> Response:
 
     safe_redirect = _safe_redirect(redirect)
     if not issuer or not client_id:
-        # Stub mode
-        logger.warning("OIDC not configured (OIDC_ISSUER / OIDC_CLIENT_ID missing) — issuing stub token")
-        token = _issue_jwt({"sub": "oidc-stub-user", "email": "oidc@stub.local", "provider": "oidc-stub"})
-        resp = RedirectResponse(url=safe_redirect, status_code=302)
-        resp.set_cookie("aisoc_token", token, httponly=True, samesite="lax")
-        return resp
+        # This issued a signed session for a principal called
+        # `oidc-stub-user` that no identity provider had ever seen, and it
+        # fired whenever OIDC_ISSUER or OIDC_CLIENT_ID was unset, which is
+        # the default. An unconfigured identity provider has nothing to say
+        # about who the caller is.
+        logger.error("OIDC login requested but OIDC_ISSUER / OIDC_CLIENT_ID are not set")
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=("OIDC is not configured on this deployment: set OIDC_ISSUER and OIDC_CLIENT_ID."),
+        )
 
     try:
         provider = await _discover(issuer)
@@ -164,7 +301,7 @@ async def oidc_login(request: Request, redirect: str = "/") -> Response:
         params["code_challenge_method"] = "S256"
         state_data["verifier"] = verifier
 
-    _store_state(state, state_data)
+    await _store_state(state, state_data)
 
     auth_url = provider["authorization_endpoint"] + "?" + urlencode(params)
     response = RedirectResponse(url=auth_url)
@@ -175,6 +312,7 @@ async def oidc_login(request: Request, redirect: str = "/") -> Response:
 @router.get("/callback", name="oidc_callback")
 async def oidc_callback(
     request: Request,
+    db: DBSession,
     code: str = Query(...),
     state: str = Query(...),
     error: str | None = Query(None),
@@ -183,7 +321,7 @@ async def oidc_callback(
     if error:
         raise HTTPException(status_code=400, detail=f"OIDC error: {error}")
 
-    state_data = _pop_state(state)
+    state_data = await _pop_state(state)
     if state_data is None:
         raise HTTPException(status_code=400, detail="Invalid or expired OIDC state")
 
@@ -218,14 +356,48 @@ async def oidc_callback(
             raise HTTPException(status_code=502, detail=f"Token exchange failed: {token_resp.text}")
         tokens = token_resp.json()
 
-    # Decode id_token (no signature verification here — use provider JWKS in production)
+    # Verify the id_token against the provider's published JWKS.
+    #
+    # This used to decode with `options={"verify_signature": False}` under a
+    # comment saying to use JWKS in production. An unverified id_token is a
+    # base64 blob anyone can author: its `sub`, `email` and `groups` claims
+    # are attacker-controlled, and they are merged into the identity below.
+    # The userinfo response is TLS-authenticated and was carrying the real
+    # weight, but `{**claims, **userinfo}` means any claim userinfo omits
+    # came straight from the unverified token.
+    #
+    # Verification is mandatory. A token that does not verify is discarded
+    # rather than downgraded, because falling back to unverified claims on
+    # error is the same hole with an extra step.
     id_token = tokens.get("id_token", "")
     claims: dict[str, Any] = {}
     if id_token:
         try:
-            claims = _jwt.decode(id_token, options={"verify_signature": False})
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Failed to decode id_token claims: %s", exc)
+            claims = await _verify_id_token(id_token, issuer=issuer, provider=provider)
+        except _IdTokenInvalid as exc:
+            logger.warning(
+                "oidc.id_token_rejected issuer=%s reason=%s",
+                str(issuer).replace("\r", "").replace("\n", " ")[:200],
+                str(exc).replace("\r", "").replace("\n", " ")[:200],
+            )
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="The identity provider's id_token could not be verified.",
+            ) from exc
+
+        # The nonce was generated, sent and then never checked, which left
+        # the authorization-code flow open to replay of a token minted for
+        # a different sign-in attempt.
+        expected_nonce = (state_data or {}).get("nonce")
+        if expected_nonce and claims.get("nonce") != expected_nonce:
+            logger.warning(
+                "oidc.nonce_mismatch issuer=%s",
+                str(issuer).replace("\r", "").replace("\n", " ")[:200],
+            )
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="The identity provider's response did not match this sign-in attempt.",
+            )
 
     access_token = tokens.get("access_token", "")
 
@@ -241,22 +413,85 @@ async def oidc_callback(
                 userinfo = ui_resp.json()
 
     merged = {**claims, **userinfo}
-    token = _issue_jwt(
-        {
-            "sub": merged.get("sub", ""),
-            "email": merged.get("email", ""),
-            "name": merged.get("name", ""),
-            "picture": merged.get("picture", ""),
-            "provider": "oidc",
-            "iss_upstream": issuer,
-        }
-    )
+
+    # Parity 4.1. This used to issue a JWT carrying `sub`, `email`, `name`
+    # and `picture`, signed with `JWT_SECRET`, and set it as a cookie. That
+    # token authenticated nothing: the API verifies with
+    # `settings.SECRET_KEY`, requires `tenant_id` and `role`, and reads
+    # `Authorization: Bearer`, not a cookie. A user could complete the whole
+    # dance, land on the console, and find every request unauthenticated.
+    #
+    # The tenant comes from the configured connection rather than from the
+    # assertion, because an IdP that can name its own tenant can name
+    # somebody else's.
+    groups = _claim_groups(merged)
+    try:
+        session = await complete_sso_login(
+            db,
+            provider="oidc",
+            issuer=issuer,
+            email=str(merged.get("email") or ""),
+            subject=str(merged.get("sub") or ""),
+            # OIDC makes `email_verified` optional, and it arrives as a bool
+            # from most providers and the string "true" from a few. Anything
+            # that is not an affirmative is passed through as not-verified:
+            # "the provider did not say" is not "the provider said yes", and
+            # treating absence as consent is the whole of
+            # GHSA-qjjc-q2h2-56cg.
+            email_verified=_claim_is_true(merged.get("email_verified")),
+            name=merged.get("name"),
+            groups=groups,
+        )
+    except SsoProvisioningError as exc:
+        # A specific reason, not a generic failure. "No SSO connection is
+        # configured for this issuer" is an administrator's next action;
+        # "login failed" is a support ticket.
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
 
     redirect_url = _safe_redirect(state_data.get("redirect", "/"))
-    response = RedirectResponse(url=redirect_url, status_code=302)
-    response.set_cookie("aisoc_token", token, httponly=True, samesite="lax", secure=request.url.scheme == "https")
+    # The token travels in the fragment, which browsers do not send to the
+    # server and which does not land in an access log or a Referer header,
+    # and the console moves it into the storage its API client reads.
+    separator = "&" if "#" in redirect_url else "#"
+    response = RedirectResponse(
+            url=f"{redirect_url}{separator}access_token={session['access_token']}"
+            f"&refresh_token={session['refresh_token']}",
+            status_code=302,
+        )
     response.delete_cookie("oidc_state")
     return response
+
+
+def _claim_is_true(value: Any) -> bool:
+    """Whether a provider affirmatively asserted a boolean claim.
+
+    Returns `False` for `None`, for a missing claim, and for any string that
+    is not an affirmative. There is deliberately no "unknown" third state: the
+    only question the caller asks is "may this claim select an existing
+    account", and the answer to that for an unasserted claim is no.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes"}
+    return False
+
+
+def _claim_groups(claims: dict[str, Any]) -> list[str]:
+    """Group names from whichever claim this IdP uses.
+
+    Four spellings, because there is no standard one: Okta and Auth0 emit
+    `groups`, Entra emits `roles` or `groups` depending on the app
+    registration, and Keycloak emits whatever the mapper was named.
+    """
+    configured = (os.getenv("SSO_GROUPS_CLAIM") or "").strip()
+    for key in ((configured,) if configured else ()) + ("groups", "roles", "memberOf", "group_membership"):
+        value = claims.get(key)
+        if isinstance(value, list):
+            return [str(v) for v in value if v]
+        if isinstance(value, str) and value:
+            return [part.strip() for part in value.split(",") if part.strip()]
+    return []
 
 
 @router.get("/userinfo")

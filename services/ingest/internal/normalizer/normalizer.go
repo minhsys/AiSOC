@@ -207,6 +207,79 @@ var connectorProfiles = map[string]connectorProfile{
 			"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFORMATIONAL": 1,
 		},
 	},
+	// aisoc_sample — the batch the first-run wizard pushes.
+	//
+	// It goes through this door rather than being inserted into Postgres
+	// precisely so it proves something: a console full of seeded rows
+	// looks identical whether the pipeline works or is completely broken.
+	// Running the real path means a first-run operator who sees alerts
+	// has also seen ingest, normalisation, fusion and triage work.
+	//
+	// The vendor name says what it is. An alert from this batch is
+	// attributed to "AiSOC (sample data)" in the console's own source
+	// column, so a reader who never saw the wizard can still tell these
+	// apart from real telemetry — honesty that does not depend on anyone
+	// remembering context.
+	//
+	// 2001 for the same reason as the others at this class: these are
+	// already-judged findings with a severity the wizard sets, not raw
+	// telemetry waiting to be assessed.
+	"aisoc_sample": {
+		product:   OcsfProduct{Name: "Sample data", VendorName: "AiSOC"},
+		classUID:  2001,
+		className: "Security Finding",
+		fieldMap: map[string]string{
+			"created_at":  "time",
+			"title":       "message",
+			"description": "finding.desc",
+			"external_id": "finding.uid",
+			"severity":    "severity",
+			"src_ip":      "src_endpoint.ip",
+			"host":        "device.name",
+			"user_name":   "actor.user.name",
+		},
+		severityMap: _canonicalSeverityMap,
+	},
+	// aws_cloudtrail — the audit log of the AWS account itself.
+	//
+	// It had no entry here, and the symptom found in live QA is worse than
+	// "unmapped": every CloudTrail event collapsed into **one alert**. The
+	// generic fallback produces a title of "Security Finding from
+	// aws_cloudtrail" for every event and carries no vendor id, and the
+	// alert id is a v5 UUID derived from that content — so a console login
+	// and a DeleteTrail dedup onto the same row. A customer connecting
+	// CloudTrail would see exactly one alert no matter what happened in
+	// their account, which reads as a quiet estate rather than as a bug.
+	//
+	// Mapped from the connector's own lowercase keys (see
+	// `services/connectors/app/connectors/aws_cloudtrail.py::normalize`),
+	// not from raw CloudTrail field names: by the time ingest sees this the
+	// connector has already flattened it.
+	//
+	// 2001 Security Finding rather than 3005/6003, because the connector
+	// ships a curated ~80-event allow-list — it has already decided these
+	// are security-relevant, which is the same reasoning that puts a Splunk
+	// notable at 2001. Category 2 is always promoted, so an IAM policy
+	// change does not need to clear a severity bar to reach a human.
+	"aws_cloudtrail": {
+		product:   OcsfProduct{Name: "CloudTrail", VendorName: "AWS"},
+		classUID:  2001,
+		className: "Security Finding",
+		fieldMap: map[string]string{
+			"created_at": "time",
+			// `title` is the event name (ConsoleLogin, DeleteTrail), which
+			// is what makes two events two alerts rather than one.
+			"title":       "message",
+			"description": "finding.desc",
+			"external_id": "finding.uid",
+			"severity":    "severity",
+			"src_ip":      "src_endpoint.ip",
+			"user_name":   "actor.user.name",
+			"user_arn":    "actor.user.uid",
+			"aws_region":  "cloud.region",
+		},
+		severityMap: _canonicalSeverityMap,
+	},
 	// ai_runtime / ai_guardrail — the customer's AI estate.
 	//
 	// Two profiles rather than one, and the split is load-bearing. Routine AI

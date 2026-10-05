@@ -109,7 +109,7 @@ async def db():
 
 async def _teardown(session) -> None:
     await session.rollback()
-    for table in ("alerts", "cases", "connectors"):
+    for table in ("alerts", "aisoc_cases", "connectors"):
         await session.execute(
             text(f"DELETE FROM {table} WHERE tenant_id = ANY(:ids)"),
             {"ids": [str(t) for t in _ALL_TENANTS]},
@@ -405,10 +405,10 @@ async def test_mttr_is_null_rather_than_zero_when_nothing_closed(db) -> None:
 
     await db.execute(
         text(
-            "INSERT INTO cases (tenant_id, case_number, title, status, created_at, closed_at) "
+            "INSERT INTO aisoc_cases (tenant_id, case_number, title, status, created_at, closed_at) "
             "VALUES (:a, :num, 'closed case', 'closed', now() - interval '30 minutes', now())"
         ),
-        {"a": str(TENANT_A), "num": f"ISO-{uuid.uuid4().hex[:8]}"},
+        {"a": TENANT_A, "num": f"ISO-{uuid.uuid4().hex[:8]}"},
     )
     await db.commit()
 

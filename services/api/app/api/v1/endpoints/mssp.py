@@ -13,6 +13,44 @@ organisation model (migration 058), where the operator is its own object
 with members, per-member roles, and per-member tenant grants. Cross-tenant
 reads resolve their tenant list through
 `app.services.org_scope.resolve_portfolio_scope` and nothing else.
+
+Authorization
+-------------
+The two generations authorize through two different vocabularies, and that is
+deliberate rather than an oversight.
+
+The tenant-parented routes take a tenant-role permission. `_require_own_child`
+answers "is this child mine?" and says nothing about whether the caller may
+act on it, so before these constants existed a `viewer` who happened to sit in
+a managing tenant could push a rule pack into a customer, grant themselves a
+role over one, or delete a critical detection from one — the same shape as
+GHSA-wj5c-88hg-5926, one tenant boundary further out. The mapping is by what
+the row does, not by which table it lands in:
+
+* `rules:write` for rule packs and rule overrides. They are detection content;
+  an `exclude` override is read back by the effective-rule resolver keyed on
+  the *child's* tenant id and removes the rule from the ruleset their hunts
+  run against, so authoring one is authoring detection content for somebody
+  else's estate.
+* `users:write` for delegations. A delegation grants a role in another tenant,
+  which is user administration and nothing else.
+* `settings:write` for adoption. It changes the caller's tenant topology, and
+  it is the symmetric half of a consent invite the child writes through
+  `PATCH /tenants/me/settings` — also `settings:write`. Requiring less on this
+  side than the side that consents would be incoherent.
+* `cases:write` for provider notes. They are operator working material about a
+  managed customer, which is what every investigating role already holds and
+  what `viewer` deliberately does not. `settings:write` was the alternative and
+  is too strong: annotating a customer is not administering a tenant.
+
+The organisation routes authorize through `_admin_scope`, which requires an
+organisation `owner` or `admin`. That is the correct entitlement for a
+portfolio-scoped act and it is not interchangeable with a tenant role:
+`create_organization` is self-service, so an operator's founding member may
+hold any tenant role at all, and adding a tenant-role permission on top would
+lock them out of the organisation they own. `scripts/check_route_authz.py`
+counts only `require_permission`, so those four routes still appear in its
+ledger; they are authorized, by something it does not read.
 """
 
 from __future__ import annotations
@@ -20,14 +58,16 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import UTC, datetime
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.v1.deps import CurrentUser
+from app.api.v1.deps import CurrentUser, require_permission
 from app.api.v1.endpoints.auth import get_current_user
+from app.core.role_grants import RoleGrantDenied, authorize_role_grant
 from app.db.database import get_db
 from app.models.mssp import MSSPDelegation, MSSPTenantMetrics, MSSPTenantNote
 from app.models.organization import (
@@ -122,8 +162,8 @@ async def list_child_tenants(
 @router.post("/children/{child_id}/onboard", status_code=status.HTTP_200_OK)
 async def onboard_child_tenant(
     child_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
-    current_user: CurrentUser = Depends(get_current_user),
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[CurrentUser, Depends(require_permission("settings:write"))],
 ) -> dict[str, str]:
     """Link an existing tenant as a child, if that tenant invited the caller.
 
@@ -202,8 +242,8 @@ async def list_notes(
 @router.post("/notes", response_model=TenantNoteOut, status_code=status.HTTP_201_CREATED)
 async def create_note(
     body: TenantNoteCreate,
-    db: AsyncSession = Depends(get_db),
-    current_user: CurrentUser = Depends(get_current_user),
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[CurrentUser, Depends(require_permission("cases:write"))],
 ) -> MSSPTenantNote:
     await _require_own_child(db, current_user, body.child_id)
     note = MSSPTenantNote(
@@ -242,14 +282,31 @@ async def list_delegations(
 @router.post("/delegations", response_model=DelegationOut, status_code=status.HTTP_201_CREATED)
 async def create_delegation(
     body: DelegationCreate,
-    db: AsyncSession = Depends(get_db),
-    current_user: CurrentUser = Depends(get_current_user),
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[CurrentUser, Depends(require_permission("users:write"))],
 ) -> MSSPDelegation:
+    # Ownership first, so a caller probing for tenants they do not manage
+    # still gets the same 404 whatever role string they send.
     await _require_own_child(db, current_user, body.child_tenant_id)
+    # `granted_role` was an unvalidated string. Nothing resolves it into a
+    # session yet, so this was not exploitable — but it is a role name stored
+    # against a customer tenant, and the whole point of the column is that a
+    # future reader turns it into authority. Refusing an ungrantable value now
+    # means that reader cannot be the thing that makes it exploitable.
+    try:
+        granted_role = authorize_role_grant(
+            granter_role=current_user.role,
+            granter_scopes=current_user.scopes,
+            granter_permissions=current_user.resolved_permissions,
+            requested_role=body.granted_role,
+        )
+    except RoleGrantDenied as exc:
+        code = status.HTTP_422_UNPROCESSABLE_ENTITY if exc.unknown else status.HTTP_403_FORBIDDEN
+        raise HTTPException(status_code=code, detail=exc.reason) from exc
     delegation = MSSPDelegation(
         parent_tenant_id=current_user.tenant_id,
         child_tenant_id=body.child_tenant_id,
-        granted_role=body.granted_role,
+        granted_role=granted_role,
         granted_by_user=current_user.user_id,
         expires_at=body.expires_at,
     )
@@ -262,8 +319,8 @@ async def create_delegation(
 @router.delete("/delegations/{delegation_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 async def revoke_delegation(
     delegation_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
-    current_user: CurrentUser = Depends(get_current_user),
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[CurrentUser, Depends(require_permission("users:write"))],
 ) -> None:
     delegation = await db.get(MSSPDelegation, delegation_id)
     if not delegation or delegation.parent_tenant_id != current_user.tenant_id:
@@ -475,8 +532,8 @@ async def list_rule_packs(
 @router.post("/rule-packs", response_model=RulePackOut, status_code=status.HTTP_201_CREATED)
 async def create_rule_pack(
     body: RulePackCreate,
-    db: AsyncSession = Depends(get_db),
-    current_user: CurrentUser = Depends(get_current_user),
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[CurrentUser, Depends(require_permission("rules:write"))],
 ) -> MSSPRulePack:
     """Create a new rule pack (parent tenant only)."""
     pack = MSSPRulePack(
@@ -509,8 +566,8 @@ async def get_rule_pack(
 async def update_rule_pack(
     pack_id: uuid.UUID,
     body: RulePackUpdate,
-    db: AsyncSession = Depends(get_db),
-    current_user: CurrentUser = Depends(get_current_user),
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[CurrentUser, Depends(require_permission("rules:write"))],
 ) -> MSSPRulePack:
     pack = await db.get(MSSPRulePack, pack_id)
     if not pack or pack.parent_tenant_id != current_user.tenant_id:
@@ -531,8 +588,8 @@ async def update_rule_pack(
 @router.delete("/rule-packs/{pack_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 async def delete_rule_pack(
     pack_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
-    current_user: CurrentUser = Depends(get_current_user),
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[CurrentUser, Depends(require_permission("rules:write"))],
 ) -> None:
     pack = await db.get(MSSPRulePack, pack_id)
     if not pack or pack.parent_tenant_id != current_user.tenant_id:
@@ -545,8 +602,8 @@ async def delete_rule_pack(
 async def add_rule_to_pack(
     pack_id: uuid.UUID,
     body: RulePackRuleAdd,
-    db: AsyncSession = Depends(get_db),
-    current_user: CurrentUser = Depends(get_current_user),
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[CurrentUser, Depends(require_permission("rules:write"))],
 ) -> dict[str, str]:
     pack = await db.get(MSSPRulePack, pack_id)
     if not pack or pack.parent_tenant_id != current_user.tenant_id:
@@ -566,8 +623,8 @@ async def add_rule_to_pack(
 async def remove_rule_from_pack(
     pack_id: uuid.UUID,
     rule_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
-    current_user: CurrentUser = Depends(get_current_user),
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[CurrentUser, Depends(require_permission("rules:write"))],
 ) -> None:
     pack = await db.get(MSSPRulePack, pack_id)
     if not pack or pack.parent_tenant_id != current_user.tenant_id:
@@ -582,8 +639,8 @@ async def remove_rule_from_pack(
 async def assign_pack_to_child(
     pack_id: uuid.UUID,
     body: PackAssignmentCreate,
-    db: AsyncSession = Depends(get_db),
-    current_user: CurrentUser = Depends(get_current_user),
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[CurrentUser, Depends(require_permission("rules:write"))],
 ) -> MSSPRulePackAssignment:
     pack = await db.get(MSSPRulePack, pack_id)
     if not pack or pack.parent_tenant_id != current_user.tenant_id:
@@ -594,6 +651,11 @@ async def assign_pack_to_child(
 
     assignment = MSSPRulePackAssignment(
         pack_id=pack_id,
+        # Taken from the pack that was just loaded and ownership-checked,
+        # never from the request. The composite foreign key would reject a
+        # mismatch anyway; reading it from the pack means the rejection
+        # never has to happen.
+        parent_tenant_id=pack.parent_tenant_id,
         child_tenant_id=body.child_tenant_id,
         enabled=body.enabled,
         parameter_overrides=body.parameter_overrides,
@@ -607,8 +669,8 @@ async def assign_pack_to_child(
 @router.post("/overrides", response_model=RuleOverrideOut, status_code=status.HTTP_201_CREATED)
 async def create_rule_override(
     body: RuleOverrideCreate,
-    db: AsyncSession = Depends(get_db),
-    current_user: CurrentUser = Depends(get_current_user),
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[CurrentUser, Depends(require_permission("rules:write"))],
 ) -> MSSPRuleOverride:
     if body.action not in ("exclude", "customize"):
         raise HTTPException(status_code=422, detail="action must be 'exclude' or 'customize'")
@@ -650,8 +712,8 @@ async def list_overrides(
 @router.delete("/overrides/{override_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 async def delete_override(
     override_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
-    current_user: CurrentUser = Depends(get_current_user),
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[CurrentUser, Depends(require_permission("rules:write"))],
 ) -> None:
     override = await db.get(MSSPRuleOverride, override_id)
     if not override:
@@ -776,6 +838,35 @@ async def _admin_scope(scope: PortfolioScope = Depends(_scope)) -> PortfolioScop
             detail="Organisation owner or admin role required",
         )
     return scope
+
+
+def _require_org_grant_scope(granter: str | None, requested: str, *, current: str | None) -> None:
+    """Refuse an organisation role above the granter's own.
+
+    ``ORG_ROLES`` is ordered by authority, unlike the tenant roles, so this is
+    an index comparison rather than a permission-set comparison — but it is
+    the same property `app.core.role_grants` enforces there: nobody confers
+    what they do not hold. ``current`` covers the other half, since demoting
+    the sitting ``owner`` is how an ``admin`` would clear the way.
+
+    ``granter`` is ``str | None`` because ``PortfolioScope.org_role`` is.
+    ``_admin_scope`` has already refused a non-administering caller by the
+    time this runs, so ``None`` should be unreachable — an unrecognised or
+    absent role lands on a ceiling of -1 and confers nothing, which is the
+    direction to fail in if that ever stops being true.
+    """
+    rank = {role: index for index, role in enumerate(reversed(ORG_ROLES))}
+    ceiling = rank.get(granter or "", -1)
+    if rank.get(requested, len(ORG_ROLES)) > ceiling:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Cannot grant organisation role '{requested}': it is above your own '{granter}'",
+        )
+    if current is not None and rank.get(current, len(ORG_ROLES)) > ceiling:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Cannot change a member holding '{current}': it is above your own '{granter}'",
+        )
 
 
 class LimitHeadroomOut(BaseModel):
@@ -1022,16 +1113,23 @@ class TenantGrant(BaseModel):
 @router.post("/organizations", response_model=OrganizationOut, status_code=status.HTTP_201_CREATED)
 async def create_organization(
     body: OrganizationCreate,
-    db: AsyncSession = Depends(get_db),
-    current_user: CurrentUser = Depends(get_current_user),
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[CurrentUser, Depends(require_permission("settings:write"))],
 ) -> Organization:
     """Create an operator organisation around the caller's own tenant.
 
-    The creator becomes its owner. Available to any authenticated user
-    because there is no organisation to be a member of yet — the
-    home tenant is taken from the caller's session rather than the body, so
-    nobody can found an organisation on top of somebody else's tenant.
+    The creator becomes its owner. The home tenant is taken from the caller's
+    session rather than the body, so nobody can found an organisation on top
+    of somebody else's tenant.
     """
+    # Requires `settings:write` — the same permission as adoption, and for the
+    # same reason. There is no organisation to be a member of yet, so
+    # `_admin_scope` cannot be the control here; what founding one does is make
+    # the founder its owner, which is what the org-scoped routes below check
+    # for. Leaving this open meant a `viewer` could become an administering
+    # principal in one request and grant org roles and per-tenant scope from
+    # there. Rationale kept out of the docstring because FastAPI publishes that
+    # verbatim in docs/openapi.yaml.
     existing = (await db.execute(select(Organization).where(Organization.slug == body.slug))).scalar_one_or_none()
     if existing is not None:
         raise HTTPException(status_code=409, detail="Organisation slug already taken")
@@ -1077,14 +1175,29 @@ async def add_tenants_to_portfolio(
     db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, object]:
-    """Bring tenants under management.
+    """Bring tenants under management, with each tenant's consent.
 
-    A tenant already managed by another organisation is rejected rather than
-    reassigned: `organization_tenants` carries a unique constraint on
-    `tenant_id` precisely so a customer cannot end up in two portfolios, and
-    silently moving one would be a cross-tenant transfer performed by
-    whoever asked last.
+    A tenant must first invite this organisation by setting
+    `settings["mssp_parent_invite"]` to the managing tenant's id through
+    `PATCH /api/v1/tenants/me/settings`. The invite is single-use. A tenant
+    already managed by another organisation is rejected rather than reassigned.
     """
+    # Rationale kept out of the docstring because FastAPI publishes that
+    # verbatim in docs/openapi.yaml.
+    #
+    # This route previously accepted any tenant UUID whose row was unclaimed,
+    # checking only that the caller administers their *own* organisation — and
+    # creating an organisation is self-service. So three requests let any
+    # authenticated user, including one holding only `viewer`, pull an
+    # unrelated tenant's alerts, cases and posture into a portfolio they
+    # control (GHSA-mcg9-8pxf-j98v). The unclaimed precondition is not a
+    # mitigation: on a deployment not using MSSP, no tenant is claimed.
+    #
+    # The consent mechanism is the one `onboard_child_tenant` already uses,
+    # deliberately rather than a second one: it is gated on `settings:write`
+    # in the *child's* own settings and so cannot be forged from outside that
+    # tenant. A caller attaching their own tenant needs no invite — requiring
+    # them to invite themselves would be ceremony, not consent.
     added: list[str] = []
     rejected: dict[str, str] = {}
 
@@ -1097,6 +1210,23 @@ async def add_tenants_to_portfolio(
         if claim is not None:
             rejected[str(tenant_id)] = "already in this portfolio" if claim.org_id == scope.org_id else "managed by another organisation"
             continue
+
+        tenant_settings = dict(tenant.settings or {})
+        invited = str(tenant_settings.get(_MSSP_INVITE_SETTING) or "")
+        is_own_tenant = tenant_id == current_user.tenant_id
+        if not is_own_tenant and invited != str(current_user.tenant_id):
+            # Does not disclose whether an invite exists for someone else.
+            logger.warning(
+                "mssp.portfolio.refused_without_invite org=%s tenant=%s",
+                str(scope.org_id).replace("\r", "").replace("\n", " ")[:64],
+                str(tenant_id).replace("\r", "").replace("\n", " ")[:64],
+            )
+            rejected[str(tenant_id)] = "not invited: an admin of that tenant must invite you first"
+            continue
+        if invited:
+            tenant_settings.pop(_MSSP_INVITE_SETTING, None)
+            tenant.settings = tenant_settings  # type: ignore[assignment]
+
         db.add(
             OrganizationTenant(
                 org_id=scope.org_id,
@@ -1195,6 +1325,14 @@ async def upsert_member(
             )
         )
     ).scalar_one_or_none()
+
+    # `ORG_ROLES` is a vocabulary, not a grant scope. `_admin_scope` admits
+    # `owner` and `admin` alike, so without this an `admin` could appoint an
+    # `owner` — or demote the sitting one — which is the same shape as the
+    # tenant-role escalation in a second vocabulary. Checked after the member
+    # row is loaded because demotion needs the *current* role, and before any
+    # write.
+    _require_org_grant_scope(scope.org_role, body.org_role, current=None if member is None else str(member.org_role))
 
     if member is None:
         member = OrganizationMember(org_id=scope.org_id, user_id=body.user_id, org_role=body.org_role)

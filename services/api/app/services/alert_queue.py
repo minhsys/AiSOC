@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, case, func, literal, or_, select, update
@@ -39,6 +39,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.alert import Alert
 from app.models.sla import TenantSLAConfig
+from app.services import sla_events
+from app.services.alert_priority import AssetContext, IdentityContext, score_alert_priority
 from app.services.sla import DEFAULT_SLA_TARGETS
 
 # Severities that show up in the *unassigned* bucket of the queue.
@@ -288,6 +290,38 @@ def first_action(alert: Alert) -> QueueAction | None:
 # ─── Queue assembly ─────────────────────────────────────────────────────
 
 
+def queue_priority(alert: Any, *, asset: Any = None, identity: Any = None) -> int:
+    """The score this alert sorts by.
+
+    Wired here because the queue is the only surface where
+    prioritisation changes anything — a score nothing sorts on is a
+    column. Context is optional: most deployments have no CMDB on day
+    one and the queue must still work, in which case this is severity
+    alone.
+    """
+    result = score_alert_priority(
+        severity=str(getattr(alert, "severity", "") or "medium"),
+        asset=AssetContext(
+            asset_id=str(getattr(asset, "id", "") or "") or None,
+            criticality=str(getattr(asset, "criticality", "medium") or "medium"),
+            has_kev_vulnerability=bool(getattr(asset, "has_kev_vulnerability", False)),
+            exploitable_vuln_count=int(getattr(asset, "exploitable_vuln_count", 0) or 0),
+            internet_facing=bool(getattr(asset, "internet_facing", False)),
+        )
+        if asset is not None
+        else None,
+        identity=IdentityContext(
+            principal=str(getattr(identity, "principal", "") or "") or None,
+            privilege_tier=str(getattr(identity, "privilege_tier", "standard") or "standard"),
+            is_service=bool(getattr(identity, "is_service", False)),
+            is_break_glass=bool(getattr(identity, "is_break_glass", False)),
+        )
+        if identity is not None
+        else None,
+    )
+    return result.score
+
+
 async def build_queue(
     db: AsyncSession,
     *,
@@ -469,7 +503,22 @@ async def claim_alert(
     update_result = await db.execute(
         update(Alert)
         .where(Alert.id == alert_id, Alert.tenant_id == tenant_id, Alert.assigned_to_id.is_(None))
-        .values(assigned_to_id=user_id, assigned_at=now, updated_at=now)
+        .values(
+            assigned_to_id=user_id,
+            assigned_at=now,
+            updated_at=now,
+            # Acknowledgement time, written once. `alerts.first_seen_at` had
+            # no writer anywhere, so `/insights/soc` MTTA and `/metrics/soc`
+            # mttd_hours both averaged over NULL and published a confident
+            # `0.0` through `float(result or 0.0)` — a zero that read as
+            # "instant acknowledgement" while meaning "nobody measured".
+            #
+            # COALESCE rather than a plain assignment: a claim after a
+            # release is still the same alert, and resetting the clock on
+            # re-assignment would make MTTA measure the last handoff rather
+            # than the first human response.
+            first_seen_at=func.coalesce(Alert.first_seen_at, now),
+        )
         .returning(Alert.assigned_to_id)
     )
     winner = update_result.scalar_one_or_none()
@@ -486,6 +535,17 @@ async def claim_alert(
             return alert
         raise AlertAlreadyClaimedError(alert_id=alert_id, owner_id=actual_owner)
 
+    # The claim is the acknowledgement, so it is also the `acknowledged`
+    # SLA event. Emitted here rather than from a sweep so the timestamp is
+    # the moment it happened.
+    await sla_events.record_event(
+        db,
+        alert_id=alert_id,
+        tenant_id=tenant_id,
+        event_type="acknowledged",
+        actor_id=user_id,
+        occurred_at=now,
+    )
     await db.commit()
     await db.refresh(alert)
     return alert

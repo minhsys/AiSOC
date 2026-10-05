@@ -31,6 +31,26 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/auth/sso/status:
+    get:
+      tags:
+      - auth
+      summary: Sso Status
+      description: 'What the login screen asks before it offers SSO. Public: it reveals
+
+        only that SSO is offered, under what label, and whether password sign-in
+
+        remains open -- never issuers, client ids, endpoints or secrets.'
+      operationId: sso_status_api_v1_auth_sso_status_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Sso Status Api V1 Auth Sso Status Get
   /api/v1/auth/refresh:
     post:
       tags:
@@ -109,6 +129,24 @@ paths:
       security:
       - HTTPBearer: []
   /api/v1/api-keys:
+    get:
+      tags:
+      - api-keys
+      summary: List Api Keys
+      description: List all API keys for the current tenant (raw keys are never returned).
+      operationId: list_api_keys_api_v1_api_keys_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/ApiKeyOut'
+                type: array
+                title: Response List Api Keys Api V1 Api Keys Get
+      security:
+      - HTTPBearer: []
     post:
       tags:
       - api-keys
@@ -118,18 +156,12 @@ paths:
 
         The raw key value is returned **only once** in this response.'
       operationId: create_api_key_api_v1_api_keys_post
-      parameters:
-      - name: current_user
-        in: query
-        required: true
-        schema:
-          title: Current User
       requestBody:
-        required: true
         content:
           application/json:
             schema:
               $ref: '#/components/schemas/CreateApiKeyRequest'
+        required: true
       responses:
         '201':
           description: Successful Response
@@ -143,24 +175,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
-    get:
-      tags:
-      - api-keys
-      summary: List Api Keys
-      description: List all API keys for the current tenant (raw keys are never returned).
-      operationId: list_api_keys_api_v1_api_keys_get
       security:
       - HTTPBearer: []
-      responses:
-        '200':
-          description: Successful Response
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/ApiKeyOut'
-                title: Response List Api Keys Api V1 Api Keys Get
   /api/v1/api-keys/{key_id}:
     get:
       tags:
@@ -197,6 +213,8 @@ paths:
       summary: Update Api Key
       description: Update an API key's name, scopes, or expiry.
       operationId: update_api_key_api_v1_api_keys__key_id__patch
+      security:
+      - HTTPBearer: []
       parameters:
       - name: key_id
         in: path
@@ -205,11 +223,6 @@ paths:
           type: string
           format: uuid
           title: Key Id
-      - name: current_user
-        in: query
-        required: true
-        schema:
-          title: Current User
       requestBody:
         required: true
         content:
@@ -236,6 +249,8 @@ paths:
       description: Revoke (deactivate) an API key. The key can no longer be used for
         authentication.
       operationId: revoke_api_key_api_v1_api_keys__key_id__delete
+      security:
+      - HTTPBearer: []
       parameters:
       - name: key_id
         in: path
@@ -244,11 +259,6 @@ paths:
           type: string
           format: uuid
           title: Key Id
-      - name: current_user
-        in: query
-        required: true
-        schema:
-          title: Current User
       responses:
         '204':
           description: Successful Response
@@ -997,6 +1007,52 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/cases/{case_id}/reopen:
+    post:
+      tags:
+      - cases
+      summary: Reopen a closed case
+      description: "Bring a terminal case back, deliberately and on the record.\n\n\
+        Its own route rather than a backward edge in `TRANSITIONS`. The forward-only\n\
+        machine is what makes \"this case was closed\" mean something, and adding\n\
+        `closed -> investigating` to the table would let an ordinary `PATCH` --\n\
+        a title edit that happens to carry a status -- walk a case backwards\nsilently.\
+        \ `PATCH` stays forward-only.\n\nThree things separate this from a status\
+        \ change:\n\n* a reason is required, because an unexplained reopen is exactly\
+        \ what an\n  auditor asks about six months later;\n* `reopen_count` increments,\
+        \ so a case reopened four times is\n  distinguishable from one reopened once;\n\
+        * `closed_at` and `resolved_at` are cleared, because leaving them set\n  would\
+        \ make the case terminal and active at the same time -- and every\n  closure\
+        \ metric reads those columns."
+      operationId: reopen_case_api_v1_cases__case_id__reopen_post
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: case_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Case Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReopenCaseRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/cases/{case_id}/alerts:
     post:
       tags:
@@ -1433,6 +1489,7 @@ paths:
       tags:
       - cases
       summary: Get investigation run
+      description: One investigation run belonging to this case, in the caller's tenant.
       operationId: case_investigation_run_api_v1_cases__case_id__investigations__run_id__get
       security:
       - HTTPBearer: []
@@ -1459,6 +1516,41 @@ paths:
                 additionalProperties: true
                 title: Response Case Investigation Run Api V1 Cases  Case Id  Investigations  Run
                   Id  Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/cases/{case_id}/investigations/{run_id}/report.md:
+    get:
+      tags:
+      - cases
+      summary: Markdown incident report for one investigation run
+      description: The Markdown report the case workspace renders.
+      operationId: case_investigation_report_md_api_v1_cases__case_id__investigations__run_id__report_md_get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: case_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Case Id
+      - name: run_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Run Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            text/plain:
+              schema:
+                type: string
         '422':
           description: Validation Error
           content:
@@ -2373,6 +2465,58 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/onboarding/status:
+    get:
+      tags:
+      - onboarding
+      summary: Onboarding Status
+      description: 'What this tenant has set up, derived from its data.
+
+
+        Derived rather than stored. A `tenant.onboarded` boolean drifts the
+
+        moment somebody connects a source through the API, deletes their last
+
+        connector, or restores a backup — and a wizard that insists you are
+
+        finished when your estate is empty is worse than no wizard.'
+      operationId: onboarding_status_api_v1_onboarding_status_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OnboardingStatus'
+      security:
+      - HTTPBearer: []
+  /api/v1/onboarding/sample-data:
+    post:
+      tags:
+      - onboarding
+      summary: Load Sample Data
+      description: 'Push five labelled scenarios through the real pipeline.
+
+
+        Refuses on a tenant that already has real alerts. Sample rows in a
+
+        live queue are indistinguishable from real ones at a glance, and an
+
+        analyst who dismisses a genuine alert because they assumed it was
+
+        sample data is a worse outcome than an evaluator having to use a
+
+        second tenant.'
+      operationId: load_sample_data_api_v1_onboarding_sample_data_post
+      responses:
+        '202':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SampleDataResponse'
+      security:
+      - HTTPBearer: []
   /api/v1/tenants/me/identity:
     get:
       tags:
@@ -2507,7 +2651,12 @@ paths:
       tags:
       - tenants
       summary: Create User
-      description: Create a new user in the current tenant.
+      description: 'Create a new user in the current tenant.
+
+
+        The role must be one the caller could hold itself. `platform_admin` and
+
+        `admin` cannot be assigned through the API at all.'
       operationId: create_user_api_v1_tenants_me_users_post
       requestBody:
         content:
@@ -2535,7 +2684,12 @@ paths:
       tags:
       - tenants
       summary: Update User
-      description: Update a user.
+      description: 'Update a user.
+
+
+        A role change is bounded the same way creation is, and a principal
+
+        already holding `platform_admin` or `admin` cannot be re-roled here.'
       operationId: update_user_api_v1_tenants_me_users__user_id__patch
       security:
       - HTTPBearer: []
@@ -2560,6 +2714,127 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/UserResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/usage:
+    get:
+      tags:
+      - usage
+      summary: Get Usage
+      description: Daily usage for the caller's tenant, defaulting to the last 30
+        days.
+      operationId: get_usage_api_v1_usage_get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: start
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Start
+      - name: end
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: End
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Get Usage Api V1 Usage Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/usage/reconciliation:
+    get:
+      tags:
+      - usage
+      summary: Get Reconciliation
+      description: 'Compare the daily sum against one query over the whole window.
+
+
+        Exposed rather than kept in a test so an operator disputing an invoice
+
+        can run the same check the test runs, against their own rows.'
+      operationId: get_reconciliation_api_v1_usage_reconciliation_get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: start
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Start
+      - name: end
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: End
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Get Reconciliation Api V1 Usage Reconciliation Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/usage/export.csv:
+    get:
+      tags:
+      - usage
+      summary: Export Month
+      description: A month of usage as CSV, labelled with the organisation it belongs
+        to.
+      operationId: export_month_api_v1_usage_export_csv_get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: month
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: YYYY-MM; defaults to the current month
+          title: Month
+        description: YYYY-MM; defaults to the current month
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
         '422':
           description: Validation Error
           content:
@@ -3636,7 +3911,7 @@ paths:
         required: false
         schema:
           type: boolean
-          default: true
+          default: false
           title: Create Proposals
       responses:
         '200':
@@ -3949,6 +4224,153 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/FederatedSearchResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
+  /api/v1/agent-tools/backends:
+    get:
+      tags:
+      - agent-tools
+      summary: Which agent tools this tenant has a backend for
+      description: 'Enumerate what can be asked, so nothing else is advertised.
+
+
+        ``registry_reachable`` is part of the contract. A caller that reads an
+
+        unreachable action registry as "this tenant has no vendor tools" will
+
+        bind a smaller toolset and then investigate confidently without it, which
+
+        is the worst of the three outcomes. Reported as unknown instead.'
+      operationId: list_backends_api_v1_agent_tools_backends_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response List Backends Api V1 Agent Tools Backends Get
+      security:
+      - HTTPBearer: []
+  /api/v1/agent-tools/siem-search:
+    post:
+      tags:
+      - agent-tools
+      summary: Search every configured SIEM for one indicator
+      description: 'Run one typed indicator search across the tenant''s SIEMs.
+
+
+        The response separates three facts that an agent must not conflate: rows
+
+        that matched, sources that answered, and sources that could not be
+
+        searched. ``outcome`` is the single field a caller branches on.'
+      operationId: search_siem_api_v1_agent_tools_siem_search_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SiemSearchRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Search Siem Api V1 Agent Tools Siem Search Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
+  /api/v1/agent-tools/vendor-read:
+    post:
+      tags:
+      - agent-tools
+      summary: Run one read-only vendor verb
+      description: 'Dispatch one read verb, under the capability contract.
+
+
+        Refusals are 422 rather than a result with ``executed: false``, so a
+
+        caller cannot mistake "this verb is not allowed here" for "the vendor had
+
+        nothing". The one thing that is *not* a refusal is a vendor failure: that
+
+        comes back 200 with ``executed: false`` and a reason, because the caller
+
+        has to render it to a model as "could not check".'
+      operationId: vendor_read_api_v1_agent_tools_vendor_read_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VendorReadRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Vendor Read Api V1 Agent Tools Vendor Read Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
+  /api/v1/agent-tools/hunt-plan/execute:
+    post:
+      tags:
+      - agent-tools
+      summary: Run a hunting agent's structured plan against the event lake
+      description: 'Compile a validated plan and run it, tenant-scoped.
+
+
+        The tenant comes from the credential, never from the request, which is why
+
+        there is no tenant field on the model above. An unreachable lake is
+
+        reported as ``available: false`` with a reason rather than as zero rows:
+
+        an agent that reads the second as the first concludes an estate is clean
+
+        on evidence nobody gathered.'
+      operationId: execute_hunt_plan_api_v1_agent_tools_hunt_plan_execute_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HuntPlanExecuteRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Execute Hunt Plan Api V1 Agent Tools Hunt Plan Execute
+                  Post
         '422':
           description: Validation Error
           content:
@@ -5821,6 +6243,414 @@ paths:
                 title: Response Mitre Coverage Api V1 Marketplace Mitre Get
       security:
       - HTTPBearer: []
+  /api/v1/mcp-servers:
+    get:
+      tags:
+      - mcp-servers
+      summary: List Mcp Servers
+      description: Every MCP server registered for the caller's tenant.
+      operationId: list_mcp_servers_api_v1_mcp_servers_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/McpServerListResponse'
+      security:
+      - HTTPBearer: []
+    post:
+      tags:
+      - mcp-servers
+      summary: Register Mcp Server
+      description: 'Register a server for this tenant.
+
+
+        The tenant comes from the credential. A refusal is a 422 naming what was
+
+        wrong, because every refusal here is something an operator typed.'
+      operationId: register_mcp_server_api_v1_mcp_servers_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/McpServerCreate'
+        required: true
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/McpServerModel'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
+  /api/v1/mcp-servers/{server_id}:
+    patch:
+      tags:
+      - mcp-servers
+      summary: Update Mcp Server
+      description: Change a registered server. Absent fields are left alone.
+      operationId: update_mcp_server_api_v1_mcp_servers__server_id__patch
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: server_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Server Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/McpServerUpdate'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/McpServerModel'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - mcp-servers
+      summary: Remove Mcp Server
+      operationId: remove_mcp_server_api_v1_mcp_servers__server_id__delete
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: server_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Server Id
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/tenant-skills:
+    get:
+      tags:
+      - tenant-skills
+      summary: Every skill this tenant has authored
+      operationId: list_tenant_skills_api_v1_tenant_skills_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SkillListResponse'
+      security:
+      - HTTPBearer: []
+    put:
+      tags:
+      - tenant-skills
+      summary: Create or update a skill from its YAML
+      description: 'Save the document. A content change bumps the version and drops
+        to draft.
+
+
+        ``PUT`` with no id in the path because the id is inside the document: a
+
+        skill''s identity is the author''s slug, and taking it from a path as well
+
+        would create two authorities that can disagree.'
+      operationId: save_tenant_skill_api_v1_tenant_skills_put
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SaveSkillRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SkillModel'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
+  /api/v1/tenant-skills/{skill_id}:
+    get:
+      tags:
+      - tenant-skills
+      summary: One skill
+      operationId: get_tenant_skill_api_v1_tenant_skills__skill_id__get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: skill_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Skill Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SkillModel'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - tenant-skills
+      summary: Delete a skill and its history
+      description: 'For a skill created by mistake. To stop using a working one, retire
+        it.
+
+
+        Deleting removes the version history, which is what explains verdicts the
+
+        skill already steered. The docs say so beside this route.'
+      operationId: delete_tenant_skill_api_v1_tenant_skills__skill_id__delete
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: skill_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Skill Id
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/tenant-skills/{skill_id}/versions:
+    get:
+      tags:
+      - tenant-skills
+      summary: Every version of one skill, newest first
+      description: 'Resolve a ``skill@vN`` recorded on an investigation back to its
+        text.
+
+
+        This is the read that makes the version recorded on a verdict mean
+
+        something. Without it the pair is a number pointing at nothing.'
+      operationId: list_skill_versions_api_v1_tenant_skills__skill_id__versions_get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: skill_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Skill Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SkillVersionModel'
+                title: Response List Skill Versions Api V1 Tenant Skills  Skill Id  Versions
+                  Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/tenant-skills/validate:
+    post:
+      tags:
+      - tenant-skills
+      summary: Parse and validate without saving
+      description: 'Back the editor''s validate button with the same call the save
+        makes.
+
+
+        A 200 carrying ``valid: false`` rather than a 422: the editor asks this on
+
+        every keystroke pause, and an error status on a document the author is
+
+        still typing is a failed request in their network tab every few seconds.
+
+        The save route returns the 422.'
+      operationId: validate_tenant_skill_api_v1_tenant_skills_validate_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SaveSkillRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidateResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
+  /api/v1/tenant-skills/{skill_id}/backtest:
+    post:
+      tags:
+      - tenant-skills
+      summary: Grade this skill against the tenant's own closed findings, with and
+        without it
+      description: 'Start the two Phase 1 replay runs that grade this version.
+
+
+        202 for the same reason ``POST /evaluations/replay`` is: replaying a few
+
+        hundred findings through a model twice is not a request-response
+
+        operation. The ids come back immediately and the console polls both.
+
+
+        ``connectors:write`` rather than ``settings:write``, because what this
+
+        actually does is reach a customer''s own SIEM with stored credentials,
+
+        which is the bar every other route that does that clears.'
+      operationId: backtest_tenant_skill_api_v1_tenant_skills__skill_id__backtest_post
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: skill_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Skill Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SkillBacktestRequest'
+      responses:
+        '202':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SkillBacktestResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/tenant-skills/{skill_id}/activate:
+    post:
+      tags:
+      - tenant-skills
+      summary: Put a backtested skill into service
+      description: 'Activate, refusing anything that would put untested guidance in
+        front of alerts.
+
+
+        The refusals live in the store and are restated by the database
+
+        constraint, so neither this route nor a future caller can be the only
+
+        place the rule holds.'
+      operationId: activate_tenant_skill_api_v1_tenant_skills__skill_id__activate_post
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: skill_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Skill Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SkillModel'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/tenant-skills/{skill_id}/retire:
+    post:
+      tags:
+      - tenant-skills
+      summary: Take a skill out of service, keeping its history
+      operationId: retire_tenant_skill_api_v1_tenant_skills__skill_id__retire_post
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: skill_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Skill Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SkillModel'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/rbac/permissions:
     get:
       tags:
@@ -6248,6 +7078,164 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/branding:
+    get:
+      tags:
+      - branding
+      summary: Get Branding
+      description: 'What the product looks like for the caller''s tenant.
+
+
+        Readable by any authenticated member. The console calls it on every page
+
+        load, and gating it behind an administrative permission would leave an
+
+        analyst looking at a differently-branded product from their colleague.'
+      operationId: get_branding_api_v1_branding_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Get Branding Api V1 Branding Get
+      security:
+      - HTTPBearer: []
+    put:
+      tags:
+      - branding
+      summary: Put Branding
+      description: Set branding for the organisation the caller's tenant belongs to.
+      operationId: put_branding_api_v1_branding_put
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BrandingIn'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Put Branding Api V1 Branding Put
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
+  /api/v1/branding/assets/{kind}:
+    post:
+      tags:
+      - branding
+      summary: Upload Asset
+      description: 'Upload a logo or favicon.
+
+
+        An SVG goes through the sanitiser and what is stored is the sanitised
+
+        output. Nothing re-sanitises at render time, so this handler is the only
+
+        writer and the stored bytes are trusted thereafter.'
+      operationId: upload_asset_api_v1_branding_assets__kind__post
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: kind
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Kind
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Body_upload_asset_api_v1_branding_assets__kind__post'
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Upload Asset Api V1 Branding Assets  Kind  Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - branding
+      summary: Delete Asset
+      description: Remove an asset, returning that surface to the wordmark.
+      operationId: delete_asset_api_v1_branding_assets__kind__delete
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: kind
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Kind
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/branding/assets/{asset_id}:
+    get:
+      tags:
+      - branding
+      summary: Get Asset
+      description: 'Serve a brand asset from this deployment.
+
+
+        Scoped to the caller''s own organisation. The bytes are not secret, but
+
+        an unscoped read would let any authenticated user enumerate every
+
+        operator''s logo, which is a customer list.'
+      operationId: get_asset_api_v1_branding_assets__asset_id__get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: asset_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Asset Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/compliance/frameworks:
     get:
       tags:
@@ -6514,13 +7502,175 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/compliance/{framework}:
+    get:
+      tags:
+      - compliance
+      summary: One framework's control status
+      operationId: framework_detail_api_v1_compliance__framework__get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: framework
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Framework
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FrameworkDetail'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/compliance/{framework}/heatmap:
+    get:
+      tags:
+      - compliance
+      summary: Control status grid
+      operationId: framework_heatmap_api_v1_compliance__framework__heatmap_get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: framework
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Framework
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HeatmapResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/compliance/{framework}/collect:
+    post:
+      tags:
+      - compliance
+      summary: Collect what the platform can attest for this framework
+      description: 'Write a real evidence row per automatable control.
+
+
+        Rows join the same tamper-evident hash chain as manually collected
+
+        evidence, and land as `pending`: the platform attesting its own state is
+
+        a claim an auditor still has to accept, and auto-accepting would make the
+
+        review step decorative.'
+      operationId: framework_collect_api_v1_compliance__framework__collect_post
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: framework
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Framework
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CollectResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/compliance/{framework}/export:
+    get:
+      tags:
+      - compliance
+      summary: Export this framework's evidence
+      operationId: framework_export_api_v1_compliance__framework__export_get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: framework
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Framework
+      - name: fmt
+        in: query
+        required: false
+        schema:
+          type: string
+          pattern: ^(csv|json)$
+          default: csv
+          title: Fmt
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/metrics/dashboard:
     get:
       tags:
       - metrics
       summary: Get Dashboard Metrics
-      description: Return aggregated KPI metrics for the dashboard overview tiles.
+      description: 'Return aggregated KPI metrics for the dashboard overview tiles.
+
+
+        `period` drives every windowed figure below. It did not exist: the console
+
+        shipped a global time-window selector whose only consumer was itself, so
+
+        changing it re-rendered a header and fetched nothing. The trend chart and
+
+        the "closed this week" tile were fixed at 7 days whatever the control
+
+        said.
+
+
+        Counts of *current state* -- open alerts by severity -- are deliberately
+
+        not windowed. "How many criticals are open" is a question about now, and
+
+        answering it for the last hour would hide the backlog rather than scope
+
+        it.'
       operationId: get_dashboard_metrics_api_v1_metrics_dashboard_get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: period
+        in: query
+        required: false
+        schema:
+          type: string
+          pattern: ^(1h|24h|7d|30d)$
+          description: Time window for this view.
+          default: 24h
+          title: Period
+        description: Time window for this view.
       responses:
         '200':
           description: Successful Response
@@ -6528,8 +7678,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DashboardMetrics'
-      security:
-      - HTTPBearer: []
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/metrics/soc:
     get:
       tags:
@@ -6540,6 +7694,19 @@ paths:
         \ analyst overrides\n  - ATT&CK technique × tactic heatmap\n  - Confidence\
         \ calibration over time (reliability curve)"
       operationId: get_soc_metrics_api_v1_metrics_soc_get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: period
+        in: query
+        required: false
+        schema:
+          type: string
+          pattern: ^(1h|24h|7d|30d)$
+          description: Time window for this view.
+          default: 24h
+          title: Period
+        description: Time window for this view.
       responses:
         '200':
           description: Successful Response
@@ -6547,8 +7714,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SOCMetrics'
-      security:
-      - HTTPBearer: []
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/metrics/alerts/trend:
     get:
       tags:
@@ -6600,7 +7771,7 @@ paths:
 
         24h ago). Values are percentage changes rounded to two decimals; a delta
 
-        of ``0.0`` means "no meaningful baseline" (the previous window was empty).'
+        of ``None`` means "no baseline" (the previous window was empty).'
       operationId: get_funnel_metrics_api_v1_metrics_funnel_get
       security:
       - HTTPBearer: []
@@ -6611,8 +7782,10 @@ paths:
         schema:
           type: string
           pattern: ^(1h|24h|7d|30d)$
+          description: Time window for this view.
           default: 24h
           title: Period
+        description: Time window for this view.
       responses:
         '200':
           description: Successful Response
@@ -6755,6 +7928,191 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/health/audit-chain:
+    get:
+      tags:
+      - health
+      summary: Get Audit Chain Health
+      description: 'Whether the audit log''s tamper-evidence actually covers this
+        tenant.
+
+
+        `apps/docs/docs/operations/security.md` states that every state-changing
+
+        action is appended to an immutable, hash-chained log. That claim is only
+
+        true of rows that carry a hash, and the one signal that a row did not was
+
+        a `logger.warning` — which fired on every `alerts.explain` against a
+
+        default install for as long as a best-effort cost write could abort the
+
+        transaction underneath it. Nobody noticed, because an append-only log
+
+        going quiet looks exactly like an idle one.
+
+
+        So the question gets a surface. `unchained` counts rows this tenant holds
+
+        with no `entry_hash`, split into the ones written before migration 043
+
+        (which never had one and are not a defect) and the ones written after it
+
+        (which are). A reviewer asking "is the chain intact?" gets a number rather
+
+        than a grep.
+
+
+        `verified` replays the chain with `verify_chain` over the most recent
+
+        window, so a row that was rewritten in place is found rather than assumed
+
+        absent.
+
+
+        Since migration 074 the replay also separates breaks by `chain_epoch`.
+
+        Epoch 1 is the pre-074 unserialized writer, which could fork two audit
+
+        rows of one request onto the same predecessor; those rows were left
+
+        exactly as written rather than re-chained, so a healthy deployment can
+
+        legitimately hold epoch-1 breaks forever. An epoch-2 break cannot be
+
+        historical and is the number worth alerting on.'
+      operationId: get_audit_chain_health_api_v1_health_audit_chain_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Get Audit Chain Health Api V1 Health Audit Chain Get
+      security:
+      - HTTPBearer: []
+  /api/v1/health/shadow-reconciliation:
+    get:
+      tags:
+      - health
+      summary: Get Shadow Reconciliation Health
+      description: "Whether closures made in this tenant's own SIEM are being polled\
+        \ back.\n\nGap-closure Phase 2.1 (D15).\n\nA sweep that silently stopped and\
+        \ a sweep with nothing to do look identical\nfrom outside, and that ambiguity\
+        \ is what made the original gap invisible:\nthe reconciler existed, nothing\
+        \ called it, and the only symptom available\nto an operator was a scorecard\
+        \ that never filled in. So this reports the\nsubscription in every state,\
+        \ including the healthy one and the idle one,\nand names which it is.\n\n\
+        ``state`` is one of:\n\n``disabled``    the operator has not switched the\
+        \ sweep on. Not a fault,\n                and not a healthy idle sweep either.\n\
+        ``not_measuring`` the sweep runs, but this tenant has no alert class in\n\
+        \                shadow mode, so there is nothing to reconcile.\n``no_connector``\
+        \  this tenant is measuring and has no enabled connector of\n            \
+        \    a type with a closed-finding reader. Agreement is being\n           \
+        \     measured on AiSOC closures only, which is the honest answer\n      \
+        \          and is stated rather than left to be inferred.\n``blocked``   \
+        \  at least one connector needs an operator. The reason is a\n           \
+        \     sentence, and it will not clear by waiting.\n``degraded``    at least\
+        \ one connector is failing transiently and is being\n                retried.\n\
+        ``ok``          every configured connector polled."
+      operationId: get_shadow_reconciliation_health_api_v1_health_shadow_reconciliation_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Get Shadow Reconciliation Health Api V1 Health Shadow
+                  Reconciliation Get
+      security:
+      - HTTPBearer: []
+  /api/v1/health/dead-letters/replay:
+    post:
+      tags:
+      - health
+      summary: Replay Dead Letters
+      description: 'Re-read a bounded range of refused messages and replay what now
+        passes.
+
+
+        The action that follows a dead-letter queue, and the one Phase 5 left
+
+        undone: the backlog was reportable and nothing could drain it.
+
+
+        Safe rather than merely possible, in four ways.
+
+
+        *Deliberate.* The range is `(topic, partition, start_offset)`, supplied by
+
+        the caller. There is no "replay the backlog" — the excerpt stored on a
+
+        dead-letter row is a truncated triage record, not the event, so the
+
+        replay re-reads the real message from Kafka and the operator says which.
+
+
+        *Bounded.* `max_messages` is capped at 1000 by this request model, again
+
+        by the fusion service, and again by a CHECK constraint on the audit
+
+        table. A bound in one place is a bound the next caller skips.
+
+
+        *Authorised and attributable.* `connectors:write` rather than the
+
+        identity-only dependency the sibling GET carries, because this one
+
+        re-injects production traffic. The row records who asked.
+
+
+        *Observable, and honest about failure.* One `aisoc_dlq_replays` row per
+
+        request including dry runs, written before fusion is called so an
+
+        attempt that hangs still left evidence, and a failed replay reports the
+
+        reason rather than a zero that reads like "nothing to do".
+
+
+        The property that makes it safe at all is in fusion: every message is
+
+        re-validated by the validator that refused it, and one that still fails
+
+        is refused again instead of being produced. Replaying a poison batch into
+
+        the consumer that rejected it reproduces the outage, so a preview whose
+
+        `would_pass` is zero is the answer "your fix has not landed".
+
+
+        Defaults to a dry run. Pass `execute: true` once the preview is clean.'
+      operationId: replay_dead_letters_api_v1_health_dead_letters_replay_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DlqReplayRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DlqReplayResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
   /api/v1/insights/soc:
     get:
       tags:
@@ -7445,6 +8803,132 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/investigations/{run_id}/bundle:
+    get:
+      tags:
+      - investigations
+      summary: Export Evidence Bundle
+      description: 'Export this investigation as a signed, replayable evidence bundle.
+
+
+        Two exports of one run produce identical bytes, so an auditor can
+
+        diff them, re-hash them, and check the signature without trusting
+
+        this endpoint. Prompts travel as digests rather than text, because a
+
+        bundle is the artefact most likely to leave the customer''s control
+
+        and a prompt carries their hostnames and usernames.
+
+
+        Served as a download rather than JSON so what the auditor verifies is
+
+        the same byte sequence the signature was computed over. A client that
+
+        re-serialised a parsed body would change the bytes and the signature
+
+        would stop matching for a reason nobody could see.'
+      operationId: export_evidence_bundle_api_v1_investigations__run_id__bundle_get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: run_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Run Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/kill-switch:
+    get:
+      tags:
+      - autonomy
+      summary: Is autonomous action frozen
+      description: 'Readable by any authenticated user in the tenant.
+
+
+        Deliberately not behind a write permission: an analyst watching the
+
+        queue stop moving needs to be able to find out why without asking an
+
+        administrator.'
+      operationId: read_kill_switch_api_v1_kill_switch_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KillSwitchState'
+      security:
+      - HTTPBearer: []
+  /api/v1/kill-switch/engage:
+    post:
+      tags:
+      - autonomy
+      summary: Freeze autonomous closure and action dispatch for this tenant
+      operationId: engage_api_v1_kill_switch_engage_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EngageRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KillSwitchState'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
+  /api/v1/kill-switch/release:
+    post:
+      tags:
+      - autonomy
+      summary: Resume autonomous closure and action dispatch
+      operationId: release_api_v1_kill_switch_release_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReleaseRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KillSwitchState'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
   /api/v1/ledger/{run_id}/publish/preview:
     post:
       tags:
@@ -8624,6 +10108,241 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/scim-tokens:
+    get:
+      tags:
+      - scim
+      summary: List Scim Tokens
+      description: List this tenant's SCIM credentials. Secrets are never returned.
+      operationId: list_scim_tokens_api_v1_scim_tokens_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/ScimTokenOut'
+                type: array
+                title: Response List Scim Tokens Api V1 Scim Tokens Get
+      security:
+      - HTTPBearer: []
+    post:
+      tags:
+      - scim
+      summary: Create Scim Token
+      description: Mint a SCIM credential for this tenant.
+      operationId: create_scim_token_api_v1_scim_tokens_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateScimTokenRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedScimTokenOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
+  /api/v1/scim-tokens/{token_id}/rotate:
+    post:
+      tags:
+      - scim
+      summary: Rotate Scim Token
+      description: Replace a credential, leaving the old one working for a grace window.
+      operationId: rotate_scim_token_api_v1_scim_tokens__token_id__rotate_post
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: token_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Token Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RotateScimTokenRequest'
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedScimTokenOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/scim-tokens/{token_id}:
+    delete:
+      tags:
+      - scim
+      summary: Revoke Scim Token
+      description: 'Revoke a credential immediately.
+
+
+        The row stays, because ``aisoc_scim_users.token_id`` references it and
+
+        the audit trail answers "which integration provisioned this principal"
+
+        through it.'
+      operationId: revoke_scim_token_api_v1_scim_tokens__token_id__delete
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: token_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Token Id
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/sso-connections:
+    get:
+      tags:
+      - sso
+      summary: List Sso Connections
+      description: Every SSO connection this tenant has configured.
+      operationId: list_sso_connections_api_v1_sso_connections_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/SsoConnectionOut'
+                type: array
+                title: Response List Sso Connections Api V1 Sso Connections Get
+      security:
+      - HTTPBearer: []
+    post:
+      tags:
+      - sso
+      summary: Create Sso Connection
+      description: 'Configure an identity provider for this tenant.
+
+
+        Until one of these exists, every SAML and OIDC sign-in answers 403 —
+
+        `resolve_connection` finds no row and refuses rather than guessing a
+
+        tenant from the assertion.'
+      operationId: create_sso_connection_api_v1_sso_connections_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SsoConnectionIn'
+        required: true
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SsoConnectionOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
+  /api/v1/sso-connections/{connection_id}:
+    patch:
+      tags:
+      - sso
+      summary: Update Sso Connection
+      description: 'Replace a connection''s configuration.
+
+
+        The tenant is not settable: moving a connection between tenants would
+
+        silently re-home every user who signs in through it.'
+      operationId: update_sso_connection_api_v1_sso_connections__connection_id__patch
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: connection_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Connection Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SsoConnectionIn'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SsoConnectionOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - sso
+      summary: Delete Sso Connection
+      description: Remove a connection. Sign-ins through that issuer start answering
+        403 again.
+      operationId: delete_sso_connection_api_v1_sso_connections__connection_id__delete
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: connection_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Connection Id
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/assets:
     get:
       tags:
@@ -9747,13 +11466,11 @@ paths:
       description: 'Create an operator organisation around the caller''s own tenant.
 
 
-        The creator becomes its owner. Available to any authenticated user
+        The creator becomes its owner. The home tenant is taken from the caller''s
 
-        because there is no organisation to be a member of yet — the
+        session rather than the body, so nobody can found an organisation on top
 
-        home tenant is taken from the caller''s session rather than the body, so
-
-        nobody can found an organisation on top of somebody else''s tenant.'
+        of somebody else''s tenant.'
       operationId: create_organization_api_v1_mssp_organizations_post
       requestBody:
         content:
@@ -9796,18 +11513,16 @@ paths:
       tags:
       - mssp
       summary: Add Tenants To Portfolio
-      description: 'Bring tenants under management.
+      description: 'Bring tenants under management, with each tenant''s consent.
 
 
-        A tenant already managed by another organisation is rejected rather than
+        A tenant must first invite this organisation by setting
 
-        reassigned: `organization_tenants` carries a unique constraint on
+        `settings["mssp_parent_invite"]` to the managing tenant''s id through
 
-        `tenant_id` precisely so a customer cannot end up in two portfolios, and
+        `PATCH /api/v1/tenants/me/settings`. The invite is single-use. A tenant
 
-        silently moving one would be a cross-tenant transfer performed by
-
-        whoever asked last.'
+        already managed by another organisation is rejected rather than reassigned.'
       operationId: add_tenants_to_portfolio_api_v1_mssp_organizations_current_tenants_post
       requestBody:
         content:
@@ -10798,6 +12513,238 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/autonomy-policy/shadow-mode:
+    get:
+      tags:
+      - autonomy-policy
+      summary: Get Shadow Mode
+      description: Which alert classes this tenant is measuring rather than acting
+        on.
+      operationId: get_shadow_mode_api_v1_autonomy_policy_shadow_mode_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShadowModeResponse'
+      security:
+      - HTTPBearer: []
+  /api/v1/autonomy-policy/shadow-mode/{alert_class}:
+    put:
+      tags:
+      - autonomy-policy
+      summary: Set Shadow Mode
+      description: 'Start or stop measuring one alert class.
+
+
+        ``enabled_at`` is stamped on the transition into shadow and cleared on the
+
+        way out, rather than being set on every write. A promotion window that
+
+        reaches further back than the day measurement started is reaching back
+
+        before there was anything to measure, and the only way a later reader can
+
+        tell is if this column records the real start.'
+      operationId: set_shadow_mode_api_v1_autonomy_policy_shadow_mode__alert_class__put
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: alert_class
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Alert Class
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ShadowModeUpdateRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShadowModeEntry'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/autonomy-policy/agreement:
+    get:
+      tags:
+      - autonomy-policy
+      summary: Get Agreement
+      description: 'Rolling agreement between the agent and this tenant''s own analysts.
+
+
+        The tenant comes from the credential. ``scope_kind`` and ``scope_key``
+
+        narrow *within* that tenant and cannot widen beyond it: the scope names a
+
+        dimension from a fixed vocabulary, never a column, and the tenant
+
+        predicate is applied whatever the scope says.
+
+
+        Closures made in this console are reconciled on the way in rather than by
+
+        a background job. The sweep is bounded and indexed, and doing it here
+
+        means the number an operator is looking at includes the alert they closed
+
+        a minute ago, which is exactly when they come to look.'
+      operationId: get_agreement_api_v1_autonomy_policy_agreement_get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: scope_kind
+        in: query
+        required: false
+        schema:
+          type: string
+          description: tenant, alert_class, rule, source or model
+          default: tenant
+          title: Scope Kind
+        description: tenant, alert_class, rule, source or model
+      - name: scope_key
+        in: query
+        required: false
+        schema:
+          type: string
+          maxLength: 200
+          default: '*'
+          title: Scope Key
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgreementResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/autonomy-policy/grants:
+    get:
+      tags:
+      - autonomy-policy
+      summary: List Autonomy Grants
+      description: 'Every capability this tenant holds or has held, re-checked on
+        the way out.
+
+
+        Reconciliation runs first. A grant whose evidence has slipped below the
+
+        demotion floors is demoted here rather than being listed as current and
+
+        quietly failing at dispatch, which would leave an operator reading a page
+
+        that disagrees with the product.'
+      operationId: list_autonomy_grants_api_v1_autonomy_policy_grants_get
+      security:
+      - HTTPBearer: []
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GrantListResponse'
+    post:
+      tags:
+      - autonomy-policy
+      summary: Request Autonomy Grant
+      description: 'Ask for a capability. The evidence decides; an operator may overrule.
+
+
+        A refusal is a 200 carrying `granted: false` and the reasons, not an
+
+        error. Being told no by a safety control is the control working, and
+
+        rendering it as a failure invites a client to retry it.
+
+
+        The tenant comes from the credential. `scope_key` narrows within that
+
+        tenant and cannot reach past it.'
+      operationId: request_autonomy_grant_api_v1_autonomy_policy_grants_post
+      security:
+      - HTTPBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PromotionRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PromotionResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - autonomy-policy
+      summary: Revoke Autonomy Grant
+      description: 'Hand a capability back.
+
+
+        Audited as a revocation rather than as a demotion. A human deciding to
+
+        stop and the evidence deciding for them are different events, and one word
+
+        for both would make "was this taken away because the numbers slipped"
+
+        unanswerable from the log.'
+      operationId: revoke_autonomy_grant_api_v1_autonomy_policy_grants_delete
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: scope_kind
+        in: query
+        required: true
+        schema:
+          type: string
+          title: Scope Kind
+      - name: scope_key
+        in: query
+        required: true
+        schema:
+          type: string
+          maxLength: 200
+          title: Scope Key
+      - name: capability
+        in: query
+        required: true
+        schema:
+          type: string
+          title: Capability
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/business-context/rules:
     get:
       tags:
@@ -11038,104 +12985,6 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
       security:
       - HTTPBearer: []
-  /api/v1/detection-loop/suggest:
-    post:
-      tags:
-      - detection_rules
-      - detection_loop
-      summary: Draft Sigma improvement for a FP alert
-      description: 'Retrieve the triggering rule + alert evidence, then draft a Sigma
-        improvement.
-
-
-        Tenant isolation: the alert and rule lookups are scoped to ``user.tenant_id``
-
-        so a caller cannot pull another tenant''s evidence by guessing an ``alert_id``.
-
-        ``TenantDBSession`` also sets the Postgres RLS context for defense in depth.'
-      operationId: suggest_fp_fix_api_v1_detection_loop_suggest_post
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/SuggestRequest'
-        required: true
-      responses:
-        '201':
-          description: Successful Response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/SuggestionResponse'
-        '422':
-          description: Validation Error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
-      security:
-      - HTTPBearer: []
-  /api/v1/detection-loop/suggestions:
-    get:
-      tags:
-      - detection_rules
-      - detection_loop
-      summary: List LLM-drafted Sigma suggestions
-      description: 'List suggestions drafted by *this* tenant only.
-
-
-        Tenant isolation: ``_SUGGESTIONS`` is process-wide and shared across all
-
-        tenants. Filtering on the stored ``tenant_id`` ensures one tenant never
-
-        sees another tenant''s drafts, rule names, or evidence-derived rationale.'
-      operationId: list_suggestions_api_v1_detection_loop_suggestions_get
-      responses:
-        '200':
-          description: Successful Response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/SuggestionListResponse'
-      security:
-      - HTTPBearer: []
-  /api/v1/detection-loop/suggestions/{suggestion_id}:
-    get:
-      tags:
-      - detection_rules
-      - detection_loop
-      summary: Get one Sigma suggestion
-      description: 'Return one suggestion if and only if it belongs to the caller''s
-        tenant.
-
-
-        Tenant isolation: a cross-tenant lookup returns 404 (not 403) to avoid
-
-        leaking the existence of a suggestion that belongs to another tenant.'
-      operationId: get_suggestion_api_v1_detection_loop_suggestions__suggestion_id__get
-      security:
-      - HTTPBearer: []
-      parameters:
-      - name: suggestion_id
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-          title: Suggestion Id
-      responses:
-        '200':
-          description: Successful Response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/SuggestionResponse'
-        '422':
-          description: Validation Error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/nl-query/translate:
     post:
       tags:
@@ -11993,6 +13842,233 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
       security:
       - HTTPBearer: []
+  /api/v1/evaluations/replay/capabilities:
+    get:
+      tags:
+      - evaluations
+      summary: Which connectors can be replayed on this deployment
+      operationId: capabilities_api_v1_evaluations_replay_capabilities_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapabilitiesResponse'
+      security:
+      - HTTPBearer: []
+  /api/v1/evaluations/replay:
+    post:
+      tags:
+      - evaluations
+      summary: Start a replay evaluation against this tenant's own history
+      description: 'Queue a run and return its id immediately.
+
+
+        202 rather than 200: replaying a few hundred findings through a model is
+
+        not a request-response operation, and a route that blocked on it would
+
+        time out at whichever proxy is in front of it while the work continued.'
+      operationId: start_replay_api_v1_evaluations_replay_post
+      security:
+      - HTTPBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartReplayRequest'
+      responses:
+        '202':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvaluationSummary'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    get:
+      tags:
+      - evaluations
+      summary: This tenant's replay evaluations
+      operationId: list_replays_api_v1_evaluations_replay_get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 200
+          minimum: 1
+          default: 50
+          title: Limit
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/EvaluationSummary'
+                title: Response List Replays Api V1 Evaluations Replay Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/evaluations/replay/{evaluation_id}:
+    get:
+      tags:
+      - evaluations
+      summary: One replay evaluation
+      operationId: get_replay_api_v1_evaluations_replay__evaluation_id__get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: evaluation_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Evaluation Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvaluationDetail'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/evaluations/replay/{evaluation_id}/decisions:
+    get:
+      tags:
+      - evaluations
+      summary: The decisions behind a report
+      description: 'Every replayed finding, so a disputed number can be re-derived.
+
+
+        Read separately from the report because these rows carry the evidence
+
+        handed to triage and are measured in megabytes, and the page that shows
+
+        the headline should not pay for them.'
+      operationId: get_replay_decisions_api_v1_evaluations_replay__evaluation_id__decisions_get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: evaluation_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Evaluation Id
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 2000
+          minimum: 1
+          default: 2000
+          title: Limit
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+                title: Response Get Replay Decisions Api V1 Evaluations Replay  Evaluation
+                  Id  Decisions Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/evaluations/replay/{evaluation_id}/export:
+    get:
+      tags:
+      - evaluations
+      summary: Export a report as JSON, Markdown or PDF
+      description: 'Serve the stored report, not a fresh render of it.
+
+
+        All three formats come from the artefact written when the run completed.
+
+        Re-rendering later would produce a document that no longer matches what
+
+        the operator read, and this phase''s acceptance bar is a report that
+
+        reproduces byte for byte.'
+      operationId: export_replay_api_v1_evaluations_replay__evaluation_id__export_get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: evaluation_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Evaluation Id
+      - name: format
+        in: query
+        required: false
+        schema:
+          enum:
+          - json
+          - markdown
+          - pdf
+          type: string
+          default: markdown
+          title: Format
+      - name: exclude_latency
+        in: query
+        required: false
+        schema:
+          type: boolean
+          description: Replace the two wall-clock latency figures with a note. Everything
+            else in the report is a property of the input and the code, so two runs
+            over one pinned window are then byte-identical; latency measures the host
+            and never will be.
+          default: false
+          title: Exclude Latency
+        description: Replace the two wall-clock latency figures with a note. Everything
+          else in the report is a property of the input and the code, so two runs
+          over one pinned window are then byte-identical; latency measures the host
+          and never will be.
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/kb/ingest:
     post:
       tags:
@@ -13522,6 +15598,55 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/retro-hunts/settings:
+    get:
+      tags:
+      - retro_hunts
+      summary: This tenant's retro-hunt opt-in and budget
+      operationId: get_retro_hunt_settings_api_v1_retro_hunts_settings_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetroHuntSettingsOut'
+      security:
+      - HTTPBearer: []
+    put:
+      tags:
+      - retro_hunts
+      summary: Opt this tenant in or out of retro-hunt sweeps
+      description: 'Write the tenant''s half of the switch.
+
+
+        The budget columns are deliberately not writable here. They are the
+
+        operator''s ceiling on what one tenant can cost the deployment, and a tenant
+
+        that could raise its own ceiling would not have one.'
+      operationId: put_retro_hunt_settings_api_v1_retro_hunts_settings_put
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RetroHuntSettingsIn'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetroHuntSettingsOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
   /api/v1/report-builder/validate:
     post:
       tags:
@@ -13618,15 +15743,16 @@ paths:
       tags:
       - llm
       summary: Current LLM provider configuration
-      description: "Return the env-only LLM provider snapshot for this pod.\n\nIntentionally\
-        \ **unauthenticated** and **env-only**, mirroring\n``GET /api/v1/airgap/status``:\
-        \ the response carries no secrets\n(only ``key_set: bool``) and is safe for\
-        \ operator dashboards,\nauditors, and k8s liveness probes.\n\nTenant-aware\
-        \ callers (the web UI's \"Deployment & AI\" Settings\npanel, the agents service's\
-        \ explain path) layer per-tenant BYOK\noverrides on top of this baseline by\
-        \ either:\n\n* calling :func:`tenant_llm_status` with their own DB session,\
-        \ or\n* pairing this response with ``GET /api/v1/llm/credentials`` to\n  perform\
-        \ the merge client-side."
+      description: "Return the env-only LLM provider snapshot for this pod.\n\n**Authenticated**\
+        \ -- the signature binds ``AuthUser`` and has for as long\nas this route has\
+        \ existed. The docstring used to say \"intentionally\nunauthenticated\", which\
+        \ was prose disagreeing with the code beneath it.\n\n**Env-only**: the response\
+        \ carries no secrets (only ``key_set: bool``).\n\nTenant-aware callers (the\
+        \ web UI's \"Deployment & AI\" Settings\npanel, the agents service's explain\
+        \ path) layer per-tenant BYOK\noverrides on top of this baseline by either:\n\
+        \n* calling :func:`tenant_llm_status` with their own DB session, or\n* pairing\
+        \ this response with ``GET /api/v1/llm/credentials`` to\n  perform the merge\
+        \ client-side."
       operationId: get_llm_status_api_v1_llm_status_get
       responses:
         '200':
@@ -13637,6 +15763,44 @@ paths:
                 additionalProperties: true
                 type: object
                 title: Response Get Llm Status Api V1 Llm Status Get
+      security:
+      - HTTPBearer: []
+  /api/v1/llm/runtime:
+    get:
+      tags:
+      - llm
+      summary: Where the local model is actually running
+      description: 'Ask Ollama whether the model is on a GPU or a CPU, and say so.
+
+
+        Separate from ``/status`` deliberately. That route reports *configuration*
+
+        -- which provider and model this pod is pointed at. This one reports
+
+        *outcome*, which can differ: a GPU reservation is a request, and a model
+
+        can still land on the CPU for want of VRAM or a usable driver. Reading the
+
+        compose file back would report the intent and call it the result.
+
+
+        Carries the commands that would change the answer, because the console
+
+        cannot change it: switching the bundled Ollama onto a GPU means restarting
+
+        that container with different compose arguments, which a web service must
+
+        not be able to do.'
+      operationId: get_llm_runtime_api_v1_llm_runtime_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Get Llm Runtime Api V1 Llm Runtime Get
       security:
       - HTTPBearer: []
   /api/v1/llm/credentials:
@@ -13711,6 +15875,40 @@ paths:
       responses:
         '204':
           description: Successful Response
+      security:
+      - HTTPBearer: []
+  /api/v1/llm/credentials/test:
+    post:
+      tags:
+      - llm
+      summary: Make one real call with this tenant's credential
+      description: 'Place one minimal completion and report what happened.
+
+
+        There was no way to find out whether a saved key worked. The three routes
+
+        above validate *shape* -- that the URL parses, that the provider/key/base
+
+        combination is internally consistent -- and none of them talks to the
+
+        provider, so an operator who pasted a revoked key learned about it when
+
+        triage silently fell back to the deterministic path. That failure is quiet
+
+        by design, which is exactly what makes it hard to attribute.
+
+
+        `settings:write` rather than `settings:read`: this spends the tenant''s
+
+        money and touches an external service, which is not a read.'
+      operationId: test_llm_credential_api_v1_llm_credentials_test_post
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LlmCredentialTestResult'
       security:
       - HTTPBearer: []
   /api/v1/threatintel/stix/indicators:
@@ -13936,129 +16134,6 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
       security:
       - HTTPBearer: []
-  /api/v1/shifts:
-    get:
-      tags:
-      - shifts
-      summary: List Shifts
-      description: Return shift summaries, newest first.
-      operationId: list_shifts_api_v1_shifts_get
-      security:
-      - HTTPBearer: []
-      parameters:
-      - name: status
-        in: query
-        required: false
-        schema:
-          anyOf:
-          - type: string
-          - type: 'null'
-          description: active | completed
-          title: Status
-        description: active | completed
-      - name: limit
-        in: query
-        required: false
-        schema:
-          type: integer
-          maximum: 100
-          minimum: 1
-          default: 20
-          title: Limit
-      responses:
-        '200':
-          description: Successful Response
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/ShiftSummary'
-                title: Response List Shifts Api V1 Shifts Get
-        '422':
-          description: Validation Error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
-    post:
-      tags:
-      - shifts
-      summary: Create Shift
-      description: Start a new shift.
-      operationId: create_shift_api_v1_shifts_post
-      security:
-      - HTTPBearer: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/ShiftCreate'
-      responses:
-        '201':
-          description: Successful Response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ShiftSummary'
-        '422':
-          description: Validation Error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
-  /api/v1/shifts/current:
-    get:
-      tags:
-      - shifts
-      summary: Get Current Shift
-      description: Return the currently active shift.
-      operationId: get_current_shift_api_v1_shifts_current_get
-      responses:
-        '200':
-          description: Successful Response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ShiftSummary'
-      security:
-      - HTTPBearer: []
-  /api/v1/shifts/{shift_id}/handoff:
-    put:
-      tags:
-      - shifts
-      summary: Add Handoff Notes
-      description: Attach handoff notes to a shift and mark it completed.
-      operationId: add_handoff_notes_api_v1_shifts__shift_id__handoff_put
-      security:
-      - HTTPBearer: []
-      parameters:
-      - name: shift_id
-        in: path
-        required: true
-        schema:
-          type: string
-          title: Shift Id
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/HandoffNotes'
-      responses:
-        '200':
-          description: Successful Response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ShiftSummary'
-        '422':
-          description: Validation Error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/deployment/config:
     get:
       tags:
@@ -14336,6 +16411,41 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AgentToolsResponse'
+      security:
+      - HTTPBearer: []
+  /api/v1/agents/hunt:
+    post:
+      tags:
+      - agents
+      summary: Run Hunt
+      description: 'Plan and run one natural-language hunt for the caller''s tenant.
+
+
+        The tenant comes from the authenticated principal and is never read
+
+        from the body. A caller-supplied tenant on a route like this is the
+
+        shape that has gone wrong here before.'
+      operationId: run_hunt_api_v1_agents_hunt_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentHuntRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentHuntResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
       security:
       - HTTPBearer: []
   /api/v1/inbox/templates:
@@ -15021,6 +17131,547 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /scim/v2/ServiceProviderConfig:
+    get:
+      tags:
+      - scim
+      summary: Get Service Provider Config
+      operationId: get_service_provider_config_scim_v2_ServiceProviderConfig_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+      security:
+      - HTTPBearer: []
+  /scim/v2/ResourceTypes:
+    get:
+      tags:
+      - scim
+      summary: List Resource Types
+      operationId: list_resource_types_scim_v2_ResourceTypes_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+      security:
+      - HTTPBearer: []
+  /scim/v2/ResourceTypes/{resource_type_id}:
+    get:
+      tags:
+      - scim
+      summary: Get Resource Type
+      operationId: get_resource_type_scim_v2_ResourceTypes__resource_type_id__get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: resource_type_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Resource Type Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /scim/v2/Schemas:
+    get:
+      tags:
+      - scim
+      summary: List Schemas
+      operationId: list_schemas_scim_v2_Schemas_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+      security:
+      - HTTPBearer: []
+  /scim/v2/Schemas/{schema_id}:
+    get:
+      tags:
+      - scim
+      summary: Get Schema
+      operationId: get_schema_scim_v2_Schemas__schema_id__get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: schema_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Schema Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /scim/v2/Users:
+    get:
+      tags:
+      - scim
+      summary: List Users
+      description: 'List or look up principals.
+
+
+        A provider calls this with a filter before every create, so the
+
+        filter path is the hot one and an unsupported filter must be an error
+
+        rather than a full listing.'
+      operationId: list_users_scim_v2_Users_get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: filter
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Filter
+      - name: startIndex
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 1
+          default: 1
+          title: Startindex
+      - name: count
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+          default: 100
+          title: Count
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    post:
+      tags:
+      - scim
+      summary: Create User
+      description: 'Create a principal, or return the existing one.
+
+
+        A repeated create for a ``userName`` that already exists is answered
+
+        409, which is what RFC 7644 specifies and what a provider uses to
+
+        reconcile. Creating a second principal for the same address instead
+
+        would give one person two accounts with two sets of permissions.'
+      operationId: create_user_scim_v2_Users_post
+      security:
+      - HTTPBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              title: Body
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /scim/v2/Users/{user_id}:
+    get:
+      tags:
+      - scim
+      summary: Get User
+      operationId: get_user_scim_v2_Users__user_id__get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: User Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    put:
+      tags:
+      - scim
+      summary: Replace User
+      description: 'Replace a principal''s attributes.
+
+
+        One provider sends PUT for ordinary profile updates and for
+
+        deactivation, so this path has to handle ``active: false`` with the same
+
+        consequences the PATCH path gives it.'
+      operationId: replace_user_scim_v2_Users__user_id__put
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: User Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              title: Body
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    patch:
+      tags:
+      - scim
+      summary: Patch User
+      description: 'Apply a PATCH, which is how both providers deactivate a principal.
+
+
+        The body shapes differ between providers in five ways, all resolved by
+
+        ``app.services.scim.patch``.'
+      operationId: patch_user_scim_v2_Users__user_id__patch
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: User Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              title: Body
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - scim
+      summary: Delete User
+      description: 'Deprovision a principal.
+
+
+        Deactivates rather than deletes. A deleted row takes its audit
+
+        attribution, case ownership and approval history with it, and this
+
+        platform''s own records reference the principal. Access ends completely
+
+        either way, which is what DELETE means here.'
+      operationId: delete_user_scim_v2_Users__user_id__delete
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: User Id
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /scim/v2/Groups:
+    get:
+      tags:
+      - scim
+      summary: List Groups
+      operationId: list_groups_scim_v2_Groups_get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: filter
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Filter
+      - name: startIndex
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 1
+          default: 1
+          title: Startindex
+      - name: count
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+          default: 100
+          title: Count
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    post:
+      tags:
+      - scim
+      summary: Create Group
+      description: 'Create a directory group and resolve what it confers.
+
+
+        The resolved role is recorded at create time and returned in the
+
+        response, so an administrator can see immediately whether the group they
+
+        pushed grants anything.'
+      operationId: create_group_scim_v2_Groups_post
+      security:
+      - HTTPBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              title: Body
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /scim/v2/Groups/{group_id}:
+    get:
+      tags:
+      - scim
+      summary: Get Group
+      operationId: get_group_scim_v2_Groups__group_id__get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: group_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Group Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    put:
+      tags:
+      - scim
+      summary: Replace Group
+      description: 'Replace a group, including its entire membership.
+
+
+        PUT on a group is a *set* operation: members absent from the body are
+
+        removed. One provider uses it to reconcile a group wholesale.'
+      operationId: replace_group_scim_v2_Groups__group_id__put
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: group_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Group Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              title: Body
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    patch:
+      tags:
+      - scim
+      summary: Patch Group
+      description: 'Apply a group PATCH, which is how membership changes arrive.
+
+
+        Both providers express member removal two ways, and one of those puts
+
+        the member id in the path filter rather than the value. Both shapes are
+
+        normalised before they reach this handler.'
+      operationId: patch_group_scim_v2_Groups__group_id__patch
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: group_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Group Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              title: Body
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - scim
+      summary: Delete Group
+      description: Delete a group and recompute what its members are left holding.
+      operationId: delete_group_scim_v2_Groups__group_id__delete
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: group_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Group Id
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /graphql:
     get:
       tags:
@@ -15214,6 +17865,76 @@ components:
       - expires_at
       - url
       title: AdminInviteWire
+    AgentHuntRequest:
+      properties:
+        hypothesis:
+          type: string
+          maxLength: 2000
+          minLength: 1
+          title: Hypothesis
+      type: object
+      required:
+      - hypothesis
+      title: AgentHuntRequest
+      description: 'One natural-language hypothesis to hunt against tenant data.
+
+
+        Named `AgentHuntRequest`, not `HuntRequest`, and the reason is a
+
+        published-contract one rather than a stylistic one.
+
+        `detection_rules.py` already exports a `HuntRequest`, and FastAPI
+
+        resolves a name collision by qualifying **both** models with their
+
+        full module path. So adding a second `HuntRequest` deleted the plain
+
+        `HuntRequest` schema from the spec and renamed the existing one —
+
+        breaking every generated SDK client, for a route that had not
+
+        changed. The openapi-breaking gate caught it.'
+    AgentHuntResponse:
+      properties:
+        hypothesis:
+          type: string
+          title: Hypothesis
+        checked:
+          type: boolean
+          title: Checked
+        matches:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Matches
+          default: []
+        refusals:
+          items:
+            type: string
+          type: array
+          title: Refusals
+          default: []
+        unavailable_reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Unavailable Reason
+      type: object
+      required:
+      - hypothesis
+      - checked
+      title: AgentHuntResponse
+      description: 'What the hunt found, or why it could not look.
+
+
+        `checked` and `unavailable_reason` are separate fields deliberately.
+
+        A hunt that could not run is not a hunt that found nothing, and
+
+        collapsing the two is how a console shows a reassuring empty result
+
+        for a search that never happened.'
     AgentToolDescriptor:
       properties:
         name:
@@ -15300,6 +18021,149 @@ components:
       - connector_count
       title: AgentToolsResponse
       description: Tenant-wide tool catalogue surfaced to the agent layer.
+    AgreementResponse:
+      properties:
+        tenant_id:
+          type: string
+          title: Tenant Id
+        scope_kind:
+          type: string
+          title: Scope Kind
+        scope_key:
+          type: string
+          title: Scope Key
+        window:
+          $ref: '#/components/schemas/AgreementWindowModel'
+        recent:
+          $ref: '#/components/schemas/AgreementWindowModel'
+        window_start:
+          type: string
+          title: Window Start
+        window_end:
+          type: string
+          title: Window End
+        thresholds:
+          additionalProperties:
+            anyOf:
+            - type: number
+            - type: integer
+          type: object
+          title: Thresholds
+        reconciled:
+          type: integer
+          title: Reconciled
+        by_alert_class:
+          items:
+            $ref: '#/components/schemas/AgreementScopeModel'
+          type: array
+          title: By Alert Class
+        by_rule:
+          items:
+            $ref: '#/components/schemas/AgreementScopeModel'
+          type: array
+          title: By Rule
+        by_source:
+          items:
+            $ref: '#/components/schemas/AgreementScopeModel'
+          type: array
+          title: By Source
+        by_model:
+          items:
+            $ref: '#/components/schemas/AgreementScopeModel'
+          type: array
+          title: By Model
+      type: object
+      required:
+      - tenant_id
+      - scope_kind
+      - scope_key
+      - window
+      - recent
+      - window_start
+      - window_end
+      - thresholds
+      - reconciled
+      - by_alert_class
+      - by_rule
+      - by_source
+      - by_model
+      title: AgreementResponse
+    AgreementScopeModel:
+      properties:
+        key:
+          type: string
+          title: Key
+        window:
+          $ref: '#/components/schemas/AgreementWindowModel'
+      type: object
+      required:
+      - key
+      - window
+      title: AgreementScopeModel
+    AgreementWindowModel:
+      properties:
+        resolved:
+          type: integer
+          title: Resolved
+        labelled:
+          type: integer
+          title: Labelled
+        unlabeled:
+          type: integer
+          title: Unlabeled
+        answered:
+          type: integer
+          title: Answered
+        abstained:
+          type: integer
+          title: Abstained
+        agreed:
+          type: integer
+          title: Agreed
+        malicious_support:
+          type: integer
+          title: Malicious Support
+        malicious_caught:
+          type: integer
+          title: Malicious Caught
+        agreement_rate:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Agreement Rate
+        malicious_recall:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Malicious Recall
+        abstention_rate:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Abstention Rate
+      type: object
+      required:
+      - resolved
+      - labelled
+      - unlabeled
+      - answered
+      - abstained
+      - agreed
+      - malicious_support
+      - malicious_caught
+      title: AgreementWindowModel
+      description: 'Counts, and the rates derived from them.
+
+
+        Every rate is optional and is ``null`` when its denominator was zero. The
+
+        console renders that as "not measured". A zero here would say the agent
+
+        was wrong every time, which is a different fact with a different remedy,
+
+        and it is the more flattering of the two to print by accident in the
+
+        abstention column and the more damning in the agreement column.'
     AirgapStatus:
       properties:
         ready:
@@ -15505,6 +18369,16 @@ components:
           type: array
           title: Recommended Actions
           default: []
+        raw_event:
+          additionalProperties: true
+          type: object
+          title: Raw Event
+          default: {}
+        wazuh_locator:
+          additionalProperties: true
+          type: object
+          title: Wazuh Locator
+          default: {}
       type: object
       required:
       - id
@@ -15654,6 +18528,10 @@ components:
         resolvedToday:
           type: integer
           title: Resolvedtoday
+        resolved:
+          type: integer
+          title: Resolved
+          default: 0
         mttr:
           type: number
           title: Mttr
@@ -16046,12 +18924,12 @@ components:
             type: array
           - type: 'null'
           title: Tags
-        assigned_to_id:
+        assignee:
           anyOf:
           - type: string
             format: uuid
           - type: 'null'
-          title: Assigned To Id
+          title: Assignee
         case_id:
           anyOf:
           - type: string
@@ -16983,6 +19861,44 @@ components:
       - tenant_id
       - actions
       title: AutonomyPolicyResponse
+    AvailableTools:
+      properties:
+        builtin:
+          items:
+            type: string
+          type: array
+          title: Builtin
+        customer:
+          items:
+            type: string
+          type: array
+          title: Customer
+        mcp:
+          items:
+            type: string
+          type: array
+          title: Mcp
+        customer_unknown:
+          type: boolean
+          title: Customer Unknown
+          default: false
+        customer_unknown_reason:
+          type: string
+          title: Customer Unknown Reason
+          default: ''
+      type: object
+      title: AvailableTools
+      description: 'What an author may name in ``expected_pivots`` on this tenant
+        today.
+
+
+        Returned with the list so the editor can offer the vocabulary rather than
+
+        making the author discover it by being refused. ``customer_unknown`` is
+
+        part of the contract: an editor that read an unreachable action registry
+
+        as "this tenant has no products" would grey out tools the tenant has.'
     BacktestProposalRequest:
       properties:
         window_days:
@@ -17157,6 +20073,64 @@ components:
       - type_breakdown
       - blast_radius_score
       title: BlastRadiusResponse
+    Body_upload_asset_api_v1_branding_assets__kind__post:
+      properties:
+        file:
+          type: string
+          contentMediaType: application/octet-stream
+          title: File
+      type: object
+      required:
+      - file
+      title: Body_upload_asset_api_v1_branding_assets__kind__post
+    BrandingIn:
+      properties:
+        product_name:
+          anyOf:
+          - type: string
+            maxLength: 80
+            minLength: 1
+          - type: 'null'
+          title: Product Name
+        primary_color:
+          anyOf:
+          - type: string
+            pattern: ^#[0-9A-Fa-f]{6}$
+          - type: 'null'
+          title: Primary Color
+        accent_color:
+          anyOf:
+          - type: string
+            pattern: ^#[0-9A-Fa-f]{6}$
+          - type: 'null'
+          title: Accent Color
+        support_email:
+          anyOf:
+          - type: string
+            maxLength: 255
+          - type: 'null'
+          title: Support Email
+        support_url:
+          anyOf:
+          - type: string
+            maxLength: 500
+          - type: 'null'
+          title: Support Url
+        sender_name:
+          anyOf:
+          - type: string
+            maxLength: 80
+            minLength: 1
+          - type: 'null'
+          title: Sender Name
+        footer_text:
+          anyOf:
+          - type: string
+            maxLength: 300
+          - type: 'null'
+          title: Footer Text
+      type: object
+      title: BrandingIn
     BuildTimelineRequest:
       properties:
         identity_kind:
@@ -17371,6 +20345,50 @@ components:
         among analyst-dispositioned alerts whose ai_score landed in that bucket
 
         — i.e., the empirical hit-rate the model claimed.'
+    CapabilitiesResponse:
+      properties:
+        connectors:
+          items:
+            $ref: '#/components/schemas/ReplayableConnectorInfo'
+          type: array
+          title: Connectors
+        default_window_days:
+          type: integer
+          title: Default Window Days
+        default_train_fraction:
+          type: number
+          title: Default Train Fraction
+        default_bootstrap_seed:
+          type: integer
+          title: Default Bootstrap Seed
+        default_bootstrap_resamples:
+          type: integer
+          title: Default Bootstrap Resamples
+        min_malicious_for_headline:
+          type: integer
+          title: Min Malicious For Headline
+        max_findings:
+          type: integer
+          title: Max Findings
+      type: object
+      required:
+      - connectors
+      - default_window_days
+      - default_train_fraction
+      - default_bootstrap_seed
+      - default_bootstrap_resamples
+      - min_malicious_for_headline
+      - max_findings
+      title: CapabilitiesResponse
+      description: 'What this deployment can replay, so the console offers nothing
+        it cannot.
+
+
+        ``min_malicious_for_headline`` travels to the client so the page can say
+
+        why a headline is withheld before a run is started, rather than only
+
+        after.'
     CaseMetrics:
       properties:
         open:
@@ -17466,6 +20484,21 @@ components:
             format: date-time
           - type: 'null'
           title: Closed At
+        reopened_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Reopened At
+        reopen_count:
+          type: integer
+          title: Reopen Count
+          default: 0
+        reopen_reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Reopen Reason
         created_at:
           type: string
           format: date-time
@@ -17664,6 +20697,52 @@ components:
       - status
       - queued_at
       title: CollectJobResponse
+    CollectResponse:
+      properties:
+        framework:
+          type: string
+          title: Framework
+        collected:
+          type: integer
+          title: Collected
+        manual:
+          type: integer
+          title: Manual
+        results:
+          items:
+            $ref: '#/components/schemas/CollectedControl'
+          type: array
+          title: Results
+        collected_at:
+          type: string
+          format: date-time
+          title: Collected At
+      type: object
+      required:
+      - framework
+      - collected
+      - manual
+      - results
+      - collected_at
+      title: CollectResponse
+    CollectedControl:
+      properties:
+        control_id:
+          type: string
+          title: Control Id
+        outcome:
+          type: string
+          title: Outcome
+          description: collected | manual
+        detail:
+          type: string
+          title: Detail
+      type: object
+      required:
+      - control_id
+      - outcome
+      - detail
+      title: CollectedControl
     CommentResponse:
       properties:
         id:
@@ -18300,6 +21379,40 @@ components:
       - tenant_id
       - statements
       title: ContextStatementsResponse
+    Control:
+      properties:
+        id:
+          type: string
+          title: Id
+        framework:
+          type: string
+          title: Framework
+        control_id:
+          type: string
+          title: Control Id
+        category:
+          type: string
+          title: Category
+        title:
+          type: string
+          title: Title
+        description:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Description
+        automatable:
+          type: boolean
+          title: Automatable
+          default: false
+      type: object
+      required:
+      - id
+      - framework
+      - control_id
+      - category
+      - title
+      title: Control
     ControlItem:
       properties:
         control_id:
@@ -18313,6 +21426,25 @@ components:
       - control_id
       - title
       title: ControlItem
+    ControlWithEvidence:
+      properties:
+        control:
+          $ref: '#/components/schemas/Control'
+        evidence:
+          items:
+            $ref: '#/components/schemas/EvidenceItem'
+          type: array
+          title: Evidence
+        latest_status:
+          type: string
+          title: Latest Status
+          description: accepted | pending | rejected | missing
+      type: object
+      required:
+      - control
+      - evidence
+      - latest_status
+      title: ControlWithEvidence
     ControlsResponse:
       properties:
         framework_id:
@@ -18484,12 +21616,15 @@ components:
           title: Action Counts
         byok_savings:
           $ref: '#/components/schemas/ByokSavings'
+        storage:
+          $ref: '#/components/schemas/StorageCostProjection'
       type: object
       required:
       - tenant_id
       - period
       - headline
       - byok_savings
+      - storage
       title: CostDashboard
       description: Top-level deterministic snapshot.
     CostHeadline:
@@ -18958,6 +22093,20 @@ components:
             format: uuid
           - type: 'null'
           title: Base Rule Id
+        positive_fixtures:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          maxItems: 200
+          title: Positive Fixtures
+        negative_fixtures:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          maxItems: 200
+          title: Negative Fixtures
       type: object
       required:
       - name
@@ -19087,6 +22236,26 @@ components:
       - view_type
       - name
       title: CreateSavedViewRequest
+    CreateScimTokenRequest:
+      properties:
+        name:
+          type: string
+          maxLength: 200
+          minLength: 1
+          title: Name
+          description: Which identity provider this credential is for
+        expires_in_days:
+          anyOf:
+          - type: integer
+            maximum: 3650.0
+            minimum: 1.0
+          - type: 'null'
+          title: Expires In Days
+          description: Optional lifetime; omit for no expiry
+      type: object
+      required:
+      - name
+      title: CreateScimTokenRequest
     CreateTaskRequest:
       properties:
         title:
@@ -19138,6 +22307,73 @@ components:
       - username
       - password
       title: CreateUserRequest
+    CreatedScimTokenOut:
+      properties:
+        id:
+          type: string
+          format: uuid
+          title: Id
+        name:
+          type: string
+          title: Name
+        prefix:
+          type: string
+          title: Prefix
+        org_id:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Org Id
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+        last_used_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Last Used At
+        expires_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Expires At
+        revoked_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Revoked At
+        rotated_from_id:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Rotated From Id
+        active:
+          type: boolean
+          title: Active
+        token:
+          type: string
+          title: Token
+          description: The raw credential. Shown once and not recoverable.
+      type: object
+      required:
+      - id
+      - name
+      - prefix
+      - org_id
+      - created_at
+      - last_used_at
+      - expires_at
+      - revoked_at
+      - rotated_from_id
+      - active
+      - token
+      title: CreatedScimTokenOut
     CredentialsListResponse:
       properties:
         items:
@@ -19187,6 +22423,10 @@ components:
       title: CspmScanResponse
     DashboardMetrics:
       properties:
+        period:
+          type: string
+          title: Period
+          default: 24h
         alerts:
           $ref: '#/components/schemas/AlertMetrics'
         cases:
@@ -19529,6 +22769,88 @@ components:
       type: object
       title: DismissTuningRequest
       description: Body for ``POST /detection/tuning/{rule_id}/dismiss``.
+    DlqReplayRequest:
+      properties:
+        topic:
+          type: string
+          maxLength: 200
+          minLength: 1
+          title: Topic
+        partition:
+          type: integer
+          minimum: 0.0
+          title: Partition
+        start_offset:
+          type: integer
+          minimum: 0.0
+          title: Start Offset
+        max_messages:
+          type: integer
+          maximum: 1000.0
+          minimum: 1.0
+          title: Max Messages
+          default: 100
+        execute:
+          type: boolean
+          title: Execute
+          default: false
+      type: object
+      required:
+      - topic
+      - partition
+      - start_offset
+      title: DlqReplayRequest
+      description: An explicit, bounded range of refused messages to re-check.
+    DlqReplayResponse:
+      properties:
+        replay_id:
+          type: string
+          format: uuid
+          title: Replay Id
+        status:
+          type: string
+          title: Status
+        executed:
+          type: boolean
+          title: Executed
+        messages_read:
+          type: integer
+          title: Messages Read
+          default: 0
+        would_pass:
+          type: integer
+          title: Would Pass
+          default: 0
+        refused:
+          type: integer
+          title: Refused
+          default: 0
+        produced:
+          type: integer
+          title: Produced
+          default: 0
+        refusals:
+          additionalProperties:
+            type: integer
+          type: object
+          title: Refusals
+        produced_offsets:
+          items:
+            type: integer
+          type: array
+          title: Produced Offsets
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+      type: object
+      required:
+      - replay_id
+      - status
+      - executed
+      title: DlqReplayResponse
+      description: What the replay found, and what it did about it.
     DriftEntry:
       properties:
         ruleId:
@@ -19798,6 +23120,19 @@ components:
       - override_note
       - parameter_overrides
       title: EffectiveRuleOut
+    EngageRequest:
+      properties:
+        reason:
+          type: string
+          maxLength: 500
+          minLength: 8
+          title: Reason
+          description: 'Why. Required: the next operator has to be able to tell a
+            deliberate freeze from a forgotten test.'
+      type: object
+      required:
+      - reason
+      title: EngageRequest
     EntityNeighborsResponse:
       properties:
         entity_id:
@@ -19857,10 +23192,11 @@ components:
             type: object
           type: array
           maxItems: 200
-          minItems: 1
           title: Positive Fixtures
-          description: Events the rule MUST fire on (the attacks it claims to catch).
-            At least one required.
+          description: 'Events the rule MUST fire on. Optional: when omitted, the
+            fixtures the proposal was created with are replayed instead. The handler
+            refuses if neither source yields a positive, because a rule that cannot
+            be shown to catch anything must not be approved.'
         negative_fixtures:
           items:
             additionalProperties: true
@@ -19870,8 +23206,6 @@ components:
           title: Negative Fixtures
           description: Benign near-miss events the rule MUST NOT fire on.
       type: object
-      required:
-      - positive_fixtures
       title: EvaluateRuleRequest
       description: 'Evaluate the candidate rule body against its own fixtures (Phase
         4).
@@ -19886,6 +23220,235 @@ components:
         asserts it fires on every positive fixture and stays silent on every
 
         negative one. Approval now requires this verdict to pass.'
+    EvaluationDetail:
+      properties:
+        id:
+          type: string
+          format: uuid
+          title: Id
+        status:
+          type: string
+          title: Status
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+        connector_id:
+          type: string
+          title: Connector Id
+        vendor:
+          type: string
+          title: Vendor
+        window_start:
+          type: string
+          format: date-time
+          title: Window Start
+        window_end:
+          type: string
+          format: date-time
+          title: Window End
+        train_fraction:
+          type: number
+          title: Train Fraction
+        bootstrap_seed:
+          type: integer
+          title: Bootstrap Seed
+        bootstrap_resamples:
+          type: integer
+          title: Bootstrap Resamples
+        findings_read:
+          type: integer
+          title: Findings Read
+        findings_labelled:
+          type: integer
+          title: Findings Labelled
+        decisions_recorded:
+          type: integer
+          title: Decisions Recorded
+        graded:
+          type: integer
+          title: Graded
+        malicious_support:
+          type: integer
+          title: Malicious Support
+        headline_accuracy:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Headline Accuracy
+        headline_withheld_reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Headline Withheld Reason
+        malicious_recall:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Malicious Recall
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+        started_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Started At
+        completed_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Completed At
+        is_terminal:
+          type: boolean
+          title: Is Terminal
+        score:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Score
+        method:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Method
+        report_markdown:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Report Markdown
+      type: object
+      required:
+      - id
+      - status
+      - connector_id
+      - vendor
+      - window_start
+      - window_end
+      - train_fraction
+      - bootstrap_seed
+      - bootstrap_resamples
+      - findings_read
+      - findings_labelled
+      - decisions_recorded
+      - graded
+      - malicious_support
+      - created_at
+      - is_terminal
+      title: EvaluationDetail
+      description: A completed run with its report and the provenance behind it.
+    EvaluationSummary:
+      properties:
+        id:
+          type: string
+          format: uuid
+          title: Id
+        status:
+          type: string
+          title: Status
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+        connector_id:
+          type: string
+          title: Connector Id
+        vendor:
+          type: string
+          title: Vendor
+        window_start:
+          type: string
+          format: date-time
+          title: Window Start
+        window_end:
+          type: string
+          format: date-time
+          title: Window End
+        train_fraction:
+          type: number
+          title: Train Fraction
+        bootstrap_seed:
+          type: integer
+          title: Bootstrap Seed
+        bootstrap_resamples:
+          type: integer
+          title: Bootstrap Resamples
+        findings_read:
+          type: integer
+          title: Findings Read
+        findings_labelled:
+          type: integer
+          title: Findings Labelled
+        decisions_recorded:
+          type: integer
+          title: Decisions Recorded
+        graded:
+          type: integer
+          title: Graded
+        malicious_support:
+          type: integer
+          title: Malicious Support
+        headline_accuracy:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Headline Accuracy
+        headline_withheld_reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Headline Withheld Reason
+        malicious_recall:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Malicious Recall
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+        started_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Started At
+        completed_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Completed At
+        is_terminal:
+          type: boolean
+          title: Is Terminal
+      type: object
+      required:
+      - id
+      - status
+      - connector_id
+      - vendor
+      - window_start
+      - window_end
+      - train_fraction
+      - bootstrap_seed
+      - bootstrap_resamples
+      - findings_read
+      - findings_labelled
+      - decisions_recorded
+      - graded
+      - malicious_support
+      - created_at
+      - is_terminal
+      title: EvaluationSummary
+      description: One run as the list and the poll return it.
     EventListResponse:
       properties:
         items:
@@ -19972,6 +23535,42 @@ components:
       - output_hash
       - duration_ms
       title: EventOut
+    EvidenceItem:
+      properties:
+        id:
+          type: string
+          title: Id
+        control_id:
+          type: string
+          title: Control Id
+        evidence_type:
+          type: string
+          title: Evidence Type
+        title:
+          type: string
+          title: Title
+        description:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Description
+        status:
+          type: string
+          title: Status
+        collected_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Collected At
+      type: object
+      required:
+      - id
+      - control_id
+      - evidence_type
+      - title
+      - status
+      title: EvidenceItem
     EvidenceReport:
       properties:
         case_id:
@@ -20726,6 +24325,66 @@ components:
       required:
       - formats
       title: FormatsResponse
+    FrameworkDetail:
+      properties:
+        framework:
+          type: string
+          title: Framework
+        framework_name:
+          type: string
+          title: Framework Name
+        summary:
+          $ref: '#/components/schemas/FrameworkSummary'
+        controls:
+          items:
+            $ref: '#/components/schemas/ControlWithEvidence'
+          type: array
+          title: Controls
+        generated_at:
+          type: string
+          format: date-time
+          title: Generated At
+      type: object
+      required:
+      - framework
+      - framework_name
+      - summary
+      - controls
+      - generated_at
+      title: FrameworkDetail
+    FrameworkSummary:
+      properties:
+        total:
+          type: integer
+          title: Total
+        collected:
+          type: integer
+          title: Collected
+        review:
+          type: integer
+          title: Review
+        approved:
+          type: integer
+          title: Approved
+        rejected:
+          type: integer
+          title: Rejected
+        missing:
+          type: integer
+          title: Missing
+        pct:
+          type: number
+          title: Pct
+      type: object
+      required:
+      - total
+      - collected
+      - review
+      - approved
+      - rejected
+      - missing
+      - pct
+      title: FrameworkSummary
     FrameworksResponse:
       properties:
         frameworks:
@@ -20839,33 +24498,43 @@ components:
     FunnelDeltas:
       properties:
         events_of_interest:
-          type: number
+          anyOf:
+          - type: number
+          - type: 'null'
           title: Events Of Interest
         correlation_instances:
-          type: number
+          anyOf:
+          - type: number
+          - type: 'null'
           title: Correlation Instances
         alerts_generated:
-          type: number
+          anyOf:
+          - type: number
+          - type: 'null'
           title: Alerts Generated
         signal_to_noise:
-          type: number
+          anyOf:
+          - type: number
+          - type: 'null'
           title: Signal To Noise
         mttd_seconds:
-          type: number
+          anyOf:
+          - type: number
+          - type: 'null'
           title: Mttd Seconds
         analyst_queue_depth:
-          type: number
+          anyOf:
+          - type: number
+          - type: 'null'
           title: Analyst Queue Depth
       type: object
-      required:
-      - events_of_interest
-      - correlation_instances
-      - alerts_generated
-      - signal_to_noise
-      - mttd_seconds
-      - analyst_queue_depth
       title: FunnelDeltas
-      description: Period-over-period percentage deltas for the funnel KPI bar.
+      description: 'Period-over-period percentage deltas for the funnel KPI bar.
+
+
+        ``None`` means the previous window was empty — no baseline exists, and
+
+        the UI renders that as "no baseline" instead of a misleading 0%.'
     FunnelMetrics:
       properties:
         period:
@@ -21049,6 +24718,87 @@ components:
       - period_start
       - period_end
       title: GenerateRequest
+    GrantListResponse:
+      properties:
+        tenant_id:
+          type: string
+          title: Tenant Id
+        grants:
+          items:
+            $ref: '#/components/schemas/GrantModel'
+          type: array
+          title: Grants
+        demoted_now:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Demoted Now
+      type: object
+      required:
+      - tenant_id
+      - grants
+      - demoted_now
+      title: GrantListResponse
+    GrantModel:
+      properties:
+        id:
+          type: string
+          title: Id
+        scope_kind:
+          type: string
+          title: Scope Kind
+        scope_key:
+          type: string
+          title: Scope Key
+        capability:
+          type: string
+          title: Capability
+        state:
+          type: string
+          title: State
+        source:
+          type: string
+          title: Source
+        is_override:
+          type: boolean
+          title: Is Override
+        evidence:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Evidence
+        granted_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Granted At
+        demoted_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Demoted At
+        demoted_reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Demoted Reason
+        override_reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Override Reason
+      type: object
+      required:
+      - id
+      - scope_kind
+      - scope_key
+      - capability
+      - state
+      - source
+      - is_override
+      title: GrantModel
     GraphEdge:
       properties:
         source:
@@ -21150,21 +24900,104 @@ components:
           title: Detail
       type: object
       title: HTTPValidationError
-    HandoffNotes:
+    HeatmapCell:
       properties:
-        notes:
+        control_id:
           type: string
-          minLength: 1
-          title: Notes
-        pending_items:
-          items:
-            type: string
-          type: array
-          title: Pending Items
+          title: Control Id
+        title:
+          type: string
+          title: Title
+        status:
+          type: string
+          title: Status
+        evidence_count:
+          type: integer
+          title: Evidence Count
       type: object
       required:
-      - notes
-      title: HandoffNotes
+      - control_id
+      - title
+      - status
+      - evidence_count
+      title: HeatmapCell
+    HeatmapResponse:
+      properties:
+        framework:
+          type: string
+          title: Framework
+        cells:
+          items:
+            $ref: '#/components/schemas/HeatmapCell'
+          type: array
+          title: Cells
+        generated_at:
+          type: string
+          format: date-time
+          title: Generated At
+      type: object
+      required:
+      - framework
+      - cells
+      - generated_at
+      title: HeatmapResponse
+    HuntPlanClause:
+      properties:
+        field:
+          type: string
+          maxLength: 64
+          title: Field
+        operator:
+          type: string
+          maxLength: 16
+          title: Operator
+        value:
+          type: string
+          maxLength: 512
+          title: Value
+      type: object
+      required:
+      - field
+      - operator
+      - value
+      title: HuntPlanClause
+      description: 'One predicate of a hunting agent''s plan.
+
+
+        Three typed strings and nothing else. There is no property here that can
+
+        carry a query, a fragment of one, or free text, which is the property
+
+        ``scripts/check_hunt_agent_boundary.py`` reads this model to check. The
+
+        field and operator are validated against the closed sets in
+
+        ``app.services.retro_hunt.hunt_plan_sql`` before anything is compiled.'
+    HuntPlanExecuteRequest:
+      properties:
+        clauses:
+          items:
+            $ref: '#/components/schemas/HuntPlanClause'
+          type: array
+          maxItems: 7
+          minItems: 1
+          title: Clauses
+        lookback_hours:
+          type: integer
+          maximum: 2160.0
+          minimum: 1.0
+          title: Lookback Hours
+          default: 168
+        limit:
+          type: integer
+          maximum: 200.0
+          minimum: 1.0
+          title: Limit
+          default: 200
+      type: object
+      required:
+      - clauses
+      title: HuntPlanExecuteRequest
     HuntPreviewItem:
       properties:
         id:
@@ -22017,7 +25850,17 @@ components:
         value:
           type: number
           title: Value
-          description: Headline metric for the current window.
+          description: 'Headline metric for the current window. Read it with `sample_count`:
+            a mean over zero rows is reported as 0.0 and is *not* a measurement. The
+            mean is not nullable because that is a breaking response change for every
+            existing client, which is the same decision `/metrics/soc` took with `mttd_sample_count`.'
+        sample_count:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Sample Count
+          description: Rows behind `value`. A mean over three and over three thousand
+            differ.
         unit:
           type: string
           title: Unit
@@ -22219,6 +26062,37 @@ components:
       - created_at
       - created_by
       title: KBDocResponse
+    KillSwitchState:
+      properties:
+        engaged:
+          type: boolean
+          title: Engaged
+        scope:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Scope
+          description: global | tenant, when engaged
+        reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Reason
+        engaged_by:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Engaged By
+        engaged_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Engaged At
+      type: object
+      required:
+      - engaged
+      title: KillSwitchState
     KpiBarTargetsOut:
       properties:
         false_positive_rate_max_pct:
@@ -22543,6 +26417,46 @@ components:
       - rules
       - total
       title: ListResponse
+    LlmCredentialTestResult:
+      properties:
+        outcome:
+          type: string
+          enum:
+          - ok
+          - refused
+          - unreachable
+          - unverified
+          title: Outcome
+        detail:
+          type: string
+          title: Detail
+        provider:
+          type: string
+          title: Provider
+        model:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Model
+        latency_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Latency Ms
+      type: object
+      required:
+      - outcome
+      - detail
+      - provider
+      title: LlmCredentialTestResult
+      description: 'What a real call to the configured provider did.
+
+
+        Four outcomes, and `unverified` is one of them on purpose: an air-gapped
+
+        deployment refuses the egress rather than attempting it, and reporting that
+
+        as a failure would send an operator to debug a credential that is fine.'
     LlmCredentialUpsert:
       properties:
         provider:
@@ -22837,6 +26751,215 @@ components:
       - changed_at
       - created_at
       title: MaturityOut
+    McpServerCreate:
+      properties:
+        name:
+          type: string
+          maxLength: 40
+          minLength: 2
+          title: Name
+        label:
+          anyOf:
+          - type: string
+            maxLength: 200
+          - type: 'null'
+          title: Label
+        transport:
+          type: string
+          title: Transport
+          default: streamable_http
+        url:
+          anyOf:
+          - type: string
+            maxLength: 2048
+          - type: 'null'
+          title: Url
+        command:
+          anyOf:
+          - type: string
+            maxLength: 512
+          - type: 'null'
+          title: Command
+        args:
+          items:
+            type: string
+          type: array
+          maxItems: 32
+          title: Args
+        credential:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Credential
+        tool_allowlist:
+          items:
+            type: string
+          type: array
+          title: Tool Allowlist
+        timeout_seconds:
+          type: integer
+          title: Timeout Seconds
+          default: 20
+        max_response_bytes:
+          type: integer
+          title: Max Response Bytes
+          default: 65536
+        enabled:
+          type: boolean
+          title: Enabled
+          default: false
+      type: object
+      required:
+      - name
+      title: McpServerCreate
+    McpServerListResponse:
+      properties:
+        servers:
+          items:
+            $ref: '#/components/schemas/McpServerModel'
+          type: array
+          title: Servers
+        read_only_by_default:
+          type: boolean
+          title: Read Only By Default
+          default: true
+      type: object
+      required:
+      - servers
+      title: McpServerListResponse
+    McpServerModel:
+      properties:
+        id:
+          type: string
+          title: Id
+        name:
+          type: string
+          title: Name
+        label:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Label
+        transport:
+          type: string
+          title: Transport
+        url:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Url
+        command:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Command
+        args:
+          items:
+            type: string
+          type: array
+          title: Args
+        tool_allowlist:
+          items:
+            type: string
+          type: array
+          title: Tool Allowlist
+        timeout_seconds:
+          type: integer
+          title: Timeout Seconds
+        max_response_bytes:
+          type: integer
+          title: Max Response Bytes
+        enabled:
+          type: boolean
+          title: Enabled
+        has_credential:
+          type: boolean
+          title: Has Credential
+        created_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Created At
+        updated_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Updated At
+      type: object
+      required:
+      - id
+      - name
+      - transport
+      - timeout_seconds
+      - max_response_bytes
+      - enabled
+      - has_credential
+      title: McpServerModel
+      description: What the console sees. Never the credential.
+    McpServerUpdate:
+      properties:
+        label:
+          anyOf:
+          - type: string
+            maxLength: 200
+          - type: 'null'
+          title: Label
+        transport:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Transport
+        url:
+          anyOf:
+          - type: string
+            maxLength: 2048
+          - type: 'null'
+          title: Url
+        command:
+          anyOf:
+          - type: string
+            maxLength: 512
+          - type: 'null'
+          title: Command
+        args:
+          anyOf:
+          - items:
+              type: string
+            type: array
+            maxItems: 32
+          - type: 'null'
+          title: Args
+        credential:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Credential
+        tool_allowlist:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Tool Allowlist
+        timeout_seconds:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Timeout Seconds
+        max_response_bytes:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Max Response Bytes
+        enabled:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Enabled
+      type: object
+      title: McpServerUpdate
     MemberOut:
       properties:
         user_id:
@@ -24027,6 +28150,36 @@ components:
       required:
       - status
       title: OnCallUpdateRequest
+    OnboardingStatus:
+      properties:
+        first_run:
+          type: boolean
+          title: First Run
+          description: True when this tenant has no connectors and no alerts. The
+            console routes a first-run tenant to the setup wizard rather than to an
+            empty dashboard.
+        steps:
+          items:
+            $ref: '#/components/schemas/SetupStep'
+          type: array
+          title: Steps
+        connectors:
+          type: integer
+          title: Connectors
+        alerts:
+          type: integer
+          title: Alerts
+        sample_data_loaded:
+          type: boolean
+          title: Sample Data Loaded
+      type: object
+      required:
+      - first_run
+      - steps
+      - connectors
+      - alerts
+      - sample_data_loaded
+      title: OnboardingStatus
     OrganizationCreate:
       properties:
         slug:
@@ -24489,6 +28642,11 @@ components:
         status:
           type: string
           title: Status
+        unmeasured:
+          items:
+            type: string
+          type: array
+          title: Unmeasured
       type: object
       required:
       - stage
@@ -24973,8 +29131,87 @@ components:
       - suppressed
       - changed
       title: PreviewRow
+    PromotionRequest:
+      properties:
+        scope_kind:
+          type: string
+          title: Scope Kind
+          description: alert_class or action_verb
+        scope_key:
+          type: string
+          maxLength: 200
+          minLength: 1
+          title: Scope Key
+        capability:
+          type: string
+          title: Capability
+          description: auto_close or auto_execute
+        override:
+          type: boolean
+          title: Override
+          default: false
+        override_reason:
+          anyOf:
+          - type: string
+            maxLength: 500
+          - type: 'null'
+          title: Override Reason
+      type: object
+      required:
+      - scope_kind
+      - scope_key
+      - capability
+      title: PromotionRequest
+    PromotionResponse:
+      properties:
+        granted:
+          type: boolean
+          title: Granted
+        state:
+          type: string
+          title: State
+        source:
+          type: string
+          title: Source
+        is_override:
+          type: boolean
+          title: Is Override
+        refusals:
+          items:
+            type: string
+          type: array
+          title: Refusals
+        evidence:
+          additionalProperties: true
+          type: object
+          title: Evidence
+        changed:
+          type: boolean
+          title: Changed
+      type: object
+      required:
+      - granted
+      - state
+      - source
+      - is_override
+      - refusals
+      - evidence
+      - changed
+      title: PromotionResponse
     ProposalResponse:
       properties:
+        positive_fixtures:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Positive Fixtures
+        negative_fixtures:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Negative Fixtures
         id:
           type: string
           format: uuid
@@ -25853,6 +30090,39 @@ components:
         under (``principal``, ``network``, ``workflow``, ``tenant``). One
 
         entity belongs to exactly one group; we don''t duplicate rows.'
+    ReleaseRequest:
+      properties:
+        reason:
+          type: string
+          maxLength: 500
+          minLength: 8
+          title: Reason
+      type: object
+      required:
+      - reason
+      title: ReleaseRequest
+    ReopenCaseRequest:
+      properties:
+        reason:
+          type: string
+          maxLength: 2000
+          minLength: 8
+          title: Reason
+          description: Why the case is being reopened. Recorded on the case and in
+            the audit log.
+        status:
+          type: string
+          enum:
+          - new
+          - triaged
+          - investigating
+          title: Status
+          default: investigating
+      type: object
+      required:
+      - reason
+      title: ReopenCaseRequest
+      description: Why this case is coming back.
     ReplaceRulesRequest:
       properties:
         yaml:
@@ -25863,6 +30133,23 @@ components:
       required:
       - yaml
       title: ReplaceRulesRequest
+    ReplayableConnectorInfo:
+      properties:
+        connector_type:
+          type: string
+          title: Connector Type
+        vendor:
+          type: string
+          title: Vendor
+        label:
+          type: string
+          title: Label
+      type: object
+      required:
+      - connector_type
+      - vendor
+      - label
+      title: ReplayableConnectorInfo
     ReportDefinitionBody:
       properties:
         name:
@@ -25922,6 +30209,70 @@ components:
           title: Audit Days
       type: object
       title: RetentionUpdate
+    RetroHuntSettingsIn:
+      properties:
+        enabled:
+          type: boolean
+          title: Enabled
+          description: Whether AiSOC may sweep this tenant's history at all.
+        lookback_days:
+          type: integer
+          maximum: 365.0
+          minimum: 1.0
+          title: Lookback Days
+          description: How far back a sweep looks. Bounded so no settings row can
+            express 'scan everything'.
+          default: 30
+        include_federated:
+          type: boolean
+          title: Include Federated
+          description: 'Whether to go beyond AiSOC''s own lake into connected SIEMs.
+            Separate from `enabled` because it is a separate cost: a lake sweep is
+            free to you and a SIEM sweep may not be.'
+          default: true
+      type: object
+      required:
+      - enabled
+      title: RetroHuntSettingsIn
+    RetroHuntSettingsOut:
+      properties:
+        enabled:
+          type: boolean
+          title: Enabled
+        lookback_days:
+          type: integer
+          title: Lookback Days
+        include_federated:
+          type: boolean
+          title: Include Federated
+        max_sweeps_per_hour:
+          type: integer
+          title: Max Sweeps Per Hour
+        max_sweeps_per_day:
+          type: integer
+          title: Max Sweeps Per Day
+        sweeps_this_hour:
+          type: integer
+          title: Sweeps This Hour
+        sweeps_today:
+          type: integer
+          title: Sweeps Today
+        sweeps_skipped_budget:
+          type: integer
+          title: Sweeps Skipped Budget
+      type: object
+      required:
+      - enabled
+      - lookback_days
+      - include_federated
+      - max_sweeps_per_hour
+      - max_sweeps_per_day
+      - sweeps_this_hour
+      - sweeps_today
+      - sweeps_skipped_budget
+      title: RetroHuntSettingsOut
+      description: What this tenant has agreed to, and what its budget has been spent
+        on.
     ReviewAction:
       properties:
         action:
@@ -26117,6 +30468,18 @@ components:
           title: Permission Ids
       type: object
       title: RoleUpdate
+    RotateScimTokenRequest:
+      properties:
+        grace_hours:
+          type: integer
+          maximum: 168.0
+          minimum: 0.0
+          title: Grace Hours
+          description: How long the superseded credential keeps working. Zero revokes
+            it at once, for rotation after a disclosure.
+          default: 24
+      type: object
+      title: RotateScimTokenRequest
     RuleActionWire:
       properties:
         set_severity:
@@ -27246,6 +31609,30 @@ components:
       - pattern
       - valid_from
       title: STIXIndicatorWithPush
+    SampleDataResponse:
+      properties:
+        accepted:
+          type: integer
+          title: Accepted
+        rejected:
+          type: integer
+          title: Rejected
+        scenarios:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Scenarios
+        note:
+          type: string
+          title: Note
+      type: object
+      required:
+      - accepted
+      - rejected
+      - scenarios
+      - note
+      title: SampleDataResponse
     SandboxResultResponse:
       properties:
         outcome:
@@ -27305,6 +31692,17 @@ components:
       - provider
       - detail
       title: SandboxResultResponse
+    SaveSkillRequest:
+      properties:
+        source_yaml:
+          type: string
+          maxLength: 32768
+          minLength: 1
+          title: Source Yaml
+      type: object
+      required:
+      - source_yaml
+      title: SaveSkillRequest
     SavedHuntModel:
       properties:
         id:
@@ -27506,91 +31904,417 @@ components:
       - findings_closed
       - error_message
       title: ScanRunOut
-    ShiftAnalyst:
+    ScimTokenOut:
       properties:
         id:
           type: string
+          format: uuid
           title: Id
         name:
           type: string
           title: Name
-        role:
+        prefix:
           type: string
-          title: Role
+          title: Prefix
+        org_id:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Org Id
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+        last_used_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Last Used At
+        expires_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Expires At
+        revoked_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Revoked At
+        rotated_from_id:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Rotated From Id
+        active:
+          type: boolean
+          title: Active
       type: object
       required:
       - id
       - name
-      - role
-      title: ShiftAnalyst
-    ShiftCreate:
+      - prefix
+      - org_id
+      - created_at
+      - last_used_at
+      - expires_at
+      - revoked_at
+      - rotated_from_id
+      - active
+      title: ScimTokenOut
+    SetupStep:
       properties:
-        name:
+        key:
           type: string
-          maxLength: 120
-          minLength: 1
-          title: Name
-        analysts:
-          items:
-            type: string
-          type: array
-          title: Analysts
-          description: Analyst user IDs
-        lead_id:
+          title: Key
+        label:
+          type: string
+          title: Label
+        done:
+          type: boolean
+          title: Done
+        why:
+          type: string
+          title: Why
+        href:
           anyOf:
           - type: string
           - type: 'null'
-          title: Lead Id
+          title: Href
+        detail:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Detail
       type: object
       required:
-      - name
-      title: ShiftCreate
-    ShiftSummary:
+      - key
+      - label
+      - done
+      - why
+      title: SetupStep
+      description: One thing a tenant has or has not done.
+    ShadowModeEntry:
       properties:
-        id:
+        alert_class:
           type: string
-          title: Id
-        name:
-          type: string
-          title: Name
-        started_at:
-          type: string
-          title: Started At
-        ended_at:
+          title: Alert Class
+        enabled:
+          type: boolean
+          title: Enabled
+        enabled_at:
           anyOf:
           - type: string
           - type: 'null'
-          title: Ended At
+          title: Enabled At
+        updated_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Updated At
+        updated_by:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Updated By
+      type: object
+      required:
+      - alert_class
+      - enabled
+      title: ShadowModeEntry
+    ShadowModeResponse:
+      properties:
+        tenant_id:
+          type: string
+          title: Tenant Id
+        entries:
+          items:
+            $ref: '#/components/schemas/ShadowModeEntry'
+          type: array
+          title: Entries
+      type: object
+      required:
+      - tenant_id
+      - entries
+      title: ShadowModeResponse
+    ShadowModeUpdateRequest:
+      properties:
+        enabled:
+          type: boolean
+          title: Enabled
+      type: object
+      required:
+      - enabled
+      title: ShadowModeUpdateRequest
+    SiemSearchRequest:
+      properties:
+        indicator_type:
+          type: string
+          title: Indicator Type
+          description: One of the types GET /agent-tools/backends publishes.
+        value:
+          type: string
+          maxLength: 2048
+          minLength: 1
+          title: Value
+        since_hours:
+          type: integer
+          maximum: 168.0
+          minimum: 1.0
+          title: Since Hours
+          default: 24
+        limit:
+          type: integer
+          maximum: 40.0
+          minimum: 1.0
+          title: Limit
+          default: 40
+      type: object
+      required:
+      - indicator_type
+      - value
+      title: SiemSearchRequest
+      description: 'A structured query. Deliberately not a query.
+
+
+        There is no ``query`` field, no ``free_text`` field and no ``field``
+
+        field, and their absence is the contract rather than an omission.
+
+        ``indicator_type`` is validated against a closed set and ``value``
+
+        against the shape that type requires, so a model cannot pass query text
+
+        by claiming it is an indicator.'
+    SkillBacktestRequest:
+      properties:
+        connector_id:
+          type: string
+          format: uuid
+          title: Connector Id
+        since:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Since
+        until:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Until
+        train_fraction:
+          type: number
+          exclusiveMaximum: 1.0
+          exclusiveMinimum: 0.0
+          title: Train Fraction
+          default: 0.7
+        limit:
+          type: integer
+          maximum: 2000.0
+          minimum: 1.0
+          title: Limit
+          default: 1000
+        bootstrap_seed:
+          type: integer
+          title: Bootstrap Seed
+          default: 20260926
+        bootstrap_resamples:
+          type: integer
+          title: Bootstrap Resamples
+          default: 1000
+      type: object
+      required:
+      - connector_id
+      title: SkillBacktestRequest
+      description: Which connector and window to grade the skill over.
+    SkillBacktestResponse:
+      properties:
+        skill_id:
+          type: string
+          title: Skill Id
+        version:
+          type: integer
+          title: Version
+        baseline_evaluation_id:
+          type: string
+          title: Baseline Evaluation Id
+        candidate_evaluation_id:
+          type: string
+          title: Candidate Evaluation Id
+        note:
+          type: string
+          title: Note
+      type: object
+      required:
+      - skill_id
+      - version
+      - baseline_evaluation_id
+      - candidate_evaluation_id
+      - note
+      title: SkillBacktestResponse
+      description: The two runs the console polls, and how to read them together.
+    SkillListResponse:
+      properties:
+        skills:
+          items:
+            $ref: '#/components/schemas/SkillModel'
+          type: array
+          title: Skills
+        available_tools:
+          $ref: '#/components/schemas/AvailableTools'
+      type: object
+      required:
+      - skills
+      - available_tools
+      title: SkillListResponse
+    SkillModel:
+      properties:
+        skill_id:
+          type: string
+          title: Skill Id
+        version:
+          type: integer
+          title: Version
         status:
           type: string
           title: Status
-        lead:
-          $ref: '#/components/schemas/ShiftAnalyst'
-        analyst_count:
-          type: integer
-          title: Analyst Count
-        alerts_handled:
-          type: integer
-          title: Alerts Handled
-        escalations:
-          type: integer
-          title: Escalations
-        handoff_notes:
+        name:
+          type: string
+          title: Name
+        owner:
+          type: string
+          title: Owner
+        expires_at:
+          type: string
+          format: date-time
+          title: Expires At
+        expired:
+          type: boolean
+          title: Expired
+        body:
+          additionalProperties: true
+          type: object
+          title: Body
+        source_yaml:
+          type: string
+          title: Source Yaml
+        backtest_evaluation_id:
           anyOf:
           - type: string
           - type: 'null'
-          title: Handoff Notes
+          title: Backtest Evaluation Id
+        backtest_baseline_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Backtest Baseline Id
+        backtest_version:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Backtest Version
+        activated_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Activated At
+        created_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Created At
+        updated_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Updated At
       type: object
       required:
-      - id
-      - name
-      - started_at
+      - skill_id
+      - version
       - status
-      - lead
-      - analyst_count
-      - alerts_handled
-      - escalations
-      title: ShiftSummary
+      - name
+      - owner
+      - expires_at
+      - expired
+      - body
+      - source_yaml
+      title: SkillModel
+      description: One skill as the console sees it.
+    SkillVersionModel:
+      properties:
+        skill_id:
+          type: string
+          title: Skill Id
+        version:
+          type: integer
+          title: Version
+        name:
+          type: string
+          title: Name
+        owner:
+          type: string
+          title: Owner
+        expires_at:
+          type: string
+          format: date-time
+          title: Expires At
+        body:
+          additionalProperties: true
+          type: object
+          title: Body
+        source_yaml:
+          type: string
+          title: Source Yaml
+        backtest_evaluation_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Backtest Evaluation Id
+        backtest_baseline_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Backtest Baseline Id
+        authored_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Authored At
+        activated_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Activated At
+        retired_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Retired At
+      type: object
+      required:
+      - skill_id
+      - version
+      - name
+      - owner
+      - expires_at
+      - body
+      - source_yaml
+      title: SkillVersionModel
+      description: One immutable version, which is what a recorded ``skill@vN`` resolves
+        to.
     SourceLinkResponse:
       properties:
         vendor:
@@ -27729,6 +32453,193 @@ components:
       - disposition
       title: SourceWritebackRequest
       description: What the caller believes about the alert.
+    SsoConnectionIn:
+      properties:
+        provider:
+          type: string
+          title: Provider
+        issuer:
+          type: string
+          maxLength: 512
+          minLength: 1
+          title: Issuer
+        display_name:
+          anyOf:
+          - type: string
+            maxLength: 200
+          - type: 'null'
+          title: Display Name
+        enabled:
+          type: boolean
+          title: Enabled
+          default: false
+        group_role_mapping:
+          additionalProperties:
+            type: string
+          type: object
+          title: Group Role Mapping
+        default_role:
+          type: string
+          title: Default Role
+          default: viewer
+        metadata_url:
+          anyOf:
+          - type: string
+            maxLength: 1024
+          - type: 'null'
+          title: Metadata Url
+        metadata_xml:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Metadata Xml
+        allowed_email_domains:
+          type: string
+          maxLength: 2000
+          title: Allowed Email Domains
+          default: ''
+        jit_provisioning:
+          type: boolean
+          title: Jit Provisioning
+          default: true
+        group_role_mode:
+          type: string
+          title: Group Role Mode
+          default: first_login_only
+        login_label:
+          type: string
+          maxLength: 80
+          title: Login Label
+          default: ''
+      type: object
+      required:
+      - provider
+      - issuer
+      title: SsoConnectionIn
+    SsoConnectionOut:
+      properties:
+        id:
+          type: string
+          title: Id
+        tenant_id:
+          type: string
+          title: Tenant Id
+        provider:
+          type: string
+          title: Provider
+        issuer:
+          type: string
+          title: Issuer
+        display_name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Display Name
+        enabled:
+          type: boolean
+          title: Enabled
+        group_role_mapping:
+          additionalProperties:
+            type: string
+          type: object
+          title: Group Role Mapping
+        default_role:
+          type: string
+          title: Default Role
+        allowed_email_domains:
+          type: string
+          title: Allowed Email Domains
+        jit_provisioning:
+          type: boolean
+          title: Jit Provisioning
+        group_role_mode:
+          type: string
+          title: Group Role Mode
+        login_label:
+          type: string
+          title: Login Label
+        metadata_url:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Metadata Url
+        has_metadata_xml:
+          type: boolean
+          title: Has Metadata Xml
+        created_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Created At
+        updated_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Updated At
+      type: object
+      required:
+      - id
+      - tenant_id
+      - provider
+      - issuer
+      - display_name
+      - enabled
+      - group_role_mapping
+      - default_role
+      - allowed_email_domains
+      - jit_provisioning
+      - group_role_mode
+      - login_label
+      - metadata_url
+      - has_metadata_xml
+      - created_at
+      - updated_at
+      title: SsoConnectionOut
+    StartReplayRequest:
+      properties:
+        connector_id:
+          type: string
+          format: uuid
+          title: Connector Id
+        since:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Since
+        until:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Until
+        train_fraction:
+          type: number
+          exclusiveMaximum: 1.0
+          exclusiveMinimum: 0.0
+          title: Train Fraction
+          default: 0.7
+        limit:
+          type: integer
+          maximum: 2000.0
+          minimum: 1.0
+          title: Limit
+          default: 1000
+        bootstrap_seed:
+          type: integer
+          title: Bootstrap Seed
+          default: 20260926
+        bootstrap_resamples:
+          type: integer
+          maximum: 20000.0
+          minimum: 0.0
+          title: Bootstrap Resamples
+          default: 1000
+      type: object
+      required:
+      - connector_id
+      title: StartReplayRequest
+      description: Which connector, which window, and how the report should be computed.
     StepDispatchRequest:
       properties:
         capability:
@@ -27783,6 +32694,94 @@ components:
       - capability
       title: StepDispatchRequest
       description: One playbook step, expressed as the verb it names.
+    StorageCostProjection:
+      properties:
+        measured:
+          type: boolean
+          title: Measured
+        unmeasured_reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Unmeasured Reason
+        raw_bytes_measured:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Raw Bytes Measured
+        events_measured:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Events Measured
+        raw_tb_per_day:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Raw Tb Per Day
+        monthly_usd:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Monthly Usd
+        usd_per_raw_tb_ingested:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Usd Per Raw Tb Ingested
+        tiers:
+          items:
+            $ref: '#/components/schemas/StorageTierProjection'
+          type: array
+          title: Tiers
+        compression_ratio:
+          type: number
+          title: Compression Ratio
+          default: 8.0
+        disclaimer:
+          type: string
+          title: Disclaimer
+          default: Projected from your measured ingest volume using the committed
+            storage cost model (docs/decisions/storage-cost-model.json) at reference
+            list prices. This is a model, not your provider's bill — verify against
+            your own region and negotiated rates.
+      type: object
+      required:
+      - measured
+      title: StorageCostProjection
+      description: 'Projected storage cost for a tenant, or an honest statement that
+        there is none.
+
+
+        ``measured`` is the field that matters. When it is false every money field
+
+        is ``None`` — not ``0.0`` — and ``unmeasured_reason`` says why.'
+    StorageTierProjection:
+      properties:
+        tier:
+          type: string
+          title: Tier
+        retention_days:
+          type: integer
+          title: Retention Days
+        resident_gb:
+          type: number
+          title: Resident Gb
+        rate_usd_per_gb_month:
+          type: number
+          title: Rate Usd Per Gb Month
+        monthly_usd:
+          type: number
+          title: Monthly Usd
+      type: object
+      required:
+      - tier
+      - retention_days
+      - resident_gb
+      - rate_usd_per_gb_month
+      - monthly_usd
+      title: StorageTierProjection
+      description: One retention tier's share of the projected monthly storage cost.
     SubmissionResponse:
       properties:
         id:
@@ -27941,84 +32940,6 @@ components:
       required:
       - url
       title: SubmitUrlRequest
-    SuggestRequest:
-      properties:
-        alert_id:
-          type: string
-          format: uuid
-          title: Alert Id
-          description: ID of the FP-flagged alert.
-        analyst_note:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Analyst Note
-          description: Free-text note explaining why this is a FP.
-      type: object
-      required:
-      - alert_id
-      title: SuggestRequest
-    SuggestionListResponse:
-      properties:
-        suggestions:
-          items:
-            $ref: '#/components/schemas/SuggestionResponse'
-          type: array
-          title: Suggestions
-        total:
-          type: integer
-          title: Total
-      type: object
-      required:
-      - suggestions
-      - total
-      title: SuggestionListResponse
-    SuggestionResponse:
-      properties:
-        suggestion_id:
-          type: string
-          format: uuid
-          title: Suggestion Id
-        alert_id:
-          type: string
-          format: uuid
-          title: Alert Id
-        base_rule_id:
-          anyOf:
-          - type: string
-            format: uuid
-          - type: 'null'
-          title: Base Rule Id
-        draft_rule_name:
-          type: string
-          title: Draft Rule Name
-        draft_sigma_yaml:
-          type: string
-          title: Draft Sigma Yaml
-        rationale:
-          type: string
-          title: Rationale
-        proposal_id:
-          anyOf:
-          - type: string
-            format: uuid
-          - type: 'null'
-          title: Proposal Id
-        created_at:
-          type: string
-          format: date-time
-          title: Created At
-      type: object
-      required:
-      - suggestion_id
-      - alert_id
-      - base_rule_id
-      - draft_rule_name
-      - draft_sigma_yaml
-      - rationale
-      - proposal_id
-      - created_at
-      title: SuggestionResponse
     SuppressRequest:
       properties:
         reason:
@@ -29546,6 +34467,11 @@ components:
             - contained
             - resolved
             - closed
+            - open
+            - in_progress
+            - pending
+            - pending_closure
+            - cancelled
           - type: 'null'
           title: Status
         assignee:
@@ -29804,6 +34730,11 @@ components:
           - type: boolean
           - type: 'null'
           title: Is Active
+        reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Reason
       type: object
       title: UpdateUserRequest
     UpsertAlertGraphRequest:
@@ -30028,6 +34959,37 @@ components:
       - role_id
       - role_name
       title: UserRoleOut
+    ValidateResponse:
+      properties:
+        valid:
+          type: boolean
+          title: Valid
+        skill_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Skill Id
+        name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Name
+        expected_pivots:
+          items:
+            type: string
+          type: array
+          title: Expected Pivots
+        available_tools:
+          $ref: '#/components/schemas/AvailableTools'
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+      type: object
+      required:
+      - valid
+      title: ValidateResponse
     ValidationError:
       properties:
         loc:
@@ -30054,6 +35016,42 @@ components:
       - msg
       - type
       title: ValidationError
+    VendorReadRequest:
+      properties:
+        capability:
+          type: string
+          title: Capability
+        target:
+          type: string
+          maxLength: 512
+          minLength: 1
+          title: Target
+        vendor:
+          type: string
+          maxLength: 64
+          title: Vendor
+          default: ''
+        params:
+          additionalProperties: true
+          type: object
+          title: Params
+      type: object
+      required:
+      - capability
+      - target
+      title: VendorReadRequest
+      description: 'One read-only verb against one entity.
+
+
+        ``params`` is filtered against a per-verb allowlist before it travels,
+
+        because by the time it reaches the actions service it is the same
+
+        dictionary that carries the decrypted credential. An unfiltered
+
+        pass-through would let a caller supply their own vendor credential and
+
+        have the read run somewhere else entirely.'
     VulnerabilityCreate:
       properties:
         asset_id:

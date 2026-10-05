@@ -55,12 +55,25 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         "threat_intel:write",
         "settings:read",
         "settings:write",
+        # A tenant admin could not read their own tenant's audit log. Only
+        # `platform_admin` and `admin` could, and both hold `*` across every
+        # tenant — so on a multi-tenant deployment the only principals who
+        # could answer "who changed this?" for a customer were the operator's
+        # own staff, and the customer had to ask them. That is a compliance
+        # failure (SOC 2 CC7.2 and ISO 27001 A.12.4 both require the control
+        # owner to be able to review their own trail) and an MSSP blocker.
+        #
+        # Safe because the read is tenant-scoped at the query layer: the
+        # handler filters on the authenticated `tenant_id`, so this grants
+        # visibility of their own history and nothing else.
+        "audit_log:read",
         # Workstream 7: tenant lake API. Tenant admins get full access
         # to the warm-tier query surface (POST /api/v1/lake/sql) and
         # the schema discovery endpoint (GET /api/v1/lake/schema). The
         # rewriter still enforces tenant_id predicates and the
         # ClickHouse client still enforces row caps and timeouts; the
         # permission only controls who *can* query at all.
+        "hunts:read",
         "lake:query",
         "lake:read_schema",
         # The live-action registry: which vendors can perform which response
@@ -70,6 +83,12 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         # bound to the decision.
         "actions:read",
         "actions:execute",
+        # POST /knowledge-base/query is a read expressed as a POST (the
+        # question is a body), so it was counted as a state-changing
+        # route with no authorization decision. It searches this
+        # tenant's own knowledge base, so every role that can read an
+        # alert can read it.
+        "knowledge_base:read",
     ],
     "soc_lead": [
         "alerts:read",
@@ -90,10 +109,17 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         # hunter or tenant-admin role.
         "threat_intel:write",
         # SOC leads run investigations across the lake routinely.
+        "hunts:read",
         "lake:query",
         "lake:read_schema",
         "actions:read",
         "actions:execute",
+        # POST /knowledge-base/query is a read expressed as a POST (the
+        # question is a body), so it was counted as a state-changing
+        # route with no authorization decision. It searches this
+        # tenant's own knowledge base, so every role that can read an
+        # alert can read it.
+        "knowledge_base:read",
     ],
     "soc_analyst": [
         "alerts:read",
@@ -108,12 +134,19 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         # Analysts need lake access to drill into raw events when
         # alerts don't tell the whole story. Schema is read-only and
         # the rate limiter caps abuse.
+        "hunts:read",
         "lake:query",
         "lake:read_schema",
         # Analysts already hold playbooks:execute, and a dry run touches no
         # vendor, so previewing a response is within the same envelope.
         "actions:read",
         "actions:execute",
+        # POST /knowledge-base/query is a read expressed as a POST (the
+        # question is a body), so it was counted as a state-changing
+        # route with no authorization decision. It searches this
+        # tenant's own knowledge base, so every role that can read an
+        # alert can read it.
+        "knowledge_base:read",
     ],
     "threat_hunter": [
         "alerts:read",
@@ -127,11 +160,18 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         # Threat hunters live in the lake — this is their primary
         # workspace for hypothesis-driven investigation across raw
         # events, alert metrics, and IOC enrichments.
+        "hunts:read",
         "lake:query",
         "lake:read_schema",
         # Read the registry to know what response is available for a finding;
         # hunters hand off rather than respond, so no execute.
         "actions:read",
+        # POST /knowledge-base/query is a read expressed as a POST (the
+        # question is a body), so it was counted as a state-changing
+        # route with no authorization decision. It searches this
+        # tenant's own knowledge base, so every role that can read an
+        # alert can read it.
+        "knowledge_base:read",
     ],
     "viewer": [
         "alerts:read",
@@ -139,6 +179,12 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         "reports:read",
         "threat_intel:read",
         "actions:read",
+        # POST /knowledge-base/query is a read expressed as a POST (the
+        # question is a body), so it was counted as a state-changing
+        # route with no authorization decision. It searches this
+        # tenant's own knowledge base, so every role that can read an
+        # alert can read it.
+        "knowledge_base:read",
     ],
     "api_service": [
         "alerts:read",
@@ -170,19 +216,44 @@ def get_password_hash(password: str) -> str:
 
 def create_access_token(data: dict[str, Any], expires_delta: timedelta | None = None) -> str:
     to_encode = data.copy()
+    issued_at = datetime.now(UTC)
     if expires_delta:
-        expire = datetime.now(UTC) + expires_delta
+        expire = issued_at + expires_delta
     else:
-        expire = datetime.now(UTC) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire, "type": "access"})
+        expire = issued_at + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire, "iat": issued_at, "type": "access"})
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
 def create_refresh_token(data: dict[str, Any]) -> str:
     to_encode = data.copy()
-    expire = datetime.now(UTC) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
-    to_encode.update({"exp": expire, "type": "refresh"})
+    issued_at = datetime.now(UTC)
+    expire = issued_at + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode.update({"exp": expire, "iat": issued_at, "type": "refresh"})
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def token_is_revoked(issued_at: Any, sessions_revoked_at: datetime | None) -> bool:
+    """Whether a token predates the principal's last session revocation.
+
+    ``iat`` is the only thing distinguishing a token minted before a
+    deprovisioning from one minted after it. A token with no ``iat`` at all
+    predates this claim being added and is treated as revoked whenever a
+    revocation exists, which fails closed: the alternative would let a token
+    from before the upgrade outlive the revocation that was supposed to end it.
+    """
+    if sessions_revoked_at is None:
+        return False
+    if issued_at is None:
+        return True
+    try:
+        minted = datetime.fromtimestamp(float(issued_at), tz=UTC)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return True
+    cutoff = sessions_revoked_at if sessions_revoked_at.tzinfo else sessions_revoked_at.replace(tzinfo=UTC)
+    # `<=` rather than `<`: `iat` has one-second resolution, so a token
+    # minted in the same second as the revocation must not survive it.
+    return minted <= cutoff
 
 
 def decode_token(token: str) -> dict[str, Any]:
@@ -258,6 +329,28 @@ def verify_ed25519_signature(public_key_bytes: bytes, message: bytes, signature:
         pub_key.verify(signature, message)
     except InvalidSignature as exc:
         raise ValueError("Invalid signature") from exc
+
+
+#: Security analyst / incident handler, declared as a set expression rather
+#: than a literal copy so it cannot drift from the analyst and hunter rows
+#: above it. The subtraction is the restriction list: no user, role, settings,
+#: raw-alert, connector-credential, audit, API-key or platform management.
+ROLE_PERMISSIONS["infosec"] = sorted(
+    (set(ROLE_PERMISSIONS["soc_analyst"]) | set(ROLE_PERMISSIONS["threat_hunter"]))
+    - {
+        "alert_source_raw:read",
+        "alerts:delete",
+        "api_keys:manage",
+        "connectors:write",
+        "connectors:delete",
+        "platform_admin",
+        "roles:delete",
+        "roles:write",
+        "settings:write",
+        "users:delete",
+        "users:write",
+    }
+)
 
 
 def has_permission(role: str, permission: str) -> bool:

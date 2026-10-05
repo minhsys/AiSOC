@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import crypto from 'crypto';
 import http from 'http';
 import { WebSocketServer } from 'ws';
 import { Kafka } from 'kafkajs';
@@ -10,6 +11,7 @@ import rateLimit from 'express-rate-limit';
 import { PushManager } from './push';
 import { resolveTicketSecret, verifyRealtimeTicket } from './auth';
 import { setupTelemetry, type Shutdown } from './telemetry';
+import { resolveKafkaTransport } from './kafkaTransport.js';
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
 
@@ -96,10 +98,6 @@ if (REALTIME_TICKET_SECRET === null) {
     'AISOC_REALTIME_JWT_SECRET is unset or insecure in a production environment — ' +
       'realtime WS/SSE connections will be rejected until a real secret is wired.',
   );
-} else if (
-  REALTIME_TICKET_SECRET === 'aisoc-dev-realtime-ticket-secret-not-for-production'
-) {
-  log.warn('Using the shared development realtime ticket secret — do NOT use in production.');
 }
 
 /**
@@ -412,6 +410,12 @@ const kafka = new Kafka({
   clientId: 'aisoc-realtime',
   brokers: KAFKA_BROKERS,
   retry: { retries: 5 },
+  // kafkajs leaves `ssl` and `sasl` undefined, which is plaintext, and this
+  // client had neither — so the service fanning normalized alerts out to
+  // every connected browser read them off the broker in the clear. The
+  // resolver throws in a protected environment rather than returning a
+  // default, so a misconfigured deployment fails at startup.
+  ...resolveKafkaTransport(),
 });
 
 // --- Subscription state, reported on /health ---
@@ -669,21 +673,65 @@ function asyncRoute(
   };
 }
 
+// `public-key` is the VAPID public key and is public by definition.
 app.get('/v1/push/public-key', pushManager.publicKeyHandler);
-app.post('/v1/push/subscribe', pushRateLimit, asyncRoute(pushManager.subscribeHandler));
-app.post('/v1/push/unsubscribe', pushRateLimit, asyncRoute(pushManager.unsubscribeHandler));
-app.post('/v1/push/test', pushRateLimit, asyncRoute(pushManager.testNotifyHandler));
+
+// The other three carried only a rate limiter, and took the tenant from a
+// request header, then a query parameter, then the literal string 'default'.
+// So any caller who could reach the port could enrol a push endpoint against
+// any tenant, unsubscribe another tenant's devices, or make this service send
+// a notification. They are reached through the API's `/api/v1/push/*` proxy,
+// which authenticates the analyst and stamps the tenant, so the same internal
+// token `/internal/*` requires is the right contract: it makes the proxy the
+// only way in, which is what the module already assumed.
+app.post('/v1/push/subscribe', pushRateLimit, asyncRoute(async (req, res) => {
+  if (!requireInternal(req, res)) return;
+  await pushManager.subscribeHandler(req, res);
+}));
+app.post('/v1/push/unsubscribe', pushRateLimit, asyncRoute(async (req, res) => {
+  if (!requireInternal(req, res)) return;
+  await pushManager.unsubscribeHandler(req, res);
+}));
+app.post('/v1/push/test', pushRateLimit, asyncRoute(async (req, res) => {
+  if (!requireInternal(req, res)) return;
+  await pushManager.testNotifyHandler(req, res);
+}));
 
 // --- Internal broadcast endpoint (called by other services) ---
 // POST /internal/agent-event
 // Body: { tenant_id?: string, run_id: string, kind: string, agent: string, summary: string, data?: unknown }
 // The realtime service re-broadcasts to all WebSocket clients on the `agents` channel.
-const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN || '';
+// `REALTIME_INTERNAL_TOKEN` is the name the API sends this under and the name
+// `make up` generates; `INTERNAL_TOKEN` is read second so an existing
+// deployment that set the older name keeps working.
+const INTERNAL_TOKEN = (process.env.REALTIME_INTERNAL_TOKEN || process.env.INTERNAL_TOKEN || '').trim();
 
 function requireInternal(req: express.Request, res: express.Response): boolean {
-  if (!INTERNAL_TOKEN) return true;
-  const auth = req.headers['x-internal-token'];
-  if (auth !== INTERNAL_TOKEN) {
+  // Fails closed. This returned `true` — authorized — when the token was
+  // unset, and no shipped manifest set it, so the guard never ran: any caller
+  // who could reach the port could inject events into any tenant's live stream
+  // by naming the tenant in the body, and could push a notification with
+  // attacker-chosen title, body and URL to that tenant's devices
+  // (GHSA-mqjp-pcpr-7c37).
+  if (!INTERNAL_TOKEN) {
+    res.status(503).json({
+      error: 'realtime internal auth is not configured',
+      detail: 'set REALTIME_INTERNAL_TOKEN (run `make env`, which generates it, and restart)',
+    });
+    return false;
+  }
+  // Both spellings. `x-internal-token` is what the agents service and the
+  // API's approval route send; `x-aisoc-internal-token` is what the API's
+  // push proxy and the chatops notifier send, and what slack-bot reads. One
+  // receiver accepting both is the only fix that does not require every
+  // sender to change in the same release.
+  const auth = req.headers['x-internal-token'] ?? req.headers['x-aisoc-internal-token'];
+  if (typeof auth !== 'string' || auth.length !== INTERNAL_TOKEN.length) {
+    res.status(401).json({ error: 'unauthorized' });
+    return false;
+  }
+  // Constant-time: a length-independent compare on a bearer is a timing oracle.
+  if (!crypto.timingSafeEqual(Buffer.from(auth), Buffer.from(INTERNAL_TOKEN))) {
     res.status(401).json({ error: 'unauthorized' });
     return false;
   }

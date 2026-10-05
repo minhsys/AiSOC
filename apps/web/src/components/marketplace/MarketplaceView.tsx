@@ -5,6 +5,8 @@ import useSWR from 'swr';
 import clsx from 'clsx';
 import { EmptyState, EmptyStateIcons } from '@/components/ui/EmptyState';
 import { ErrorState } from '@/components/ui/ErrorState';
+import { formatTagLabel } from './tagLabel';
+import { apiFetch, AUTH_TOKEN_KEY } from '@/lib/api';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -33,6 +35,17 @@ export interface MarketplaceItem {
     | string;
   tier?: 'stable' | 'beta' | 'imported' | 'community';
   enabled?: boolean;
+  /**
+   * Whether the detection engine loads this rule — the only thing that
+   * decides whether it can fire, and deliberately **not** `enabled`.
+   *
+   * `enabled` is the YAML's own flag OR-ed with the directory, and 1,724
+   * rules carry `enabled: false` while the engine loads every one of them:
+   * the Sigma compiler began translating rules in place without rewriting
+   * the flag. Reading `enabled` here would mark those 1,724 working rules
+   * unusable. Absent on playbooks and plugins, which are not engine rules.
+   */
+  executable?: boolean;
   quarantine_reason?: string;
   provenance?: {
     source?: string | null;
@@ -77,6 +90,9 @@ interface MarketplaceStats {
   community: number;
   by_tier?: Record<string, number>;
   detections_by_tier?: Record<string, number>;
+  /** Entries the engine loads. Partitions the catalogue with `quarantined`. */
+  executable?: number;
+  /** Entries the engine does not load, so they cannot fire. */
   quarantined?: number;
 }
 
@@ -186,6 +202,25 @@ function CommunityBadge() {
   );
 }
 
+/**
+ * The catalogue's load-bearing distinction, and the one it did not make.
+ *
+ * 4,388 of 7,155 entries — 61% — are rules the engine does not load. They were
+ * disclosed only by the *absence* of a green "Verified" badge, listed beside
+ * executable content, sorted together, and offered the same Install button.
+ * A reader had no way to tell a rule that fires from one that cannot.
+ */
+function ReferenceOnlyBadge({ reason }: { reason?: string }) {
+  return (
+    <span
+      title={reason || 'The engine does not load this rule, so it cannot fire.'}
+      className="inline-flex items-center gap-1 rounded border border-amber-600/70 bg-amber-900/30 px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wide text-amber-300"
+    >
+      Reference only
+    </span>
+  );
+}
+
 function StarRating({ rating, count }: { rating: number; count: number }) {
   const full = Math.floor(rating);
   const half = rating - full >= 0.5;
@@ -245,6 +280,20 @@ interface InstallButtonProps {
 }
 
 function InstallButton({ item, installed, busy, onInstall, onUninstall }: InstallButtonProps) {
+  // Installing a rule the engine does not load is a no-op wearing the costume
+  // of an action: the per-tenant flag flips and nothing can ever match. The
+  // control says what it is instead.
+  if (item.executable === false) {
+    return (
+      <span
+        title={item.quarantine_reason || 'The engine does not load this rule, so installing it would enable nothing.'}
+        className="cursor-not-allowed rounded border border-zinc-700 px-2 py-1 text-xs font-medium text-zinc-500"
+      >
+        Cannot install
+      </span>
+    );
+  }
+
   if (installed) {
     // Allow operators to back out of an install; visible affordance, not destructive
     // since marketplace items are already on disk – we just clear the per-tenant flag.
@@ -318,9 +367,20 @@ function ItemCard({ item, installed, busy, onInstall, onUninstall }: ItemCardPro
         </h3>
         <div className="flex shrink-0 flex-wrap gap-1 justify-end">
           <TypeBadge type={item.type} />
+          {item.executable === false && <ReferenceOnlyBadge reason={item.quarantine_reason} />}
           {item.source === 'community' ? <CommunityBadge /> : item.verified && <VerifiedBadge />}
         </div>
       </div>
+
+      {/* Why it cannot fire, in the card rather than in a tooltip. A reader
+          scanning the grid should not have to hover to find out that most of
+          what they are looking at does not run. */}
+      {item.executable === false && (
+        <p className="rounded border border-amber-700/40 bg-amber-950/30 px-2 py-1.5 text-xs leading-relaxed text-amber-200/90">
+          Not loaded by the detection engine — it cannot fire.{' '}
+          <span className="text-amber-200/70">{item.quarantine_reason}</span>
+        </p>
+      )}
 
       {/* Description */}
       <p className="text-xs text-zinc-400 leading-relaxed line-clamp-3">
@@ -383,17 +443,23 @@ function ItemCard({ item, installed, busy, onInstall, onUninstall }: ItemCardPro
         </div>
       </div>
 
-      {/* Tags */}
+      {/* Tags. The builder flattens the importers' structured tag block into
+          dotted keys for downstream code; `formatTagLabel` is what turns that
+          encoding back into something a person reads. */}
       {item.tags && item.tags.length > 0 && (
         <div className="flex flex-wrap gap-1">
-          {item.tags.slice(0, 4).map((tag) => (
-            <span
-              key={tag}
-              className="rounded bg-zinc-700/60 px-1.5 py-0.5 text-xs text-zinc-400"
-            >
-              {tag}
-            </span>
-          ))}
+          {item.tags.slice(0, 4).map((tag) => {
+            const { label, title } = formatTagLabel(tag);
+            return (
+              <span
+                key={tag}
+                title={title}
+                className="rounded bg-zinc-700/60 px-1.5 py-0.5 text-xs text-zinc-400"
+              >
+                {label}
+              </span>
+            );
+          })}
           {item.tags.length > 4 && (
             <span className="rounded bg-zinc-700/60 px-1.5 py-0.5 text-xs text-zinc-500">
               +{item.tags.length - 4}
@@ -416,13 +482,57 @@ type SdkFilter = 'all' | 'python' | 'go' | 'both';
 //            parsed and provenance-tagged but not fixture-tested per AiSOC's bar
 // community = third-party contributions
 type TierFilter = 'all' | 'stable' | 'beta' | 'imported' | 'community';
+// Whether the engine loads the entry. Orthogonal to `tier`, which says where
+// the content came from — 1,770 of the imported Sigma rules are compiled and
+// proven to fire, and plenty of native rules ship disabled, so neither answers
+// the other's question. Defaults to `all` so the catalogue is never silently
+// smaller than it is; the stat cards and the per-card banner carry the split.
+type RunsFilter = 'all' | 'executable' | 'reference';
 
-// Fetch the installed-set, but treat 401/404 as "not signed in / API offline"
-// so the marketplace stays usable in static demos and unauthenticated previews.
+/**
+ * The bearer token the rest of the console authenticates with.
+ *
+ * These three calls sent `credentials: 'include'` and nothing else. The API
+ * authenticates a `Authorization: Bearer` JWT held in localStorage, not a
+ * cookie, so every one of them was anonymous: install answered 401, the
+ * installed-set answered 401, and neither said so.
+ */
+function authHeaders(): Record<string, string> {
+  if (typeof window === 'undefined') return {};
+  try {
+    const token = window.localStorage.getItem(AUTH_TOKEN_KEY);
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Whether this browser holds a session at all. */
+function signedIn(): boolean {
+  return Boolean(authHeaders().Authorization);
+}
+
+/** The API's `detail`, when it sent one, so a refusal can say why. */
+async function failureDetail(res: Response): Promise<string> {
+  try {
+    const body = (await res.json()) as { detail?: unknown };
+    if (typeof body.detail === 'string' && body.detail) return body.detail;
+  } catch {
+    /* not JSON */
+  }
+  return `HTTP ${res.status}`;
+}
+
+/**
+ * Fetch the installed-set. A 401 with no session is "nobody is signed in",
+ * which is the static-preview case and not an error; a 401 *with* a session
+ * is a real failure and must not be flattened into an empty list.
+ */
 async function fetchInstalled(url: string): Promise<InstalledResponse | null> {
-  const res = await fetch(url, { credentials: 'include' });
-  if (res.status === 401 || res.status === 404) return null;
-  if (!res.ok) throw new Error(`installed: HTTP ${res.status}`);
+  const res = await fetch(url, { credentials: 'include', headers: authHeaders() });
+  if (res.status === 404) return null;
+  if (res.status === 401 && !signedIn()) return null;
+  if (!res.ok) throw new Error(`installed: ${await failureDetail(res)}`);
   return (await res.json()) as InstalledResponse;
 }
 
@@ -486,15 +596,18 @@ export function MarketplaceView() {
         return next;
       });
       try {
-        const res = await fetch('/api/v1/marketplace/install', {
+        const res = await apiFetch('/api/v1/marketplace/install', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...authHeaders() },
           credentials: 'include',
           body: JSON.stringify({ type: item.type, id: item.id }),
         });
-        if (!res.ok && res.status !== 401 && res.status !== 404) {
-          throw new Error(`install: HTTP ${res.status}`);
-        }
+        // 401 and 404 used to be swallowed here, and the optimistic flag was
+        // never rolled back — so against a real API the button answered 401,
+        // the card said "Installed", the header counted it, and nothing had
+        // been installed. A control that reports success it did not achieve
+        // is worse than one that is greyed out.
+        if (!res.ok) throw new Error(await failureDetail(res));
         await refreshInstalled();
       } catch (err) {
         // Roll the optimistic flag back; surface a one-line toast.
@@ -529,10 +642,12 @@ export function MarketplaceView() {
         const url = `/api/v1/marketplace/install?type=${encodeURIComponent(
           item.type,
         )}&id=${encodeURIComponent(item.id)}`;
-        const res = await fetch(url, { method: 'DELETE', credentials: 'include' });
-        if (!res.ok && res.status !== 401 && res.status !== 404) {
-          throw new Error(`uninstall: HTTP ${res.status}`);
-        }
+        const res = await fetch(url, {
+          method: 'DELETE',
+          credentials: 'include',
+          headers: authHeaders(),
+        });
+        if (!res.ok) throw new Error(await failureDetail(res));
         await refreshInstalled();
       } catch (err) {
         setLocalInstalled((prev) => {
@@ -552,6 +667,37 @@ export function MarketplaceView() {
     [refreshInstalled, setBusyKey],
   );
 
+  /**
+   * One entry per `type:id` — the identity the grid keys its children on, and
+   * the identity `POST /v1/marketplace/install` resolves by first match.
+   *
+   * The shipped index carried two collisions between the v1 playbook pack and
+   * the standalone response playbooks, and React does not simply warn about a
+   * repeated key: reconciliation maps the old fibers by key, a second fiber
+   * with the same key overwrites the first in that map, and the overwritten
+   * one is never handed to `deleteChild`. It stayed mounted through every
+   * later render, so two installable playbooks survived into the
+   * `Reference only` view — which by definition holds nothing installable —
+   * and the grid rendered more children than the header beneath it counted.
+   *
+   * `scripts/build_marketplace.py` now refuses to emit a colliding index, but
+   * this file is served from `public/` and a deployment can serve its own, so
+   * the console settles it at the boundary rather than trusting the feed.
+   * First match wins, which is the entry the install API would have resolved.
+   */
+  const { catalogue, duplicateCount } = useMemo(() => {
+    const source = data?.items ?? [];
+    const seen = new Set<string>();
+    const unique: MarketplaceItem[] = [];
+    for (const item of source) {
+      const key = installedKey(item.type, item.id);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      unique.push(item);
+    }
+    return { catalogue: unique, duplicateCount: source.length - unique.length };
+  }, [data]);
+
   const [search, setSearch] = useState('');
   const [typeFilter, setTypeFilter] = useState<'all' | 'playbook' | 'detection' | 'plugin'>('all');
   const [severityFilter, setSeverityFilter] = useState<string>('all');
@@ -564,15 +710,16 @@ export function MarketplaceView() {
   // whether it runs: 1,770 of the imported Sigma rules are compiled, proven to
   // fire and loaded by the engine, so this filter is about provenance.
   const [tierFilter, setTierFilter] = useState<TierFilter>('stable');
+  const [runsFilter, setRunsFilter] = useState<RunsFilter>('all');
   const [mitreFilter, setMitreFilter] = useState<string>('all');
   const [sortBy, setSortBy] = useState<SortOption>('name');
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('asc');
 
   // Build distinct, sorted MITRE technique list (with item counts) for the filter.
   const mitreOptions = useMemo(() => {
-    if (!data?.items) return [] as { id: string; count: number }[];
+    if (catalogue.length === 0) return [] as { id: string; count: number }[];
     const byId = new Map<string, number>();
-    for (const it of data.items) {
+    for (const it of catalogue) {
       for (const tid of it.mitre_techniques ?? []) {
         byId.set(tid, (byId.get(tid) ?? 0) + 1);
       }
@@ -580,17 +727,17 @@ export function MarketplaceView() {
     return Array.from(byId.entries())
       .map(([id, count]) => ({ id, count }))
       .sort((a, b) => a.id.localeCompare(b.id));
-  }, [data]);
+  }, [catalogue]);
 
   // Distinct content categories (detection.category + playbook.category) for filter.
   const categoryOptions = useMemo(() => {
-    if (!data?.items) return [] as string[];
+    if (catalogue.length === 0) return [] as string[];
     const set = new Set<string>();
-    for (const it of data.items) {
+    for (const it of catalogue) {
       if (it.category) set.add(it.category);
     }
     return Array.from(set).sort();
-  }, [data]);
+  }, [catalogue]);
 
   // Counts per tier so chips can show "Stable (865)" etc. — helps users
   // understand at a glance that imported content dwarfs native content.
@@ -602,19 +749,19 @@ export function MarketplaceView() {
       imported: 0,
       community: 0,
     };
-    if (!data?.items) return counts;
-    counts.all = data.items.length;
-    for (const it of data.items) {
+    if (catalogue.length === 0) return counts;
+    counts.all = catalogue.length;
+    for (const it of catalogue) {
       const tier = (it.tier ?? 'stable') as TierFilter;
       if (tier in counts) counts[tier]++;
     }
     return counts;
-  }, [data]);
+  }, [catalogue]);
 
   const items = useMemo(() => {
-    if (!data?.items) return [];
+    if (catalogue.length === 0) return [];
 
-    const filtered = data.items.filter((item) => {
+    const filtered = catalogue.filter((item) => {
       if (typeFilter !== 'all' && item.type !== typeFilter) return false;
       if (severityFilter !== 'all' && item.severity !== severityFilter) return false;
       if (categoryFilter !== 'all' && item.category !== categoryFilter) return false;
@@ -626,6 +773,8 @@ export function MarketplaceView() {
         const itemTier = item.tier ?? 'stable';
         if (itemTier !== tierFilter) return false;
       }
+      if (runsFilter === 'executable' && item.executable === false) return false;
+      if (runsFilter === 'reference' && item.executable !== false) return false;
       if (mitreFilter !== 'all' && !(item.mitre_techniques ?? []).includes(mitreFilter)) return false;
       if (sdkFilter !== 'all') {
         if (item.type !== 'plugin') return false;
@@ -675,7 +824,7 @@ export function MarketplaceView() {
 
     return filtered;
   }, [
-    data,
+    catalogue,
     search,
     typeFilter,
     severityFilter,
@@ -683,23 +832,38 @@ export function MarketplaceView() {
     sourceFilter,
     sdkFilter,
     tierFilter,
+    runsFilter,
     mitreFilter,
     sortBy,
     sortOrder,
   ]);
 
+  // Counted from the items rather than read from `stats`, so the headline
+  // cannot disagree with the grid underneath it. `stats.quarantined` used to
+  // count rows carrying a `quarantine_reason` — 4,213 against the 4,388 the
+  // engine does not load — so the published figure and the truth table's
+  // were two numbers nothing compared.
+  const installableCount = useMemo(
+    () => catalogue.filter((i) => i.executable !== false).length,
+    [catalogue],
+  );
+  const referenceOnlyCount = useMemo(
+    () => catalogue.filter((i) => i.executable === false).length,
+    [catalogue],
+  );
+
   const stats = useMemo(() => {
     if (!data?.items) return null;
     if (data.stats) return data.stats;
     return {
-      total:      data.items.length,
-      playbooks:  data.items.filter((i) => i.type === 'playbook').length,
-      detections: data.items.filter((i) => i.type === 'detection').length,
-      plugins:    data.items.filter((i) => i.type === 'plugin').length,
-      verified:   data.items.filter((i) => i.verified).length,
-      community:  data.items.filter((i) => i.source === 'community').length,
+      total:      catalogue.length,
+      playbooks:  catalogue.filter((i) => i.type === 'playbook').length,
+      detections: catalogue.filter((i) => i.type === 'detection').length,
+      plugins:    catalogue.filter((i) => i.type === 'plugin').length,
+      verified:   catalogue.filter((i) => i.verified).length,
+      community:  catalogue.filter((i) => i.source === 'community').length,
     };
-  }, [data]);
+  }, [data, catalogue]);
 
   const toggleSort = (field: SortOption) => {
     if (sortBy === field) {
@@ -720,6 +884,7 @@ export function MarketplaceView() {
     // Reset tier to its default (`stable`) rather than `all` so users land
     // back on the curated view, not on 6,000+ rules.
     setTierFilter('stable');
+    setRunsFilter('all');
     setMitreFilter('all');
   };
 
@@ -734,6 +899,13 @@ export function MarketplaceView() {
             repo&rsquo;s <code className="text-zinc-300">detections/</code>,{' '}
             <code className="text-zinc-300">playbooks/</code> and{' '}
             <code className="text-zinc-300">plugins/</code> trees, so what you see here is what your AiSOC instance has on disk.
+          </p>
+          <p className="mt-2 text-sm text-zinc-400">
+            <span className="font-medium text-amber-300">On disk is not the same as running.</span>{' '}
+            Much of this catalogue is imported upstream content the detection engine does not load —
+            kept for provenance and for porting, marked{' '}
+            <span className="font-semibold uppercase tracking-wide text-amber-300">reference only</span>, and
+            not installable. The counts below say how many of each.
           </p>
         </div>
         {installedSet.size > 0 && (
@@ -762,19 +934,48 @@ export function MarketplaceView() {
         </div>
       )}
 
-      {/* Stats */}
+      {/* A collapsed collision is the sort of thing that should cost a
+          sentence rather than happen quietly: the catalogue a reader is
+          looking at is smaller than the file behind it, and they are entitled
+          to know which way the console resolved it. */}
+      {duplicateCount > 0 && (
+        <p className="rounded-lg border border-amber-700/40 bg-amber-950/30 px-4 py-2 text-sm text-amber-200/90">
+          {duplicateCount === 1
+            ? 'One entry in this index repeats a type and id that another entry already uses, so it is not listed.'
+            : `${duplicateCount} entries in this index repeat a type and id that another entry already uses, so they are not listed.`}{' '}
+          Install resolves the first match, so the listing is what an install would act on. Regenerate with{' '}
+          <code className="text-amber-200">pnpm marketplace:sync</code>.
+        </p>
+      )}
+
+      {/* Stats.
+          `Installable` and `Reference only` lead, and they partition the
+          catalogue: every entry is one or the other and the two sum to
+          `Total`. `Total` alone was the headline for a long time, over a
+          catalogue where 85% of the entries cannot fire.
+
+          The left card says `Installable`, not `Executable`, and the
+          distinction is not pedantry. It counts every entry the engine loads
+          *plus* the playbooks and plugins, which are shipped installable
+          content but are not engine rules and carry no `executable` field.
+          Labelled `Executable` it read 2,767 under a tooltip saying "loaded
+          by the detection engine" — false for the 164 that are not rules, and
+          164 above the 2,603 the truth table and the README publish for
+          exactly that claim. Two live surfaces disagreeing about the same
+          word is the tell; `Detections` below carries the rule figure. */}
       {stats && (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-6">
           {[
-            { label: 'Total',       value: stats.total,      color: 'text-zinc-100' },
-            { label: 'Playbooks',   value: stats.playbooks,  color: 'text-purple-300' },
-            { label: 'Detections',  value: stats.detections, color: 'text-cyan-300' },
-            { label: 'Plugins',     value: stats.plugins,    color: 'text-emerald-300' },
-            { label: 'Verified',    value: stats.verified,   color: 'text-emerald-400' },
-            { label: 'Community',   value: stats.community,  color: 'text-blue-300' },
-          ].map(({ label, value, color }) => (
+            { label: 'Installable',    value: installableCount,   color: 'text-emerald-400', title: 'Detection rules the engine loads, plus every playbook and plugin — everything here can be installed — these can fire.' },
+            { label: 'Reference only', value: referenceOnlyCount, color: 'text-amber-400',   title: 'Present on disk and not loaded by the engine. They cannot fire; they are here for provenance and for porting.' },
+            { label: 'Total',          value: stats.total,        color: 'text-zinc-100',    title: 'Every entry in the catalogue, executable or not.' },
+            { label: 'Playbooks',      value: stats.playbooks,    color: 'text-purple-300' },
+            { label: 'Detections',     value: stats.detections,   color: 'text-cyan-300' },
+            { label: 'Plugins',        value: stats.plugins,      color: 'text-emerald-300' },
+          ].map(({ label, value, color, title }) => (
             <div
               key={label}
+              title={title}
               className="rounded-xl border border-zinc-700/60 bg-zinc-800/60 p-4 text-center"
             >
               <p className={clsx('text-3xl font-bold tabular-nums', color)}>{value}</p>
@@ -822,6 +1023,32 @@ export function MarketplaceView() {
               )}
             >
               {s === 'all' ? 'All sources' : s}
+            </button>
+          ))}
+        </div>
+
+        {/* Does it run? The question the catalogue could not answer.
+            Separate from the tier chips below: tier is provenance, this is
+            capability, and the two disagree in both directions. */}
+        <div
+          className="flex gap-1 rounded-lg border border-zinc-700 bg-zinc-800 p-1"
+          title="Installable = every entry you can install: the detection rules the engine loads, plus the playbooks and plugins, which are not rules. Reference only = present on disk and not loaded by the engine, so it cannot fire."
+        >
+          {([
+            ['all', 'All', undefined],
+            ['executable', 'Installable', installableCount],
+            ['reference', 'Reference only', referenceOnlyCount],
+          ] as const).map(([value, label, count]) => (
+            <button
+              key={value}
+              onClick={() => setRunsFilter(value)}
+              className={clsx(
+                'rounded px-2.5 py-1.5 text-xs font-medium transition-colors',
+                runsFilter === value ? 'bg-zinc-600 text-zinc-100' : 'text-zinc-400 hover:text-zinc-200',
+              )}
+            >
+              {label}
+              {count !== undefined && <span className="ml-1 text-zinc-500">({count})</span>}
             </button>
           ))}
         </div>
@@ -939,7 +1166,7 @@ export function MarketplaceView() {
           </button>
         ))}
         <span className="ml-auto text-xs text-zinc-500">
-          Showing {items.length} of {data?.items.length ?? 0}
+          Showing {items.length} of {catalogue.length}
         </span>
       </div>
 

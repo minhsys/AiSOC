@@ -34,8 +34,8 @@ service lives under `services.<name>` — `--set api.image.tag=...` addresses a
 path no template reads and silently changes nothing:
 
 ```bash
-  --set services.api.image.tag=v11.2.0 \
-  --set services.web.image.tag=v11.2.0
+  --set services.api.image.tag=v12.0.0 \
+  --set services.web.image.tag=v12.0.0
 ```
 
 Override any of the defaults in [`infra/helm/aisoc/values.yaml`](https://github.com/beenuar/AiSOC/blob/main/infra/helm/aisoc/values.yaml). For production deployments, walk through the [Hardening Runbook](https://github.com/beenuar/AiSOC/blob/main/docs/runbooks/HARDENING.md) before exposing the platform on the public internet.
@@ -45,17 +45,52 @@ Override any of the defaults in [`infra/helm/aisoc/values.yaml`](https://github.
 All images are published to GHCR and Cosign-signed:
 
 ```
-ghcr.io/beenuar/aisoc-core-api:v11.2.0
-ghcr.io/beenuar/aisoc-agents:v11.2.0
-ghcr.io/beenuar/aisoc-realtime:v11.2.0
-ghcr.io/beenuar/aisoc-ingest:v11.2.0
-ghcr.io/beenuar/aisoc-enrichment:v11.2.0
-ghcr.io/beenuar/aisoc-web:v11.2.0
+ghcr.io/beenuar/aisoc-core-api:v12.0.0
+ghcr.io/beenuar/aisoc-agents:v12.0.0
+ghcr.io/beenuar/aisoc-realtime:v12.0.0
+ghcr.io/beenuar/aisoc-ingest:v12.0.0
+ghcr.io/beenuar/aisoc-enrichment:v12.0.0
+ghcr.io/beenuar/aisoc-web:v12.0.0
 ```
 
 The tags above are an example pinned to a release. The current one is whatever
-the chart's `appVersion` says — a default install needs no tag at all, and
-`helm show chart oci://ghcr.io/beenuar/aisoc` reports what it resolves to.
+the chart's `appVersion` says, and a default install needs no tag at all.
+
+The chart itself is published to an OCI registry from v11.3.0 onward:
+
+```bash
+helm show chart oci://ghcr.io/beenuar/charts/aisoc
+```
+
+This page previously named `oci://ghcr.io/beenuar/aisoc`, where no chart has
+ever been pushed: the command answered `not found`. A published command is a
+claim like any other, so `release.yml` now packages, lints and pushes the
+chart on every tag, and re-checks that its `appVersion` names images that
+exist. Until the first release carrying that job, install from a checkout as
+shown below.
+
+### The chart's version, and one coordinate that meant two things
+
+`Chart.yaml` carries two versions. `appVersion` is the application, and is
+what every unpinned `tag:` in `values.yaml` falls back to. `version` is the
+chart's own, and it is what `--version` selects.
+
+**If you pinned `--version 5.9.2`, pull it again and check what you have.**
+v12.3.2 published chart 5.9.2 with `appVersion: v12.3.2`; v13.0.0 bumped
+`appVersion` and left the chart version alone, and `helm push` overwrote the
+existing version rather than refusing it. `charts/aisoc:5.9.2` therefore names
+`v13.0.0` today and named `v12.3.2` before 29 September 2026. The replaced
+bytes are gone and cannot be restored — the coordinate is honest from 6.0.0
+onward, and 5.9.2 stays ambiguous forever.
+
+`scripts/check_chart_version.py` is what stops the next one. It refuses a
+release whose `appVersion` moved while the chart version did not, refuses a
+chart edit with no version bump, and asks GHCR whether the version about to be
+pushed already exists holding different content — comparing the unpacked
+files, because `helm package` output is not byte-reproducible. What it does
+not decide is whether a bump is a major, a minor or a patch: nothing in a diff
+knows whether a renamed `values.yaml` key breaks your values file, so that
+judgement stays with a human.
 
 `scripts/check_published_images.py` resolves every one of these against GHCR
 daily, so a name or tag that stops existing fails a build rather than a
@@ -72,7 +107,7 @@ Verify a signature before deploying:
 cosign verify \
   --certificate-identity-regexp '^https://github.com/beenuar/AiSOC' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/beenuar/aisoc-core-api:v11.2.0
+  ghcr.io/beenuar/aisoc-core-api:v12.0.0
 ```
 
 ## Scaling

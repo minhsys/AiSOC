@@ -12,7 +12,7 @@ from enum import Enum
 from typing import Any
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 def _stable_hash(payload: Any) -> str:
@@ -77,10 +77,38 @@ class ForensicFindings(BaseModel):
 
     timeline: list[dict[str, Any]] = Field(default_factory=list)  # [{ts, event, src}]
     artefacts: list[str] = Field(default_factory=list)
+
+    @field_validator("blast_radius", "root_cause_hypothesis", "summary", mode="before")
+    @classmethod
+    def _stringify_llm_json(cls, v: Any) -> Any:
+        """The forensic LLM sometimes returns nested objects where prose is
+        expected (e.g. blast_radius as {"systems": [...]}). Coerce to a
+        readable string instead of failing the whole investigation run."""
+        if isinstance(v, dict):
+            parts = []
+            for key, val in v.items():
+                if isinstance(val, (list, tuple)):
+                    val = ", ".join(str(x) for x in val)
+                parts.append(f"{key}: {val}")
+            return "; ".join(parts)
+        if isinstance(v, (list, tuple)):
+            return ", ".join(str(x) for x in v)
+        return v
+
     root_cause_hypothesis: str = ""
     blast_radius: str = ""
     confidence: float = 0.0  # 0–1
     summary: str = ""
+    #: What fraction of the concrete indicators this analysis asserts -- IPs,
+    #: hashes, CVEs, techniques, domains -- actually appear in the evidence
+    #: the agent was given.
+    #:
+    #: `None` means **not scored**, which is a real and common state: a case
+    #: opened by hand carries no alert payload, and scoring prose against an
+    #: empty evidence set would mark every indicator unsupported and report
+    #: that as a finding about the model. Distinct from `0.0`, which means it
+    #: was scored and nothing was supported.
+    groundedness: float | None = None
 
 
 class ResponderPlan(BaseModel):

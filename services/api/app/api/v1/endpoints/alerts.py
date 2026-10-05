@@ -1,5 +1,6 @@
 """Alert management endpoints."""
 
+import json
 import logging
 import re
 import uuid
@@ -7,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import and_, func, select, update
 from sqlalchemy.exc import IntegrityError
 
@@ -125,6 +126,50 @@ class AlertDetailResponse(AlertResponse):
     related_entities: list[RelatedEntity] = []
     mini_timeline: list[MiniTimelineEvent] = []
     recommended_actions: list[RecommendedAction] = []
+    # The Raw tab reads alert.rawEvent; the parent list shape stays lean,
+    # but the detail endpoint must carry the original payload or the tab
+    # renders "not available" for every alert (they all have one in DB).
+    raw_event: dict = {}
+    # Parsed source-HIDS location info (rule id, agent, original alert id) so an
+    # analyst can find the SAME event in the source console.
+    wazuh_locator: dict = {}
+
+
+def _build_wazuh_locator(raw_event: dict) -> dict:
+    """Extract where-in-the-source-HIDS coordinates from a stored alert payload.
+
+    The ingested shape varies (OCSF-envelope with raw_data string, or a
+    native HIDS alert). Extract every identifier an analyst can search
+    the source console by, whatever the shape, and return the non-empty subset.
+    """
+    raw: dict = {}
+    rd = raw_event.get("raw_data")
+    if isinstance(rd, str) and rd.strip().startswith("{"):
+        try:
+            raw = json.loads(rd)
+        except Exception:  # noqa: BLE001
+            raw = {}
+    elif isinstance(rd, dict):
+        raw = rd
+    merged = {**raw, **{k: v for k, v in raw_event.items() if k != "raw_data"}}
+
+    rule = raw_event.get("rule") if isinstance(raw_event.get("rule"), dict) else {}
+    agent = raw_event.get("agent") if isinstance(raw_event.get("agent"), dict) else {}
+    data = raw_event.get("data") if isinstance(raw_event.get("data"), dict) else {}
+    finding = raw_event.get("finding") if isinstance(raw_event.get("finding"), dict) else {}
+    device = raw_event.get("device") if isinstance(raw_event.get("device"), dict) else {}
+
+    candidates = {
+        "wazuh_alert_id": merged.get("alert_id") or rule.get("alert_id") or finding.get("uid") or raw_event.get("id"),
+        "rule_id": rule.get("id") or data.get("id") or merged.get("rule_id"),
+        "rule_description": rule.get("description"),
+        "agent_id": agent.get("id") or merged.get("agent_id"),
+        "agent_name": agent.get("name") or merged.get("agent_name") or device.get("name"),
+        "agent_ip": agent.get("ip") or merged.get("agent_ip"),
+        "full_log": rule.get("full_log") or data.get("full_log") or merged.get("full_log"),
+        "timestamp": raw_event.get("timestamp") or raw_event.get("time") or merged.get("timestamp"),
+    }
+    return {k: v for k, v in candidates.items() if v not in (None, "", {}, [])}
 
 
 class AlertSnoozeRequest(BaseModel):
@@ -144,10 +189,14 @@ class AlertListResponse(BaseModel):
 
 
 class AlertUpdateRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     status: str | None = None
     priority: int | None = None
     tags: list[str] | None = None
-    assigned_to_id: uuid.UUID | None = None
+    # The queue UI releases alerts with {"assignee": null}; accept both the
+    # canonical field name and that alias.
+    assigned_to_id: uuid.UUID | None = Field(default=None, alias="assignee")
     case_id: uuid.UUID | None = None
 
 
@@ -806,8 +855,11 @@ async def get_alert(
     # to the ORM model — keeping the envelope construction in the view
     # layer means the rail can evolve without migrations.
     payload = AlertDetailResponse.model_validate(alert)
+    raw_event = alert.raw_event if isinstance(alert.raw_event, dict) else {}
     return payload.model_copy(
         update={
+            "raw_event": raw_event,
+            "wazuh_locator": _build_wazuh_locator(raw_event),
             "narrative": alert.narrative,
             "related_entities": envelope.related_entities,
             "mini_timeline": envelope.mini_timeline,
@@ -838,9 +890,12 @@ async def update_alert(
         updates["priority"] = request.priority
     if request.tags is not None:
         updates["tags"] = request.tags
-    if request.assigned_to_id is not None:
+    # Explicit null clears the assignment (release back to the pool);
+    # absent field means "leave as-is". Key presence, not value truthiness,
+    # decides — `is not None` here made release a silent no-op.
+    if "assigned_to_id" in request.model_fields_set or "assignee" in request.model_fields_set:
         updates["assigned_to_id"] = request.assigned_to_id
-        updates["assigned_at"] = datetime.now(UTC)
+        updates["assigned_at"] = datetime.now(UTC) if request.assigned_to_id else None
     if request.case_id is not None:
         updates["case_id"] = request.case_id
 

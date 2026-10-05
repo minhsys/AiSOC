@@ -120,6 +120,8 @@ _EVAL_SCRIPT = _REPO_ROOT / "scripts" / "run_evals.py"
 
 
 class ProposalResponse(BaseModel):
+    positive_fixtures: list[dict[str, Any]] = Field(default_factory=list)
+    negative_fixtures: list[dict[str, Any]] = Field(default_factory=list)
     id: uuid.UUID
     tenant_id: uuid.UUID | None
     base_rule_id: uuid.UUID | None
@@ -149,6 +151,18 @@ class ProposalResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+#: Whether a proposal's author is barred from approving it.
+#:
+#: On by default: this is the surface that writes code into the
+#: detection engine, and it was the only governed surface in the
+#: product with no second-person requirement at all.
+_SEPARATION_OF_DUTIES_ENFORCED = os.getenv("AISOC_DETECTION_SOD_ENFORCED", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+
+
 class CreateProposalRequest(BaseModel):
     name: str = Field(..., max_length=255)
     description: str | None = None
@@ -161,6 +175,11 @@ class CreateProposalRequest(BaseModel):
     mitre_techniques: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     base_rule_id: uuid.UUID | None = None
+    #: What this rule claims to catch, and what it claims to ignore.
+    #: Carried on the proposal so `/evaluate-rule` has something to replay
+    #: without an operator re-deriving fixtures the drafter already had.
+    positive_fixtures: list[dict[str, Any]] = Field(default_factory=list, max_length=200)
+    negative_fixtures: list[dict[str, Any]] = Field(default_factory=list, max_length=200)
 
 
 class ReviewCommentRequest(BaseModel):
@@ -199,10 +218,14 @@ class EvaluateRuleRequest(BaseModel):
     """
 
     positive_fixtures: list[dict[str, Any]] = Field(
-        ...,
-        min_length=1,
+        default_factory=list,
         max_length=200,
-        description="Events the rule MUST fire on (the attacks it claims to catch). At least one required.",
+        description=(
+            "Events the rule MUST fire on. Optional: when omitted, the fixtures the "
+            "proposal was created with are replayed instead. The handler refuses if "
+            "neither source yields a positive, because a rule that cannot be shown to "
+            "catch anything must not be approved."
+        ),
     )
     negative_fixtures: list[dict[str, Any]] = Field(
         default_factory=list,
@@ -364,6 +387,30 @@ def _evaluate_eval_report(
 # ────────────────────────────────────────────────────────────────────────────
 
 
+def body_has_detection_logic(rule_body: str | None) -> bool:
+    """Whether this body could match anything at all.
+
+    The auto-tuner opened proposals whose `rule_body` was **entirely
+    comments** -- a header, a rationale and a `TODO(analyst)` -- with a null
+    `base_rule_id`. A null base takes the "new rule" branch below, so an
+    approver clicking through would have written a rule with no detection
+    logic into the engine: a rule that matches nothing, published as though it
+    detects something.
+
+    Comment-stripping only. This deliberately does not try to validate Sigma:
+    a parser here would be a second opinion that can disagree with the
+    compiler, and the question being asked is narrower than "is this valid",
+    it is "is there anything here but prose".
+    """
+    if not rule_body:
+        return False
+    for line in rule_body.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return True
+    return False
+
+
 @router.get("", response_model=list[ProposalResponse])
 async def list_proposals(
     current_user: Annotated[AuthUser, Depends(require_permission("rules:read"))],
@@ -410,6 +457,8 @@ async def create_proposal(
         tags=request.tags,
         status="proposed",
         proposed_by_id=current_user.user_id,
+        positive_fixtures=request.positive_fixtures,
+        negative_fixtures=request.negative_fixtures,
     )
     db.add(proposal)
     await db.commit()
@@ -712,12 +761,33 @@ async def evaluate_rule(
             detail=f"Proposal is {proposal.status}; candidate-rule eval cannot be re-run",
         )
 
+    # Fall back to the fixtures the proposal was created with. Requiring
+    # them in the body meant an operator had to re-derive the very fixtures
+    # the drafter produced and threw away, which is why this gate had no
+    # console caller and no realistic path to being run.
+    positives = request.positive_fixtures or list(proposal.positive_fixtures or [])
+    negatives = request.negative_fixtures or list(proposal.negative_fixtures or [])
+    if not positives:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "This proposal carries no positive fixtures and none were supplied, so there is "
+                "nothing to prove the rule fires on. A rule that cannot be shown to catch "
+                "anything must not be approved."
+            ),
+        )
+
     result = evaluate_candidate_rule(
         rule_language=proposal.rule_language,
         rule_body=proposal.rule_body,
-        positive_fixtures=request.positive_fixtures,
-        negative_fixtures=request.negative_fixtures,
+        positive_fixtures=positives,
+        negative_fixtures=negatives,
     )
+
+    # Keep what was actually evaluated, so a later reader can see the proof
+    # rather than only the verdict.
+    proposal.positive_fixtures = positives
+    proposal.negative_fixtures = negatives
 
     # Merge into eval_result so the benchmark verdict (if already attached) is
     # preserved alongside the candidate-rule verdict.
@@ -874,6 +944,30 @@ async def decide_proposal(
         )
 
     if request.decision == "approve":
+        # Separation of duties. `proposed_by_id` was written at creation
+        # and compared against nothing, so the author of a rule could
+        # approve their own rule — on the one surface in this product
+        # that writes code into the detection engine. Every other
+        # governance control here separates the two: action approval,
+        # playbook dispatch, MSSP overrides.
+        #
+        # Approval only. Rejecting your own proposal is withdrawing it,
+        # which needs no second person.
+        #
+        # Overridable by configuration because a single-analyst
+        # deployment would otherwise be unable to ship a detection at
+        # all, and a control that forces people to disable it entirely
+        # is worse than one that is off by choice and recorded.
+        if _SEPARATION_OF_DUTIES_ENFORCED and proposal.proposed_by_id is not None and proposal.proposed_by_id == current_user.user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "You proposed this rule, so you cannot approve it. A second reviewer "
+                    "must approve a detection before it reaches the engine. Set "
+                    "AISOC_DETECTION_SOD_ENFORCED=0 on a single-analyst deployment."
+                ),
+            )
+
         eval_result = proposal.eval_result or {}
         # Phase 4 — de-circularised gate. Approval requires the candidate rule
         # to have been evaluated against its own fixtures and passed (fires on
@@ -945,6 +1039,19 @@ async def promote_proposal(
         raise HTTPException(
             status_code=status.HTTP_412_PRECONDITION_FAILED,
             detail=f"Proposal must be approved before promotion (current status: {proposal.status})",
+        )
+
+    # Before either branch. An approved proposal whose body is all prose is a
+    # rule that matches nothing, and promoting one publishes a detection that
+    # cannot fire. The auto-tuner produced exactly that shape.
+    if not body_has_detection_logic(proposal.rule_body):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "This proposal's body contains no detection logic, only comments. "
+                "Promoting it would publish a rule that matches nothing. Attach a real "
+                "rule body and fixtures before approving."
+            ),
         )
 
     if proposal.base_rule_id is not None:

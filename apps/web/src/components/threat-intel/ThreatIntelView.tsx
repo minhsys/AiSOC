@@ -6,6 +6,7 @@ import {
   threatIntelApi,
   type AlertSeverity,
   type IndicatorType,
+  type IOCLookupOutcome,
   type ThreatIndicator,
 } from '@/lib/api';
 import { clsx } from 'clsx';
@@ -109,20 +110,23 @@ const SEVERITY_CONFIG: Record<AlertSeverity, string> = {
 
 function LookupForm() {
   const [query, setQuery] = useState('');
-  const [result, setResult] = useState<ThreatIndicator | null>(null);
+  // One outcome rather than a `result` plus a `notFound` flag. The two-flag
+  // shape is what allowed a failed lookup to render as a clean one: the
+  // `catch` had nowhere to put "this did not work" except the flag that meant
+  // "we checked, and it is clean".
+  const [outcome, setOutcome] = useState<IOCLookupOutcome | null>(null);
   const [isLooking, setIsLooking] = useState(false);
-  const [notFound, setNotFound] = useState(false);
 
   const handleLookup = async () => {
     if (!query.trim()) return;
     setIsLooking(true);
-    setNotFound(false);
-    setResult(null);
+    setOutcome(null);
     try {
-      const r = await threatIntelApi.lookup(query.trim());
-      setResult(r);
-    } catch {
-      setNotFound(true);
+      setOutcome(await threatIntelApi.lookup(query.trim()));
+    } catch (err) {
+      // `lookup` reports transport failure in its return value, so reaching
+      // here means the client itself threw. Still not a clean verdict.
+      setOutcome({ status: 'failed', reason: (err as Error)?.message || 'the lookup did not complete' });
     } finally {
       setIsLooking(false);
     }
@@ -149,29 +153,41 @@ function LookupForm() {
         </button>
       </div>
 
-      {notFound && (
+      {outcome?.status === 'failed' && (
+        <div className="mt-3 flex items-start gap-2 text-sm text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2">
+          <span className="text-[10px] font-semibold uppercase tracking-wider pt-0.5 shrink-0">
+            not checked
+          </span>
+          <span>
+            Lookup failed — {outcome.reason}. This says nothing about{' '}
+            <span className="font-mono">{query.trim()}</span>; it was never checked.
+          </span>
+        </div>
+      )}
+
+      {outcome?.status === 'clean' && (
         <div className="mt-3 flex items-center gap-2 text-sm text-green-400 bg-green-500/10 border border-green-500/20 rounded-lg px-3 py-2">
           <span className="text-[10px] font-semibold uppercase tracking-wider">clean</span>
           <span>No threat indicators found for this IOC</span>
         </div>
       )}
 
-      {result && (
+      {outcome?.status === 'match' && (
         <div className="mt-3 bg-red-500/5 border border-red-500/20 rounded-lg p-3 space-y-2">
           <div className="flex items-center gap-2">
             <span className="text-red-400 font-medium text-sm">Malicious indicator</span>
-            <span className="text-xs text-gray-500">Confidence: {result.confidence}%</span>
+            <span className="text-xs text-gray-500">Confidence: {outcome.indicator.confidence}%</span>
           </div>
-          {result.description ? (
-            <p className="text-xs text-gray-400">{result.description}</p>
+          {outcome.indicator.description ? (
+            <p className="text-xs text-gray-400">{outcome.indicator.description}</p>
           ) : null}
           <div className="flex flex-wrap gap-1">
-            {(result.tags ?? []).map((t) => (
+            {(outcome.indicator.tags ?? []).map((t) => (
               <span key={t} className="text-xs bg-gray-800 text-gray-400 px-1.5 py-0.5 rounded">{t}</span>
             ))}
           </div>
           <div className="text-xs text-gray-500">
-            Sources: {result.sources.join(', ')}
+            Sources: {(outcome.indicator.sources ?? []).join(', ')}
           </div>
         </div>
       )}
@@ -233,11 +249,36 @@ export function ThreatIntelView() {
   const [typeFilter, setTypeFilter] = useState<ThreatIndicator['type'] | 'all'>('all');
   const [search, setSearch] = useState('');
 
-  const { data } = useSWR(
+  const { data, error, isLoading } = useSWR(
     'threat-intel-indicators',
     () => threatIntelApi.list(),
     { fallbackData: demoFallback({ indicators: MOCK_INDICATORS, total: MOCK_INDICATORS.length }) },
   );
+
+  // `data` is undefined on first paint and on error alike, and both prior
+  // fixes on these lines were about fabricated values rather than about
+  // absence. `?? []` then published "Malicious (of shown): 0" — a security
+  // verdict — and an empty state telling the operator to go connect a feed,
+  // on a store the page could not reach.
+  //
+  // `degraded` is the other half, and the live one. With no threat-intel
+  // service reachable the route answers **HTTP 200** carrying
+  // `degraded: true` and a reason — an explicit statement that nothing was
+  // measured — so `!data` is false and every figure on this page rendered a
+  // confident zero over it. `threatIntelApi.lookup` already treats the same
+  // flag as a failed lookup; the list did not.
+  const storeUnknown = !data || data.degraded === true;
+
+  // Two distinct ways to not know, and the operator needs to be told which.
+  // `reason` is the route answering 200 and saying it could not read its
+  // store; `error` is the request never completing. The latter used to be
+  // destructured and spent on `${error ? '' : ''}` — a no-op that read as a
+  // use — so a transport failure fell through to the same generic sentence
+  // as everything else.
+  const transportFailure =
+    error instanceof Error ? error.message : error ? String(error) : null;
+  const notMeasuredReason =
+    data?.reason?.trim() || transportFailure || 'The threat-intel service did not answer';
 
   // Not `?? MOCK_INDICATORS`. `fallbackData` above already withholds the
   // sample set outside the hosted demo; repeating the constant here put it
@@ -297,8 +338,10 @@ export function ThreatIntelView() {
           { label: 'High confidence (of shown)', value: allIndicators.filter(i => i.confidence >= 80).length, color: 'text-orange-400' },
         ].map((stat) => (
           <div key={stat.label} className="bg-gray-900/60 border border-gray-800/60 rounded-xl p-4">
-            <p className={clsx('text-2xl font-bold mb-1', stat.color)}>{stat.value}</p>
-            <p className="text-xs text-gray-500">{stat.label}</p>
+            <p className={clsx('text-2xl font-bold mb-1', storeUnknown ? 'text-gray-600' : stat.color)}>
+              {storeUnknown ? '—' : stat.value}
+            </p>
+            <p className="text-xs text-gray-500">{storeUnknown ? 'not measured' : stat.label}</p>
           </div>
         ))}
       </div>
@@ -333,7 +376,9 @@ export function ThreatIntelView() {
                   : 'text-gray-400 bg-gray-800/60 hover:bg-gray-800'
               )}
             >
-              {t === 'all' ? 'All' : t.toUpperCase()} ({typeCounts[t] ?? 0})
+              {/* Five chips reading `(0)` is five measured claims about a
+                  store the page could not reach. */}
+              {t === 'all' ? 'All' : t.toUpperCase()} ({storeUnknown ? '—' : typeCounts[t] ?? 0})
             </button>
           ))}
         </div>
@@ -343,10 +388,18 @@ export function ThreatIntelView() {
       <div className="bg-gray-900/60 border border-gray-800/60 rounded-xl p-4">
         <div className="flex items-center justify-between mb-3">
           <h3 className="text-sm font-medium text-gray-300">Indicators of Compromise</h3>
-          <span className="text-xs text-gray-500">
-            {totalCollected > indicators.length
-              ? `${indicators.length.toLocaleString()} of ${totalCollected.toLocaleString()} indicators`
-              : `${indicators.length.toLocaleString()} indicators`}
+          {/* `storeUnknown` is the same signal the empty state below uses to
+              say "this is not a report that no indicators exist". This
+              counter said `0 indicators` directly above that sentence. */}
+          <span
+            className="text-xs text-gray-500"
+            title={storeUnknown ? 'The threat-intel service has not answered, so there is no count to show.' : undefined}
+          >
+            {storeUnknown
+              ? '— indicators'
+              : totalCollected > indicators.length
+                ? `${indicators.length.toLocaleString()} of ${totalCollected.toLocaleString()} indicators`
+                : `${indicators.length.toLocaleString()} indicators`}
           </span>
         </div>
         {indicators.length === 0 ? (
@@ -375,8 +428,17 @@ export function ThreatIntelView() {
           ) : (
             <EmptyState
               icon={EmptyStateIcons.shield}
-              title="No threat intel ingested yet"
-              description="Connect a TI feed (MISP, OTX, AbuseIPDB, GreyNoise, internal STIX/TAXII) from Settings → Connectors to start enriching alerts with reputation context."
+              title={storeUnknown ? (isLoading ? 'Loading threat intel…' : 'Threat intel store unreachable') : 'No threat intel ingested yet'}
+              description={
+                storeUnknown
+                  ? isLoading
+                    ? 'Reading indicators from the threat-intel service.'
+                  : // The route's own `reason` when it sent one, because
+                    // "did not answer (ConnectError)" tells an operator
+                    // where to look and a generic sentence does not.
+                    `${notMeasuredReason}. This is not a report that no indicators exist.`
+                  : 'Connect a TI feed (MISP, OTX, AbuseIPDB, GreyNoise, internal STIX/TAXII) from Settings → Connectors to start enriching alerts with reputation context.'
+              }
               className="bg-transparent py-8"
             />
           )

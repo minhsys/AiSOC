@@ -781,8 +781,9 @@ run_demo() {
     return 0
   fi
   section "Starting AiSOC (CORE profile)"
-  info "Starting the 10-service CORE stack: postgres, redis, kafka, ingest,"
-  info "fusion, api, agents, realtime and the web console."
+  info "Starting the 16-service CORE stack. Validated against docker-compose.yml"
+  info "by scripts/check_profile_service_counts.py, which refuses a figure here"
+  info "that the compose file does not support."
   info ""
   info "This is the same stack 'make up' starts and the same one CI tests."
   info "It runs the real pipeline: an event you send is normalized, placed on"
@@ -869,13 +870,52 @@ run_smoke_test() {
   exit 5
 }
 
+# Where the model runs, reported once at the end.
+#
+# Printed, never prompted: this installer asks the user nothing and should keep
+# it that way. Switching Ollama onto a GPU means restarting that container with
+# different compose arguments, so the only honest thing an installer can do is
+# say which option fits the host it just ran on.
+print_model_placement() {
+  _advice=""
+  case "$(uname -s)" in
+    Darwin)
+      if [ "$(uname -m)" = "arm64" ]; then
+        if have ollama; then
+          _advice="You already run Ollama natively, and on Apple Silicon that is the only one
+    with a GPU — Docker cannot pass Metal into a container. To use it:
+      make up-host-llm"
+        else
+          _advice="AI triage is running on CPU. On Apple Silicon a container gets no GPU at
+    all, so for a faster model install Ollama natively and point the stack at it:
+      brew install ollama && OLLAMA_HOST=0.0.0.0 ollama serve
+      make up-host-llm"
+        fi
+      fi
+      ;;
+    Linux)
+      if have nvidia-smi && nvidia-smi -L >/dev/null 2>&1; then
+        _advice="This host has an NVIDIA GPU. To run the bundled model on it:
+      make up-gpu
+    (\`python3 scripts/check_gpu_runtime.py\` says whether the container toolkit
+    is installed, and what to do if not.)"
+      fi
+      ;;
+  esac
+  [ -z "$_advice" ] && return 0
+  printf '\n%sWhere the model runs:%s\n    %s\n' "$C_BOLD" "$C_RESET" "$_advice"
+  printf '    %sOr use a hosted provider: console → Settings → Deployment & AI.%s\n' "$C_DIM" "$C_RESET"
+}
+
 print_success() {
   cat <<EOF
 
 ${C_BOLD}${C_GREEN}AiSOC is up and running${C_RESET}${C_GREEN}, and a real event reached the API.${C_RESET}
 
   ${C_BOLD}Web console:${C_RESET}     http://localhost:3000
-  ${C_BOLD}API + Swagger:${C_RESET}   http://localhost:8000/api/docs
+  ${C_BOLD}API:${C_RESET}             http://localhost:8000
+  ${C_BOLD}API spec:${C_RESET}        docs/openapi.yaml  (interactive docs are off in
+                   this production-class stack, which is the posture to keep)
   ${C_BOLD}Realtime WS:${C_RESET}     ws://localhost:8086
 
   ${C_BOLD}Sign in as:${C_RESET}      ${AISOC_ADMIN_EMAIL:-admin@aisoc.internal}
@@ -945,6 +985,7 @@ main() {
   run_pnpm_install
   run_demo
   run_smoke_test
+  print_model_placement
   print_success
 }
 

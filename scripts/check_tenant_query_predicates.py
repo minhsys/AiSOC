@@ -199,12 +199,20 @@ RATCHET: dict[str, str] = {
     "services/api/app/api/v1/endpoints/auth.py::refresh_token::User": (
         "refresh presents a signed token, not a tenant; the row it names assigns one"
     ),
-    "services/api/app/api/v1/deps.py::get_current_user::User": "bearer-token subject lookup; runs before any tenant exists on the request",
+    # One entry where there were two. The bearer-token subject lookup was
+    # inlined in `get_current_user` *and* copied into `_authenticate_ws`;
+    # that copy skipped the session-revocation check and database RBAC
+    # (GHSA-25fh-rxp8-67j8), so the two are now one function and this is
+    # its one exemption.
+    "services/api/app/api/v1/deps.py::resolve_jwt_principal::User": (
+        "bearer-token subject lookup; runs before any tenant exists on the request"
+    ),
     "services/api/app/api/v1/deps.py::_resolve_api_key::ApiKey": (
         "API-key hash lookup; the key row is the credential that carries the tenant"
     ),
-    "services/api/app/api/v1/endpoints/graph_ws.py::_authenticate_ws::User": (
-        "websocket ticket verification, same pre-auth shape as get_current_user"
+    "services/api/app/services/scim/tokens.py::verify_token::ScimToken": (
+        "SCIM bearer-token digest lookup; the token row is what assigns the tenant, "
+        "and RFC 7643 defines no tenant attribute a caller could have supplied"
     ),
     "services/api/app/api/v1/endpoints/passkeys.py::_consume_challenge::PasskeyChallenge": (
         "single-use WebAuthn challenge, matched on its own high-entropy value"
@@ -225,6 +233,11 @@ RATCHET: dict[str, str] = {
         "matched on the 32-byte single-use state nonce, which is itself the credential"
     ),
     # -- deliberately cross-tenant surfaces ----------------------------------
+    "services/agents/app/playbook/pause.py::expire_due::aisoc_playbook_pauses": (
+        "the approval-expiry sweep: a per-tenant sweep would need a list of tenants to "
+        "iterate, and a tenant missing from that list would have approvals that never "
+        "expire, which is the silent hang the sweep exists to prevent"
+    ),
     "services/api/app/api/v1/endpoints/tenants.py::create_user::User": (
         "platform-admin provisioning: creates users across tenants by design"
     ),
@@ -255,6 +268,11 @@ RATCHET: dict[str, str] = {
     "services/api/app/workers/hunt_scheduler.py::run_once::SavedHunt": (
         "scheduler sweeps every tenant's due hunts, then executes each under its own tenant"
     ),
+    "services/api/app/services/retro_hunt/service.py::opted_in_tenants::RetroHuntSettings": (
+        "answers 'which tenants opted in to retro-hunts', so it cannot presuppose one; the caller "
+        "binds each tenant with set_config before any sweep or alert write, so every write after "
+        "this read is RLS-enforced. Same shape and same reasoning as hunt_scheduler.run_once above"
+    ),
     "services/api/app/workers/oauth_refresh.py::_select_due_connectors::Connector": (
         "refresh worker sweeps all tenants' expiring OAuth grants; there is no caller"
     ),
@@ -262,6 +280,11 @@ RATCHET: dict[str, str] = {
         "writes back to the connector row the sweep above already selected, by primary key"
     ),
     "services/api/app/workers/oauth_refresh.py::_record_failure::Connector": "records the failure of that same swept row, by primary key",
+    "services/api/app/workers/approval_expiry.py::run_once::agent_approvals": (
+        "counts pending approvals that carry no expires_at, across every tenant, for one operator log line. "
+        "The sweep it sits beside is tenant-wide by nature and calls assert_cross_tenant_session first, so a "
+        "tenant predicate here would report one tenant's gap as the whole estate's"
+    ),
     # -- the row is addressed by an opaque capability, and yields the tenant --
     "services/honeytokens/app/api/routes.py::webhook_trigger::Honeytoken": (
         "canary callback: the token id is the capability and the row supplies the tenant it belongs to"
@@ -299,7 +322,37 @@ RATCHET: dict[str, str] = {
 
 #: Raising this is a deliberate act with a diff attached. Appending to RATCHET
 #: without raising it fails the gate, which is the whole point.
-MAX_RATCHET = 32
+#:
+#: 32 -> 33 for the SCIM bearer-token lookup. It belongs to the first group
+#: above, the lookups that *establish* a tenant rather than operate inside one:
+#: a SCIM request carries no tenant and RFC 7643 defines no attribute that
+#: could carry one, so the token row is the only thing that assigns it. The
+#: other seven unscoped statements the SCIM surface introduced were given real
+#: predicates instead of entries here.
+#:
+#: 33 -> 34 (gap-closure Phase 8.1): `retro_hunt.service.opted_in_tenants`.
+#: A fan-out consumer's first question is "which tenants opted in", and that
+#: question cannot presuppose a tenant — the same reasoning already recorded
+#: for `org_scope.resolve_portfolio_scope`, `hunt_scheduler.run_once` and
+#: `oauth_refresh._select_due_connectors`, all of which discover a working set
+#: and then bind each tenant before touching it. The alternative was to issue
+#: the identical query as raw SQL, which would have moved it out of this
+#: gate's view without changing what it reads, and that is worse than an entry
+#: with a reason beside it.
+#:
+#: 34 -> 35 (deferral 9b): `approval_expiry.run_once`'s no-deadline count. The
+#: worker expires stale approvals across every tenant and asserts an unbound
+#: session before it does, so the aggregate beside it is tenant-wide for the
+#: same reason. The count feeds one log line and returns no tenant's rows. It
+#: was moved out of module scope to earn this entry: keyed on `<module>` the
+#: waiver would have matched any later unscoped query in the same file, which
+#: is an allowlist wearing a ratchet's name.
+# 35 before parity 5.2, which added the approval-expiry sweep. It is the
+# one statement in that feature that is cross-tenant by construction: the
+# two lookups beside it (find_waiting, resolve) take a tenant and filter
+# on it, because resuming another tenant's playbook run should take two
+# mistakes rather than one.
+MAX_RATCHET = 36
 
 
 # ---------------------------------------------------------------------------

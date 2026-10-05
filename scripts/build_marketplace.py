@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import re
 import sys
@@ -60,6 +61,20 @@ COMMUNITY_PLUGINS_DIR = REPO_ROOT / "plugins" / "community"
 
 OUTPUT_PRIMARY = REPO_ROOT / "marketplace" / "index.json"
 OUTPUT_PUBLIC = REPO_ROOT / "apps" / "web" / "public" / "marketplace" / "index.json"
+
+#: A third copy, inside the API service's Docker build context.
+#:
+#: The API image is built with `services/api` as its context, so the
+#: repository-root `marketplace/` directory is not visible to `COPY . .` and
+#: the published image shipped without an index at all. Every containerised
+#: deployment therefore answered 503 on the marketplace — reported in
+#: discussion #374 and true of every release since the endpoint was written.
+#:
+#: `apps/web/public/marketplace/index.json` is the same arrangement for the
+#: console, so this follows a pattern the repository already relies on rather
+#: than introducing one. `scripts/check_marketplace_index_parity.py` asserts
+#: the three stay byte-identical.
+OUTPUT_API_PACKAGED = REPO_ROOT / "services" / "api" / "app" / "data" / "marketplace" / "index.json"
 
 DETECTION_CATEGORIES = {
     "cloud",
@@ -318,6 +333,10 @@ def build_detection_item(
     tags = normalise_tags(raw_tags)
     category = data.get("category") or path.parent.name
     enabled = data.get("enabled")
+    # The engine's own loaded set, which is what `docs/detections/truth-table.md`
+    # calls executable and what the README's 2,603 counts.
+    rule_id = str(data.get("id") or path.stem)
+    executable = rule_id in engine_rule_ids()
     if quarantined:
         # Quarantine directory layout has the category two levels below the
         # tier root (e.g. sigma-imports/_quarantine/cloud/foo.yaml).
@@ -346,11 +365,32 @@ def build_detection_item(
         "source": source,
         "tier": tier,
         "enabled": False if (quarantined or enabled is False) else True,
+        # Whether the engine loads this rule, which is the only thing that
+        # decides whether it can fire.
+        #
+        # **Not** `enabled`. That field is the YAML's own flag OR-ed with the
+        # directory, and the two disagree with the engine in one direction at
+        # scale: 1,724 rules carry `enabled: false` in their file and the
+        # engine loads all of them, because the Sigma compiler began
+        # translating rules in place without rewriting the flag. Publishing
+        # `enabled` as the capability signal would mark those 1,724 working
+        # rules unusable — understating the corpus in exactly the direction
+        # this repository normally guards the other way.
+        #
+        # `docs/detections/truth-table.md` already asks the engine rather
+        # than the path, and 2,603 is the figure the README publishes. This
+        # reads the same set, so the catalogue cannot disagree with them.
+        "executable": executable,
         "path": str(path.relative_to(REPO_ROOT)),
     }
-    if quarantined:
+    # Every rule that cannot fire says why. The reason used to be written
+    # only on the quarantine branch, so a rule the engine skips for any other
+    # cause arrived in the catalogue indistinguishable from a working one.
+    if not executable:
         item["quarantine_reason"] = data.get("quarantine_reason") or (
             "imported rule; upstream query language not directly executable by the AiSOC engine yet"
+            if quarantined
+            else "disabled in the rule file (`enabled: false`); the engine does not load it"
         )
     provenance = data.get("provenance")
     if isinstance(provenance, dict):
@@ -571,25 +611,97 @@ def coverage_block(items: list[dict[str, Any]]) -> dict[str, Any]:
     rather than a single flat number.
     """
     techniques: dict[str, int] = {}
+    executable_techniques: dict[str, int] = {}
     by_tier: dict[str, dict[str, int]] = {}
     for item in items:
         tier = item.get("tier") or "stable"
+        runs = bool(item.get("executable", True))
         for tid in item.get("mitre_techniques") or []:
             techniques[tid] = techniques.get(tid, 0) + 1
+            if runs:
+                executable_techniques[tid] = executable_techniques.get(tid, 0) + 1
             tier_map = by_tier.setdefault(tier, {})
             tier_map[tid] = tier_map.get(tid, 0) + 1
 
     return {
-        "techniques": dict(sorted(techniques.items())),
-        "unique_techniques": len(techniques),
-        "total_with_mitre": sum(1 for i in items if i.get("mitre_techniques")),
+        # The headline. A technique counts only when a rule that can actually
+        # fire carries the tag, because the previous figure counted every
+        # rule on disk including the reference-only ones, and a reader takes
+        # a coverage number as a statement about what the product detects.
+        "unique_techniques": len(executable_techniques),
+        "techniques": dict(sorted(executable_techniques.items())),
+        "total_with_mitre": sum(1 for i in items if i.get("mitre_techniques") and i.get("executable", True)),
+        # Kept, clearly named, because the on-disk corpus is a real thing a
+        # reader may want to size. It is not coverage.
+        "unique_techniques_all_rules": len(techniques),
+        "techniques_all_rules": dict(sorted(techniques.items())),
+        # This is tag coverage, not detection efficacy: it says a rule claims
+        # the technique, not that the rule would catch an attacker using it.
+        "measure": "attack_technique_tags_on_executable_rules",
         "by_tier": {tier: dict(sorted(tids.items())) for tier, tids in by_tier.items()},
     }
+
+
+def _attach_content_hashes(items: list[dict[str, Any]]) -> None:
+    """Record each item's SHA-256 in the index itself.
+
+    Install used to hash the file on disk, which meant the API needed the
+    `detections/`, `playbooks/` and `plugins/` trees at runtime. Its image is
+    built from `services/api` and contains none of them, so an install in any
+    container failed even once the index was found. Carrying the digest here
+    makes the index self-describing and removes the dependency entirely.
+
+    A missing file is recorded as `None` rather than skipped, so the parity
+    gate can report it instead of the index quietly describing fewer items
+    than it lists.
+    """
+    for item in items:
+        relative = item.get("path")
+        if not isinstance(relative, str):
+            item["sha256"] = None
+            continue
+        source = REPO_ROOT / relative
+        item["sha256"] = hashlib.sha256(source.read_bytes()).hexdigest() if source.is_file() else None
+
+
+def _assert_unique_identities(items: list[dict[str, Any]]) -> None:
+    """Refuse to emit an index where two entries answer to the same identity.
+
+    ``(type, id)`` is the identity every consumer keys on, and two entries
+    sharing one breaks all of them in different ways. The console keys its
+    grid children on it, and React maps old fibers by key when it reconciles:
+    a second fiber with the same key overwrites the first in that map, so the
+    overwritten one is never handed to ``deleteChild`` and stays mounted
+    through every later render. Two installable playbooks therefore survived
+    into the ``Reference only`` view, which by definition holds nothing
+    installable, and the grid rendered more children than its own header
+    counted. ``POST /v1/marketplace/install`` resolves ``(type, id)`` by first
+    match, so the entry a reader clicked was not necessarily the one that got
+    installed — a different document, a different step count, a different
+    content hash.
+
+    Both collisions in the shipped index were between the v1 pack tree and the
+    standalone response playbooks under ``detections/playbooks/``, which use
+    the same ``<slug>-v1`` convention in slug spaces that happened to overlap.
+    """
+    seen: dict[tuple[str, str], str] = {}
+    collisions: list[str] = []
+    for item in items:
+        identity = (str(item.get("type")), str(item.get("id")))
+        path = str(item.get("path") or "<no path>")
+        if identity in seen:
+            collisions.append(f"  {identity[0]}:{identity[1]}\n    {seen[identity]}\n    {path}")
+        else:
+            seen[identity] = path
+    if collisions:
+        raise SystemExit("marketplace: two entries share a (type, id); every consumer keys on it.\n" + "\n".join(collisions))
 
 
 def build_index() -> dict[str, Any]:
     items = collect_items()
     items.sort(key=lambda i: (i["type"], i.get("id", "")))
+    _assert_unique_identities(items)
+    _attach_content_hashes(items)
     return {
         "$schema": "https://example.com/schemas/marketplace/v1.json",
         "version": "1.0.0",
@@ -609,7 +721,31 @@ def build_index() -> dict[str, Any]:
             "community": sum(1 for i in items if i.get("source") == "community"),
             "by_tier": _tier_breakdown(items),
             "detections_by_tier": _detection_tier_breakdown(items),
-            "quarantined": sum(1 for i in items if i.get("quarantine_reason")),
+            # The split a reader of this catalogue needs, and the one it did
+            # not have. `quarantined` counted rows carrying a
+            # `quarantine_reason` — 4,213 against 4,388 rules the engine does
+            # not load — so the published figure and the truth table's were
+            # two numbers nothing compared.
+            #
+            # Both read `executable`, which is membership of the engine's
+            # loaded rule set, so they partition the catalogue: every item is
+            # one or the other and they sum to `total`. Playbooks and plugins
+            # are not engine rules and carry no `executable` field, so they
+            # default to the executable side — they are shipped, installable
+            # content, and calling them non-executable would be its own
+            # falsehood.
+            "executable": sum(1 for i in items if i.get("executable", True)),
+            "quarantined": sum(1 for i in items if not i.get("executable", True)),
+            # The three states, reported separately because the single
+            # `executable` figure above conflates two different things and a
+            # reader of a marketplace index takes it as a detection count.
+            # It reads 2,767 while the item flags say 2,603, and the 164 in
+            # between are the playbooks and plugins described above, which
+            # carry no flag at all. Both numbers are defensible; publishing
+            # only one of them and calling it `executable` is not.
+            "executable_detections": sum(1 for i in items if i.get("executable") is True),
+            "reference_only_detections": sum(1 for i in items if i.get("executable") is False),
+            "not_a_detection": sum(1 for i in items if "executable" not in i),
         },
         "mitre_coverage": coverage_block(items),
         "items": items,
@@ -618,10 +754,9 @@ def build_index() -> dict[str, Any]:
 
 def write_index(index: dict[str, Any]) -> None:
     payload = json.dumps(index, indent=2, sort_keys=False) + "\n"
-    OUTPUT_PRIMARY.parent.mkdir(parents=True, exist_ok=True)
-    OUTPUT_PUBLIC.parent.mkdir(parents=True, exist_ok=True)
-    OUTPUT_PRIMARY.write_text(payload, encoding="utf-8")
-    OUTPUT_PUBLIC.write_text(payload, encoding="utf-8")
+    for destination in (OUTPUT_PRIMARY, OUTPUT_PUBLIC, OUTPUT_API_PACKAGED):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(payload, encoding="utf-8")
 
 
 def main() -> int:
@@ -647,8 +782,16 @@ def main() -> int:
         return 0
 
     if args.check:
-        existing_primary = OUTPUT_PRIMARY.read_text(encoding="utf-8") if OUTPUT_PRIMARY.exists() else ""
-        existing_public = OUTPUT_PUBLIC.read_text(encoding="utf-8") if OUTPUT_PUBLIC.exists() else ""
+        # Every destination write_index() writes. It used to check two of the
+        # three, so `marketplace:check` reported "up to date" while the copy
+        # inside the API's Docker build context was stale or absent — the
+        # state that made the marketplace answer 503 in every container
+        # (discussion #374). A check that verifies fewer places than the
+        # writer writes is one that certifies the case it cannot see.
+        existing = {
+            destination: (destination.read_text(encoding="utf-8") if destination.exists() else "")
+            for destination in (OUTPUT_PRIMARY, OUTPUT_PUBLIC, OUTPUT_API_PACKAGED)
+        }
 
         # Compare ignoring `generated` timestamp.
         def _strip_generated(s: str) -> str:
@@ -662,13 +805,20 @@ def main() -> int:
             return json.dumps(obj, indent=2, sort_keys=False) + "\n"
 
         rebuilt_no_ts = _strip_generated(serialised)
-        if _strip_generated(existing_primary) != rebuilt_no_ts or _strip_generated(existing_public) != rebuilt_no_ts:
+        stale = [
+            str(destination.relative_to(REPO_ROOT))
+            for destination, content in existing.items()
+            if _strip_generated(content) != rebuilt_no_ts
+        ]
+        if stale:
+            # Named, because "the index is stale" sent people to the one they
+            # already had open rather than the one that was actually wrong.
             print(
-                "marketplace/index.json is stale. Run: pnpm marketplace:build",
+                f"stale or missing: {', '.join(stale)}. Run: pnpm marketplace:sync",
                 file=sys.stderr,
             )
             return 1
-        print(f"marketplace/index.json is up to date ({index['stats']['total']} items).")
+        print(f"marketplace index is up to date in {len(existing)} locations ({index['stats']['total']} items).")
         return 0
 
     write_index(index)

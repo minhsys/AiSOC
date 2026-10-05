@@ -15,15 +15,38 @@ name: Security
 #         the pinned release had been deleted upstream, so the download
 #         404'd, the scan ran a binary that was not there, and
 #         continue-on-error turned the whole thing green.
-#   - OBSERVE gates (report, do not fail yet): Semgrep, checkov, tfsec.
-#     These are not observe-mode because nobody has looked. They were run
-#     against this tree and the counts are: Semgrep 92 (35 at ERROR),
-#     checkov 91 failed checks under infra/terraform, tfsec 32 (7 CRITICAL,
-#     5 HIGH). Blocking on 215 untriaged findings would red every pull
+#   - RATCHETED gates (report every finding, fail on a new one): Semgrep,
+#     checkov, tfsec. Blocking on 215 untriaged findings would red every pull
 #     request on day one and the first response would be to turn the gate
-#     back off, so each needs its own triage pass first. The count is stated
-#     here rather than left as "we'll get to it" so the size of the
-#     remaining work is visible.
+#     back off, so none of the three fails on its existing findings. What
+#     they now fail on is a *change* in the count, in either direction,
+#     against the ceilings in `.security/allowlist.yml` — enforced by
+#     `scripts/check_scanner_ratchet.py`, which is the first thing in this
+#     repository ever to open that file. The counts used to live in this
+#     comment, where nothing compared them to anything: a pull request adding
+#     twenty findings and one removing twenty produced the same green tick.
+#     They now live in the allow-list, where a run that disagrees with them
+#     fails and prints the number to write.
+#
+# A ratcheted scanner runs its scan under `continue-on-error`, because the
+# scan's own exit status is not the verdict — the count is. That is only safe
+# while something *reads* the outcome, and for Semgrep and checkov nothing
+# did, so either job could report success over a scan that never finished.
+# `continue-on-error` is defined as rewriting a failed step's conclusion to
+# `success`, so the Actions API cannot show this and no amount of run history
+# would have found it; `scripts/check_required_check_substance.py --static`
+# refuses the shape instead. Both now give the scan step an `id` and put a
+# blocking step that reads `steps.<id>.outcome == 'failure'` *ahead of* the
+# ratchet — ahead, because a scan that dies part-way still leaves a short
+# report and the ratchet's shrink-only arm would answer it with "lower the
+# ceiling to N", which would bake the broken scan in.
+#
+# Four of the six jobs here are required checks on `main`: the claim-matrix
+# ratchet, gitleaks, Trivy and checkov. `Semgrep (ratcheted)` is deliberately
+# not, and the reason is measured rather than cautious — it disagrees with
+# itself on an unchanged tree about one run in twenty. See
+# `.security/allowlist.yml` and `.github/required-checks.json`, both of which
+# record the decision so it is not quietly reversed.
 #
 # GitHub native push-protection remains the always-on hard secret gate.
 
@@ -110,14 +133,21 @@ jobs:
       - name: Scan working tree (respects .gitleaksignore)
         run: gitleaks dir . --redact --exit-code 1 --no-banner
 
-  # ── OBSERVE: SAST beyond CodeQL ───────────────────────────────────────────
+  # ── RATCHETED: SAST beyond CodeQL ─────────────────────────────────────────
   #
-  # 92 findings against this tree (35 ERROR, 51 WARNING, 3 MEDIUM, 3 INFO),
-  # measured with semgrep 1.86.0 and the five configs below. Too many to
-  # block on before they are triaged, and `--error` fails on any of them, so
-  # this stays report-only with the number written down.
+  # 92 findings against this tree (35 ERROR, 51 WARNING, 3 MEDIUM, 3 INFO).
+  # Too many to block on before they are triaged, and `--error` fails on any
+  # of them — so the scan itself stays non-blocking and the *count* is what
+  # blocks, against the ceiling in `.security/allowlist.yml`.
+  #
+  # The version is pinned exactly. For a ratchet the scanner version is the
+  # behaviour: an unpinned `pip install semgrep` re-baselines the count on
+  # upstream's release schedule, which is indistinguishable from a change in
+  # this tree. The gate compares the version the report declares against the
+  # one the ceiling was measured with and fails if they differ, so a bump
+  # here is an explicit re-measure rather than a silent one.
   semgrep:
-    name: Semgrep (observe)
+    name: Semgrep (ratcheted)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -125,11 +155,20 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install semgrep
-        run: pip install --quiet semgrep
+        run: pip install --quiet semgrep==1.86.0
+      # `--error` is gone: it exits non-zero on any finding, which would make
+      # the exit status carry the same information as the count and force
+      # `continue-on-error` back onto the ratchet step below with it.
+      #
+      # `continue-on-error` here is deliberate and now *read*, by the step
+      # below. Without `--error`, semgrep exits 0 whether or not it finds
+      # anything, so a non-zero status means the scan itself failed — an
+      # unfetchable rule config, a crash — and not a finding.
       - name: Scan
+        id: scan
         continue-on-error: true
         run: |
-          semgrep --error --disable-version-check \
+          semgrep --json --output semgrep.json --disable-version-check \
             --config p/security-audit \
             --config p/owasp-top-ten \
             --config p/python \
@@ -137,6 +176,26 @@ jobs:
             --config p/react \
             --exclude plans/ \
             services/ apps/ packages/ scripts/
+      # Blocking, and this is the step that makes the one above safe.
+      # `continue-on-error` rewrites a failed step's *conclusion* to success,
+      # so without something reading its `outcome` the job reports green over
+      # a scan that died — the shape
+      # `scripts/check_required_check_substance.py` refuses by name, and the
+      # reason this check could not be required.
+      #
+      # Ahead of the ratchet on purpose. A scan that failed part-way can still
+      # leave a short `semgrep.json`, and the ratchet's shrink-only arm would
+      # read that short count and print "lower it to N" — advice that would
+      # bake a broken scan into the ceiling.
+      - name: The scan itself did not fail
+        if: steps.scan.outcome == 'failure'
+        run: |
+          echo "::error title=semgrep::semgrep exited non-zero. Without \`--error\` that is the scan failing, not a finding, so the count below would describe a partial run."
+          exit 1
+      # Blocking. No `continue-on-error`: a missing or truncated report means
+      # the scan did not finish, and the gate says so rather than passing.
+      - name: Ratchet the finding count
+        run: python3 scripts/check_scanner_ratchet.py --tool semgrep --report semgrep.json
 
   # ── HARD: filesystem vuln scan (complements dependency SCA) ───────────────
   trivy-fs:
@@ -180,29 +239,122 @@ jobs:
           set -euo pipefail
           /tmp/trivy fs --severity HIGH,CRITICAL --ignore-unfixed --skip-dirs plans --exit-code 1 .
 
-  # ── OBSERVE: IaC misconfig scan ───────────────────────────────────────────
+  # ── RATCHETED: IaC misconfig scan ─────────────────────────────────────────
   #
-  # checkov 3.2.x reports 91 failed checks against infra/terraform (164
-  # passing); tfsec 1.28.x reports 32 findings there (7 CRITICAL, 5 HIGH,
-  # 2 MEDIUM, 18 LOW). Both stay report-only until those are triaged —
-  # promoting them now would red every pull request over pre-existing
-  # infrastructure defaults that no single change introduced.
-  iac-scan:
-    name: IaC scan (checkov + tfsec, observe)
+  # checkov reports 91 failed checks against infra/terraform (164 passing);
+  # tfsec reports 32 findings there (7 CRITICAL, 5 HIGH, 2 MEDIUM, 18 LOW).
+  # Neither scan fails on those — promoting them outright would red every
+  # pull request over pre-existing infrastructure defaults that no single
+  # change introduced. What fails is a count that no longer matches the
+  # ceiling in `.security/allowlist.yml`, in either direction.
+  #
+  # tfsec runs as a pinned binary rather than through the marketplace action,
+  # for the two reasons the Trivy job above already records: the action's
+  # version tags proved unreliable, and the ratchet needs the JSON report on
+  # disk. `--soft-fail` keeps the scan's own exit status out of it so the
+  # count is the only thing that decides.
+  # One job each, not one job for both. They shared a job while neither
+  # blocked, and the moment the ratchet made the steps hard the first
+  # scanner to breach its ceiling ended the job before the second one ran —
+  # so a real count for tfsec was unobtainable whenever checkov was red.
+  # A gate that can stop another gate from measuring is a gate that reports
+  # on whichever half happened to run first.
+  iac-checkov:
+    name: IaC scan (checkov, ratcheted)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
+      # Its own step, and blocking. The install used to sit inside the scan
+      # step under `continue-on-error`, so a failed `pip install` was
+      # absorbed and the only symptom was the ratchet below complaining
+      # about a report that was never written.
+      - name: Install checkov
+        run: pip install --quiet checkov==3.2.334
+      # `continue-on-error` here is deliberate and now *read*, by the step
+      # below. It replaces a trailing `|| true`, which discarded every exit
+      # code checkov has — the one that means "I found things" and the one
+      # that means "I could not run" alike.
       - name: checkov (terraform + helm)
+        id: checkov
         continue-on-error: true
         run: |
-          pip install --quiet checkov
-          checkov -d infra/terraform --quiet --compact || true
-          checkov -d infra/helm --quiet --compact || true
-      - name: tfsec (terraform)
-        continue-on-error: true
-        uses: aquasecurity/tfsec-action@b466648d6e39e7c75324f25d83891162a721f2d6 # v1.0.3
+          # `--output-file-path .` writes ./results_json.json; checkov treats
+          # a directory argument that way rather than honouring a filename.
+          status=0
+          checkov -d infra/terraform -d infra/helm --quiet --compact \
+            -o json --output-file-path . || status=$?
+          # Measured against the pinned 3.2.334: 0 = no failed checks, 1 =
+          # failed checks, 2 = a usage error. 1 is the normal state here —
+          # there are 219 of them — and deciding on it is the ratchet's job,
+          # not this step's. Anything above 1 is checkov failing to run.
+          #
+          # `--soft-fail` would be the obvious way to write this and is the
+          # wrong one: measured, it collapses 1 to 0 but leaves 2 alone,
+          # which buys nothing, and it is silent about the case that matters
+          # most — a `-d` naming a directory that does not exist exits 0
+          # under every combination, logging an ERROR and scanning what is
+          # left. That one is caught downstream instead, by the ratchet's
+          # shrink-only arm, because a vanished directory shows up as a
+          # count below the ceiling.
+          if [ "$status" -gt 1 ]; then
+            echo "::error title=iac-checkov::checkov exited $status — that is the scan failing to run, not a finding"
+            exit "$status"
+          fi
+      # Blocking, and this is the step that makes the one above safe.
+      # `continue-on-error` rewrites a failed step's *conclusion* to success,
+      # so without something reading its `outcome` the job reports green over
+      # a scan that died — the shape
+      # `scripts/check_required_check_substance.py` refuses by name, and the
+      # reason this check could not be required.
+      #
+      # Ahead of the ratchet on purpose. A scan that failed part-way can
+      # still leave a short `results_json.json`, and the ratchet's
+      # shrink-only arm would read that short count and print "lower it to
+      # N" — advice that would bake a broken scan into the ceiling.
+      - name: The scan itself did not fail
+        if: steps.checkov.outcome == 'failure'
+        run: |
+          echo "::error title=iac-checkov::checkov did not complete, so the count below would describe a partial scan"
+          exit 1
+      - name: Ratchet the checkov finding count
+        run: python3 scripts/check_scanner_ratchet.py --tool checkov --report results_json.json
+
+  iac-tfsec:
+    name: IaC scan (tfsec, ratcheted)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          working_directory: infra/terraform
+          python-version: "3.11"
+      - name: Install tfsec
+        run: |
+          set -euo pipefail
+          VERSION=1.28.13
+          url="https://github.com/aquasecurity/tfsec/releases/download/v${VERSION}/tfsec-linux-amd64"
+          if ! curl -sSL --fail --retry 5 --retry-delay 5 --retry-all-errors "$url" -o /tmp/tfsec; then
+            echo "::error title=tfsec::could not download $url — check whether v${VERSION} still exists and bump the pin"
+            exit 1
+          fi
+          chmod +x /tmp/tfsec
+          # tfsec's JSON report carries no version field, so the ratchet's
+          # version-drift arm has nothing in the report to compare against.
+          # The binary's own answer is the robust source: the pinned URL says
+          # what was asked for, a cached or substituted binary would still
+          # satisfy it, and only this says what actually ran. Same shape as
+          # the gitleaks job above, which has checked its pin this way for
+          # exactly the same reason.
+          installed="$(/tmp/tfsec --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+          echo "installed tfsec ${installed:-unknown}"
+          if [ "$installed" != "$VERSION" ]; then
+            echo "::error title=iac-tfsec::expected tfsec $VERSION, got '${installed:-nothing}'"
+            exit 1
+          fi
+          echo "TFSEC_VERSION=$installed" >> "$GITHUB_ENV"
+      - name: tfsec (terraform)
+        run: /tmp/tfsec infra/terraform --format json --out tfsec.json --soft-fail
+      - name: Ratchet the tfsec finding count
+        run: python3 scripts/check_scanner_ratchet.py --tool tfsec --report tfsec.json --tool-version "$TFSEC_VERSION"

@@ -52,16 +52,12 @@ for the full list.
 - **Public eval harness** — alert reduction, measured against `RawAlert.correlation_key()` on a fixed noisy stream (a legacy in-test suite grouping on different dimensions is retained for continuity and does not describe this product), plus MITRE-tactic, investigation-completeness, and response-quality substrate self-consistency gates. Reproducible with one command and run in CI on every PR. The [eval harness page](./benchmark) documents what each suite does and does not measure.
 - **Ambient Copilot** — context-aware next-action suggestions on every alert, case, rule, and playbook page; one click runs the right agent tool with the right payload.
 - **Responder PWA** — installable mobile route at `/responder/*` with passkey-only login, on-call rotation, approvals queue, VAPID Web Push, and offline shell.
-- **LangGraph multi-agent investigation** — orchestrator, recon, forensic, responder, and report-writer agents grounded in MITRE ATT&CK with Qdrant RAG memory. Includes domain-specific agents for phishing triage, identity threat analysis, cloud misconfiguration detection, and insider threat scoring.
+- **LangGraph multi-agent investigation** — orchestrator, recon, forensic, responder, and report-writer agents grounded in MITRE ATT&CK, whose technique corpus is embedded in Qdrant for lookup. That is a reference index, not agent memory: nothing persists what an investigation learned. Includes domain-specific agents for phishing triage, identity threat analysis, cloud misconfiguration detection, and insider threat scoring.
 - **Autonomous alert triage** — LLM-based auto-triage agent classifies alerts as true positive, false positive, or benign with confidence scoring. High-confidence false positives are auto-closed; uncertain alerts escalate to human analysts.
 - **Conversational investigation chat** — multi-turn NL interface for querying alerts, cases, and threat intel with quick actions and a persistent investigation context panel.
-- **MITRE ATT&CK coverage advisor** — identifies detection gaps across tactics, recommends new rules, and enables one-click detection generation for uncovered techniques.
-- **Shift handoff dashboard** — SOC shift management with handoff item tracking, shift summary KPIs (alerts triaged, cases opened, escalations), and report generation.
-- **EASM (External Attack Surface Management)** — continuous asset discovery, exposed service detection, certificate monitoring with expiry alerts, and risk scoring.
-- **MSSP executive dashboard** — cross-tenant view with aggregated KPIs (MTTD, MTTR, SLA compliance, ARR) and per-tenant risk scoring for managed security providers.
+- **MITRE ATT&CK coverage matrix** — reports which techniques the executable rule corpus tags, as tag coverage rather than detection efficacy. It does **not** recommend rules and there is no one-click generation for an uncovered technique; no such route exists. `POST /api/v1/nl-detection` turns a plain-English description you supply into candidate rules, which is a different thing from advising you what is missing.
 - **Alert noise tuning** — closed-loop dashboard driven by analyst TP/FP verdicts, with auto-tune toggles per rule and monthly noise trend visualization.
-- **Team analytics & gamification** — analyst leaderboard with sortable performance metrics, badges (MITRE Master, Speed Demon, Zero FP, Precision Strike), and team highlights feed.
-- **STIX/TAXII publishing** — bidirectional threat intel sharing with STIX 2.1 bundle creation and TAXII collection management. Optional [STIX → MISP push](./integrations/misp-push) republishes high-confidence indicators and bundles to a MISP server with `dry-run` / `health` endpoints for fail-closed staging rollouts.
+- **STIX bundle creation**, with an optional push to MISP. **TAXII collection management is demo-only**: `GET /taxii/collections` calls `_demo_only()` and returns a fixed list, so there is no TAXII server a peer can subscribe to and the sharing is one-way. Optional [STIX → MISP push](./integrations/misp-push) republishes high-confidence indicators and bundles to a MISP server with `dry-run` / `health` endpoints for fail-closed staging rollouts.
 - **Automated compliance evidence** — continuous collection from connected sources across SOC 2, ISO 27001, NIST CSF, PCI-DSS, HIPAA, and DORA frameworks.
 - **AI-generated incident reports** — one-click PDF/MD export of case investigation summaries directly from the case detail view.
 - **Real-time fusion** — Kafka spine with sub-second alert ingestion, Bloom-filter dedup on 10M+ IOCs, ML scoring (LightGBM + Isolation Forest).
@@ -92,7 +88,7 @@ for the full list.
 - **AI-vs-AI adversary eval** — deterministic attacker-LLM mutator generates adversarial incidents to test detection resilience under synonym swap, leetspeak, zero-width injection, and fragmentation attacks.
 - **Marketplace** — 15 first-party plugins, 50+ playbooks, 6,900+ detections (filtered by tier: stable / beta / imported / community), surfaced in-app via [`marketplace/index.json`](https://github.com/beenuar/AiSOC/tree/main/marketplace).
 - **SDKs** — Python, TypeScript, and Go SDKs for client and plugin development; Ed25519-signed publishing.
-- **Model Context Protocol** — `@aisoc/mcp` exposes 13 tools to Claude, Cursor, Continue, and Cody so analysts can replay agent decisions and run governed warm-tier SELECTs from inside their IDE ([MCP integration](./integrations/mcp)).
+- **Model Context Protocol** — `@aisoc/mcp` exposes 19 tools to Claude, Cursor, Continue, and Cody so analysts can replay agent decisions and run governed warm-tier SELECTs from inside their IDE ([MCP integration](./integrations/mcp)).
 
 ## Architecture Overview
 
@@ -120,7 +116,7 @@ See the full [Architecture](./architecture) page for the detailed service map an
 ### Get started
 
 - [One-click install](./installation) — zero-prerequisite bootstrap for Linux, macOS, and Windows
-- [Quick Start](./quickstart) — `pnpm aisoc:demo`, under 5 minutes to a live investigation. The **Path C — founder-style CLI** flow (`docker compose -f infra/compose/docker-compose.dev.yml up -d` → `aisoc db upgrade` → `aisoc serve` → `aisoc submit examples/alerts/lateral-movement.json`) goes from fresh clone to a live alert at `http://localhost:3000/alerts` in under 90 seconds, with no Kafka / Fusion required for the first alert.
+- [Quick Start](./quickstart) — `pnpm aisoc:demo`, under 5 minutes to a live investigation. The **Path C — founder-style CLI** flow (`docker compose -f docker-compose.yml -f infra/compose/docker-compose.dev.yml up -d` → `aisoc db upgrade` → `aisoc serve` → `aisoc submit examples/alerts/lateral-movement.json`) goes from fresh clone to a live alert at `http://localhost:3000/alerts` in under 90 seconds, with no Kafka / Fusion required for the first alert.
 - [Architecture](./architecture) — service map and data flow
 - [Glossary](./glossary) — security and AiSOC-specific terminology in one place
 - [FAQ](./operations/faq) — common questions about scope, deployment, data, and licensing

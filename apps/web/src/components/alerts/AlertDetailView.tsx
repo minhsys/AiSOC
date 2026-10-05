@@ -9,7 +9,7 @@ import {
   alertsApi,
   casesApi,
   ledgerApi,
-  feedbackApi,
+  feedbackApi, computeRedispositionToken,
   type Alert,
   type ConfidenceFactor,
   type ConfidenceLabel,
@@ -384,13 +384,19 @@ function AIInvestigation({ alertId, alertTitle }: { alertId: string; alertTitle?
     setIsRunning(true);
     setError(null);
     try {
-      const summary = alertTitle ? `Investigate alert: ${alertTitle}` : 'Investigate alert';
+      // `alertIds` is the part that matters. The API reads it to load the
+      // alerts' real `raw_event` payloads and sends those to the agent as
+      // `raw_alert`; it used to forward only the string below, so the
+      // forensic agent reasoned over a restated headline while auto-triage --
+      // the same agent, the other entry point -- got the whole event.
       const createdCase = await casesApi.create({
         title: alertTitle ? `Investigation — ${alertTitle}` : `Investigation — alert ${alertId}`,
-        description: summary,
+        description: alertTitle ? `Opened from alert: ${alertTitle}` : `Opened from alert ${alertId}`,
         alertIds: [alertId],
       });
-      await casesApi.investigate(createdCase.id, summary);
+      // A note about *why*, not a substitute for the evidence. The API
+      // prepends this to what it assembled rather than using it instead.
+      await casesApi.investigate(createdCase.id, 'Opened from the alert detail view by an analyst.');
       router.push(`/cases/${createdCase.id}?tab=ledger`);
     } catch (err) {
       setError(
@@ -543,9 +549,12 @@ function AnalystOverridePanel({
     if (!verdict || selectedIds.size === 0) return;
     setApplying(true);
     try {
+      const ids = Array.from(selectedIds);
+      const token = await computeRedispositionToken(ids, verdict);
       const resp = await feedbackApi.applyRedisposition({
-        alert_ids: Array.from(selectedIds),
+        alert_ids: ids,
         new_disposition: verdict,
+        confirmation_token: token,
       });
       toast.success(
         `Re-dispositioned ${resp.updated} past alert${resp.updated === 1 ? '' : 's'}`,
@@ -1041,7 +1050,32 @@ export function AlertDetailView({ alertId }: { alertId: string }) {
 
       {activeTab === 'raw' && (
         <Section title="Raw Event Data">
-          <pre className="text-xs text-gray-400 font-mono bg-gray-950/60 rounded-lg p-4 overflow-x-auto">
+          {alert.wazuhLocator && Object.keys(alert.wazuhLocator).length > 0 && (
+              <div className="mb-3 rounded-md border border-border bg-muted/40 p-3 text-xs">
+                <div className="mb-2 font-semibold text-foreground">
+                  Find this event in the source console
+                </div>
+                <dl className="grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 font-mono">
+                  {Object.entries(alert.wazuhLocator)
+                    .filter(([k]) => k !== 'full_log')
+                    .map(([k, v]) => (
+                      <div key={k} className="contents">
+                        <dt className="text-muted-foreground">{k}</dt>
+                        <dd className="break-all select-all">{String(v)}</dd>
+                      </div>
+                    ))}
+                </dl>
+                {typeof alert.wazuhLocator.full_log === 'string' && (
+                  <details className="mt-2">
+                    <summary className="cursor-pointer text-muted-foreground">full_log</summary>
+                    <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-all rounded bg-background p-2 select-all">
+                      {alert.wazuhLocator.full_log}
+                    </pre>
+                  </details>
+                )}
+              </div>
+            )}
+            <pre className="text-xs text-gray-400 font-mono bg-gray-950/60 rounded-lg p-4 overflow-x-auto">
             {JSON.stringify(alert.rawEvent || { message: 'Raw event data not available for this alert.' }, null, 2)}
           </pre>
         </Section>

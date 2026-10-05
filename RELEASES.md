@@ -2,13 +2,255 @@
 
 This file mirrors what used to live in the "What's new" section of [`README.md`](README.md). The complete, machine-readable inventory (with file paths, env-var diffs, and per-release test counts) lives in [`CHANGELOG.md`](CHANGELOG.md).
 
-> **TL;DR for first-time visitors:** AiSOC is on `v11.2.0`, released 2026-09-26 — the release where the detection engine went from 833 rules to **2,603**, and every one of the 1,770 added rules was watched to fire before it shipped. The library had held roughly 7,000 ATT&CK-mapped rules for months while 833 ran, and the reason turned out to be one thing: Windows events nest their payload under `System`/`EventData`, one level below anything the engine flattened, so `CommandLine` and `Image` read `None` and no Windows rule could fire however correctly it was written. Fixed in the connector; the engine and matcher are byte-identical. 1,362 imported rules were **refused** with recorded reasons, which matters as much as the 1,770 accepted. **It is a minor: nothing here forces an operator to act** — but the detection surface is 3.1x wider, so a deployment with Windows telemetry should expect more alerts from the same stream. Every product claim is backed by a failing CI test (claim-to-gate matrix at the v11.2.0 cut: 147 rows — 139 GATED / 8 PARTIAL / 0 NO GATE, counted from the table by `scripts/check_claim_gate_matrix.py`, which is the figure to recount rather than to quote). The latest GitHub release with notes and downloads: <https://github.com/beenuar/AiSOC/releases/latest>.
+> **TL;DR for first-time visitors:** AiSOC is on `v17.0.0`, released 2026-10-05. **One breaking change and one number that changes meaning without erroring** — the second is the one to read twice. `POST /api/v1/detection-loop/suggest` and its two `GET /detection-loop/suggestions` reads are removed with their three schemas; no migration is needed because none of them ever worked, since they queried `aisoc_alerts`, `aisoc_detection_rules` and `alerts.evidence`, none of which any migration creates. The governed equivalent is `POST /api/v1/detection-proposals`. The quieter change: **`alerts.total` on `/metrics/dashboard` now counts open work** — `new`, `triaging`, `in_progress` — rather than every alert ever received, and the severity counts beside it are scoped the same way, because the console labels them *Active Alerts* and *Critical — Require immediate action*. A tenant who had resolved everything was still shown their entire historical intake as outstanding, and the number only ever rose. Closed work is now reported separately as `alerts.resolved`. **Every approval was failing**: the dispatch built its principal from two attributes `CurrentUser` has never defined, so the actions service received an empty permission list and refused, while the approval row recorded the decision — the action never ran, for any role, including platform admin. **You can now choose where the model runs**: `make up` is unchanged (CPU, no account, no key), `make up-gpu` layers an NVIDIA device reservation onto the bundled Ollama, and `make up-host-llm` uses an Ollama you already run — the only route to a GPU on Apple Silicon, since Docker Desktop cannot pass Metal into a Linux container. `GET /api/v1/llm/runtime` reports where the model *actually* is by asking Ollama rather than reading the compose file back, because a reservation is a request and a model can still land on the CPU; it answers `unknown` for an idle instance rather than guessing. `POST /api/v1/llm/credentials/test` places one real one-token call, so a revoked key is found at the moment you save it instead of surfacing later as triage quietly falling back. Closed cases can be reopened through `POST /api/v1/cases/{id}/reopen` with a recorded reason; `PATCH` stays forward-only, which is what makes "this case was closed" mean something. Investigations now reason over the alerts' real `raw_event` payloads instead of a restated title, and the groundedness gate covers that path too — refusing to score an empty evidence set rather than demoting everything and appearing to catch hallucination. A period-over-period delta of `-93.75` rendered as `-9375%`; the global time-window selector drove no fetch at all. The chart publishes as **`7.4.0`**. Everything below describes v16.0.1 and earlier, which this release does not change.
+>
+> **Previously:** AiSOC was on `v16.0.1`, released 2026-10-04. **A security release, no breaking changes.** It closes **GHSA-4gx4-x7gm-4xq8**, a high-severity privilege escalation reported by [HaiND](https://github.com/Haind03): the check that decides whether a caller may *confer* authority read the caller's static role, while the check that admits a caller to the route read its database-resolved permissions. Those are two different answers whenever a tenant uses database-backed RBAC — which is the configuration where it matters, since narrowing an account is what those tables are for. A `tenant_admin` deliberately restricted to `users:write` still carried 28 permissions statically and could grant itself the other 27. **If you use the `roles` and `user_roles` tables to restrict accounts, upgrade.** Deployments with no RBAC rows were never exposed, because the static map was already the correct answer for them. The report named one route; the resolver is shared, so five more had it — authoring a role, re-permissioning one, creating a user, delegating to a child tenant, and minting an API key, that last needing no target user and yielding a durable credential. `scripts/check_role_grant_scope.py` gains a direction that fails CI when a grant is measured against the wrong authority; its previous directions passed on the vulnerable tree because they asked only whether a route *reached* the chokepoint, and all six did. Also raises `serialize-javascript` to `>=7.1.2` and `http-cache-semantics` to `>=4.3.0`. The chart publishes as **`7.3.1`**. Everything below describes v16.0.0 and earlier, which this release does not change.
+>
+> **Previously:** AiSOC was on `v16.0.0`, released 2026-10-03. **One breaking change:** the `cases` table is gone and its rows live in `aisoc_cases`. Any SQL of your own against `cases` — a Grafana panel, a scheduled export — now fails with "relation does not exist" rather than returning stale rows, which is the intended behaviour. The theme is a single shape repeated seventeen times: **a mechanism that is complete, tested, and has no caller**, so it passes CI forever while doing nothing. SSO could not sign anyone in — `aisoc_sso_connections` was written by nothing, so every SAML and OIDC callback returned 403 on every deployment, while both handlers were fully tested. MTTA published a confident `0.0` because `alerts.first_seen_at` had no writer. The evidence chain an auditor exports was always `[]`. SLA reporting ran 350 lines of correct arithmetic over an empty table. The console's rule-Approve button could not succeed. The live agent evaluation imported a class that exists only in the historical prototype. And the two case tables never synchronised, so **every case an analyst created was invisible to every case metric** — which is the break above. Measured, not asserted: an agent answering "true positive" to everything scored **1.000** on the detection corpus and now scores **0.727**, because the benign class was derived from `response_class == "monitor"` and those incidents are BloodHound enumeration tagged T1087.002. The first live behavioural run published "unsafe action proposal rate 0.0%", which meant the agent proposed no actions at all; it now reports **not measured** and the verdict flip rate is **9.3%** from one manual run of the 200-incident synthetic corpus against a locally-served `llama3.2:3b`, which is not the model a hosted deployment resolves. New: detection lifecycle with rollback and separation of duties, content packs, alert prioritisation, case queues and escalation, legal hold and residency, workload identity and time-boxed elevation, restore paths for Neo4j/Qdrant/Redis, and inbound translation from Splunk SPL, Sentinel KQL and Elastic EQL — on the 2,005 rules bundled here, 1,734 translate and **1,711 of those only partially**. A 22-page technical guide ships as a PDF with real console screenshots. The chart publishes as **`7.3.0`**. Everything below describes v15.1.0 and earlier, which this release does not change.
+>
+> **Before that:** AiSOC was on `v15.1.0`, released 2026-10-03. **No breaking changes** — two routes are added and none removed, so every generated SDK client keeps working. The theme is the gap between a capability existing and a user reaching it: `v15.0.0` closed thirteen security defects sharing the shape *a control that exists, passes its tests and never runs*, and this release applies the same reading to the product. Playbooks could not act at all — `find_matching()` had no production caller, so no playbook had ever run from an alert, and the `approval` step was documented as a durable pause with nowhere to suspend to. A tenant's detection tuning never reached the streaming engine, so a rule turned off in the console kept firing. Every CloudTrail event collapsed onto a single alert, which a one-event pipeline test cannot reveal. Three things are worth reading before upgrading: **first run changed substantially** (`make up` resolves a port conflict instead of refusing to start, measured at 64 seconds from clone to signed-in console on a host with 5432 and 11434 both taken, and a new tenant lands on a setup wizard), **CloudTrail users will see more alerts**, and **the project-maturity table now means something** — `Stable` has a written definition in `docs/audit/MATURITY_DEFINITION.md` and a gate, and the two rows that claimed CI coverage which existed nowhere were fixed rather than relabelled. New: signed, replayable evidence bundles at `GET /api/v1/investigations/{run_id}/bundle`, byte-identical across exports with prompts as digests and an OCSF 1.9.0 mapping checked against the published schema before use; and a copilot that cites every checkable claim to a ledger entry or labels it **uncited**. On the benchmark page, **verdict accuracy is published as *not measured*, with the reason** — every labelled corpus here is entirely malicious by construction, so an agent answering "true positive" to everything would post 100%, and `scripts/score_replay_set.py` refuses such a corpus with a test asserting this tree's own two are refused. The chart publishes as **`7.2.0`**. Everything below describes v15.0.0 and earlier, which this release does not change.
 
 ---
 
 ## What's new
 
-`VERSION` is `11.2.0`. The **v11.2.0** release (2026-09-26) answers a question that had been asked of this repository for months — *why 833 rules and not 5,000?* — and the answer was not a missing feature.
+`VERSION` is `17.0.0`. The **v17.0.0** release (2026-10-05) removes three
+`/detection-loop/suggest*` routes that never worked — they queried three
+relations no migration creates, so every caller was already receiving an
+error — and changes one number's meaning without erroring, which is the
+change to read twice: **`alerts.total` on `/metrics/dashboard` now counts
+open work rather than every alert ever received**, with the severity counts
+beside it scoped the same way. A panel charting cumulative intake from that
+field will drop to the size of your queue; closed work moved to
+`alerts.resolved`.
+
+It also fixes an approval path that had never once succeeded — the dispatch
+read two attributes the principal class does not define, so the actions
+service received an empty permission list and refused while the approval row
+recorded the decision — and adds a choice of **where the model runs**:
+`make up` unchanged on CPU, `make up-gpu` for an NVIDIA device, or
+`make up-host-llm` for an Ollama you already run, which is the only route to a
+GPU on Apple Silicon. `GET /api/v1/llm/runtime` reports where the model
+actually is by asking Ollama rather than reading the compose file back, and
+`POST /api/v1/llm/credentials/test` finds a bad provider key at the moment you
+save it. Closed cases can be reopened with a recorded reason. The full entry
+is in [`CHANGELOG.md`](CHANGELOG.md).
+
+The **v16.0.1** release (2026-10-04) was a security
+release closing one high-severity privilege escalation
+(**GHSA-4gx4-x7gm-4xq8**): a grant was measured against the caller's static
+role rather than the permissions it was admitted on, so an account narrowed
+through the database-backed RBAC tables could confer on itself anything its
+unnarrowed role carried. Six routes shared the defect, not the one reported.
+Upgrade if you use `roles` and `user_roles` to restrict accounts; a
+deployment with no RBAC rows was never exposed. The full entry is in
+[`CHANGELOG.md`](CHANGELOG.md).
+
+The **v16.0.0** release (2026-10-03) carried one
+breaking change: the `cases` table is gone and its rows live in
+`aisoc_cases`, so SQL of your own against the old name now fails loudly
+rather than returning stale rows. It closes seventeen defects sharing one
+shape — a mechanism that is complete, tested, and has no caller — of which
+the most visible is that SAML and OIDC sign-in returned 403 on every
+deployment because the connection table had no writer. The full entry is in
+[`CHANGELOG.md`](CHANGELOG.md).
+
+The **v15.0.0** release (2026-10-01) is a security
+release closing **thirteen defects**, each found by reading the code at
+`v14.0.0` and each shipped with a reproduction that fails on the untouched
+tree for the stated reason.
+
+The ones with the widest blast radius: an **AI triage could teach the platform
+to stop showing an attacker their own alerts** — three AI verdicts at ≥0.90
+confidence on one evidence signature auto-closed every later alert sharing it,
+and the corroboration threshold was never a mitigation because the attacker
+picks how many alerts to send. **Both SSO handlers minted a signed session for
+an identity nobody authenticated**, and since `python3-saml` was declared in no
+install path, that branch was the *only* reachable path through the SAML
+assertion consumer on every deployment. **Six of the seven `mssp_*` tables had
+no row-level security**, so the query predicate was the single control between
+one MSSP's portfolio and another's. And an operator could **grant a permission
+in the console, watch it appear in the UI, and have 275 of 302 routes ignore
+it**.
+
+Two are breaking and are tabled in the `### BREAKING` sections of
+[`CHANGELOG.md`](CHANGELOG.md): `/api/v1/shifts` is removed and
+`/api/v1/threatintel/stix` reads answer 404 outside demo mode; and
+`ENVIRONMENT` defaults to `production` on every documented path, which turns
+several previously silent warnings into boot refusals. Upgrading is `make up`.
+
+Three findings are worth more than the fixes. **A real database caught what a
+static gate could not**: the obvious MSSP policies are mutually recursive and
+Postgres answers `infinite recursion detected` on the first `SELECT`, while
+`check_rls_policy_shape.py` passed throughout — shape is not liveness.
+**Adding one keyword broke four writer signatures and no test failed on the
+exception**, because the call sits inside `contextlib.suppress`; what surfaced
+was a zero write-count in an unrelated replay test three files away.
+And **the first design for database-backed permissions was wrong**: resolving
+inside the permission check would have made a transient database fault deny
+every request on the platform, so resolution happens at authentication and
+fails *open* to the static map, deliberately.
+
+The claim-to-gate matrix is at **255 rows, all GATED**. The chart publishes as
+**`7.1.0`**.
+
+`VERSION` was `14.0.0`. The **v14.0.0** release (2026-09-29) closes a HIGH
+privilege-escalation advisory by scoping every grant to the granter: no
+principal may confer a role, an API-key scope or an organisation membership
+beyond what it holds itself, and the two wildcard roles are unreachable from
+any API route. Six routes accepted authority from a request body and only one
+was reported; `scripts/check_role_grant_scope.py` names all nine handlers when
+run against the tree before the fix. The `### BREAKING` section of
+[`CHANGELOG.md`](CHANGELOG.md) tables the change per route.
+
+`VERSION` was `13.0.1`. The **v13.0.1** patch (2026-09-29) shipped no application
+change at all: it is the tag push that puts the corrected Helm chart into GHCR
+as **`6.0.1`**, the first 6.x a user can actually pull. v13.0.0 left the
+chart's own `version` at `5.9.2` while moving `appVersion`, and `helm push`
+replaces without a word, so that coordinate meant `v12.3.2` or `v13.0.0`
+depending on when it was fetched. The correction landed on `main` after the
+tag and could not reach the registry from there — `release.yml` gates its
+GHCR login, push and resolve steps on `github.event_name == 'push'`, so a
+dispatch packages and lints and then stops on purpose. `scripts/check_chart_version.py`
+now refuses the whole class before the push rather than after it. Everything
+in the rest of this section describes **v13.0.0**, which this patch leaves
+untouched.
+
+The **v13.0.0** release (2026-09-29) works the
+identity-only route debt down from **103 to 28** across five reviewed changes
+by resource area, using only permissions that already existed in
+`ROLE_PERMISSIONS`. It is a major because the break is behavioural: several
+surfaces move to `settings:write`, which `soc_analyst`, `soc_lead` and
+`threat_hunter` do not hold, so this is the first of these three releases where
+a principal other than `viewer` loses access. Read the `### BREAKING` section
+of [`CHANGELOG.md`](CHANGELOG.md) before upgrading — it names every route, the
+permission it now requires, the roles that lose it, and the two ways to restore
+access (a role that holds the permission, or the permission added to a custom
+role or an API key's `scopes`). Two permission choices were rejected for
+causing an outage rather than fixing a hole, and the rejections are pinned by
+tests: `rules:write` on the hunt workbench would have locked out
+`soc_analyst`, the role the `/hunt` page exists for, and `settings:write` on
+`/insider-threat` would have taken watchlisting away from the analysts the
+module is for.
+
+**v13.0.0 highlights (September 29, 2026)**
+- **75 routes gated, 28 deliberately left.** The remainder is not a backlog
+  with no owner: eight SCIM routes authenticate a purpose-bound provisioning
+  credential that has no role for `require_permission` to consult, four
+  `/mssp/organizations` routes authorize through an organisation owner/admin
+  check that a tenant role cannot substitute for, eleven are self-scoped to
+  the caller's own row, and the last five carry a stated product question.
+  `POST /kb/query` and `POST /community/plugins/{id}/rate` are pinned
+  *ungated* by tests, so changing them takes a decision.
+- **`POST /mssp/organizations` was an escalation into the part of that module
+  that did authorize.** Founding an organisation makes the caller the `owner`
+  that `_admin_scope` accepts, and the route was open to any authenticated
+  user, so a read-only role could mint itself an administering principal in
+  one request. It was found by a structural test asserting no state-changing
+  route in the module is unguarded, not by reading the module.
+- **Compliance evidence collection and review now take two different
+  permissions**, so a `soc_lead` can produce an evidence item and cannot
+  accept it. That is a role-level separation and weaker than the person-level
+  separation of duties `services/actions` enforces on response approvals —
+  migration 013 records `reviewed_by` and no collector column, so there is
+  nobody to compare an approver against, and the stronger check is not
+  claimed anywhere.
+- **314 new tests, per route and in both directions.** Against the pre-fix
+  tree the five suites fail 30/49, 35/55, 41/64, 45/65 and 44/68; `services/api`
+  goes 3,537 → 3,819 passing with no unrelated test moving.
+
+**v12.3.2 highlights (September 29, 2026)**
+
+The **v12.3.2** release wires eleven
+`require_permission` dependencies that FastAPI had been discarding, found
+by sweeping the sibling modules for the omission behind
+GHSA-wj5c-88hg-5926. The **v12.3.1** release earlier the same day is a
+security patch: two reported advisories fixed, no feature change and nothing breaking.
+It follows v12.3.0 the same day because a fix that sits on `main` is not a fix
+anyone running the published images has.
+
+**v12.3.1 highlights (September 29, 2026)**
+- **GHSA-p37g-cjqx-56hq (critical) — SQL injection in the osquery allowlist.**
+  A denylist that scanned rendered SQL for `--`, `/*` and `;` had never
+  listed `'`. All six templates were injectable, not the one reported, since
+  the numeric parameters were never coerced. Parameters now declare a type
+  and anything else is refused, not escaped.
+- **GHSA-wj5c-88hg-5926 (high) — missing function-level authorization.** Every
+  remediation write route authenticated and none authorized, so a `viewer`
+  could raise the tenant to L4 and pre-approve a high blast-radius verb. Now
+  enforced on all six routes, including one the advisory does not name.
+- **The router also committed before serialising**, returning HTTP 500 on a
+  write that had already landed — so the regression tests assert the
+  transaction did not commit rather than checking a status code.
+- **A gate that asks whether a route authorizes**, not merely whether it
+  authenticates: 103 of 246 state-changing routes make no authorization
+  decision, recorded as a ceiling that can only fall.
+
+
+**v12.3.0 highlights (September 29, 2026)**
+- **Six deferrals closed, one recurring shape.** 8b (every shipped prompt
+  registered, 3 -> 22, with the gate failing in both directions), 9b
+  (approvals nobody answered now expire, safe default `rejected`), 5b (dead
+  letters replayable from the Kafka offset, re-validated by the validator that
+  refused them), 10b (the ingest checkpoint is a declared contract rather than
+  an optional method 83 of 84 connectors lacked), 6b (a tenant's projected
+  storage $/mo beside its LLM $/mo), and 3.5+ (the demo stack has a measured
+  budget, 3m06s -> 1m39s).
+- **A skipped upload no longer reports as a successful publish**, and
+  something finally asks the registry after a release instead of reading the
+  workflow's own result.
+- **The weekly security digest stopped grading a repository A/100 across
+  sources it could not read.** It had headlined an all-clear derived from one
+  of three declared sources, and a byte-identical body each week froze
+  `updated_at` so six consecutive successful runs looked abandoned.
+- **Both grading-integrity controls are required now**, taking branch
+  protection to 24 contexts, and deliberately only the two that report on a
+  pull request: their two siblings skip there, and a skipped required check
+  counts as passing.
+- **A marketplace card counting playbooks was labelled Executable** — the
+  number was right and the word was wrong, which in this repository means
+  something specific.
+- **Seventeen dependency updates**, with the SQLAlchemy 2.1.1 bumps checked
+  against the greenlet hazard that reddened this repo before, and the `mcp`
+  2.0 major refused with the signature diff that shows why.
+
+
+**v12.2.0 highlights (September 28, 2026)**
+- **Four package READMEs told you to install packages that do not exist.** Each
+  deferred to `v8.0+`, a release that shipped four major versions ago, so the
+  label read as availability. None of the eight first-party packages has ever
+  been uploaded — the registries return 404 for all eight — while the release
+  workflow's publish jobs report success, because only the upload step is
+  credential-gated. A gate now asks the registry instead of trusting the
+  workflow.
+- **The claim-to-gate matrix is complete**: 238 rows, all GATED, no PARTIAL
+  and no NO GATE. Phase 4 stays unchecked, because a funded hosted-model key
+  is not something code can supply.
+- **Completion bounds now reach the bundled model.** They had been rendered as
+  `max_completion_tokens`, which Ollama ignores silently, so every investigator
+  call was effectively unbounded — one ran to 40,960 tokens.
+- **CI installs each service's committed lock as an exact closure**, so the
+  version CI grades is the version the image ships.
+
+The full inventory — 11 entries — lives under `[12.2.0]` in [`CHANGELOG.md`](CHANGELOG.md).
+
+---
+
+## v12.1.0 (2026-09-28)
+
+A security and correctness release: several controls were reading a description of the system rather than the system. Full detail under `[12.1.0]` in [`CHANGELOG.md`](CHANGELOG.md).
+
+---
+
+## v12.0.0 (2026-09-28)
+
+The release where two services stopped serving unauthenticated. Full detail under `[12.0.0]` in [`CHANGELOG.md`](CHANGELOG.md).
+
+---
+
+## v11.2.0 (2026-09-26)
+
+`VERSION` was `11.2.0`. The **v11.2.0** release (2026-09-26) answers a question that had been asked of this repository for months — *why 833 rules and not 5,000?* — and the answer was not a missing feature. (Claim-to-gate matrix at the v11.2.0 cut: 147 rows — 139 GATED / 8 PARTIAL / 0 NO GATE, counted from the table by `scripts/check_claim_gate_matrix.py`, which is the figure to recount rather than to quote.)
 
 **Nothing in this release requires you to act, which is why it is a minor.** There is no configuration change, no migration and no API change. The connector fix only *adds* fields: it lifts the `System` and `EventData` containers into the namespace the matcher already read, and a connector-normalized key still wins on collision. What does change is that 2,603 rules evaluate where 833 did, and 1,687 of the additions are Windows rules that could never fire before — so expect more alerts from the same stream. Every imported rule carries its `upstream_status` onto the alert, so the 125 `experimental` ones can be filtered without disabling the rest.
 

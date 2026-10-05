@@ -3,7 +3,7 @@
 The official Python SDK for building AiSOC plugins — custom enrichers,
 response actions, and data-source connectors.
 
-> **Status — monorepo today, PyPI in v8.0.** Until the package lands on PyPI, install from the monorepo source path below. The import path (`aisoc_plugin_sdk`) and API surface stay identical once it ships.
+> **Status — monorepo today, not yet on PyPI.** `pip install aisoc-plugin-sdk` does not resolve; install from the monorepo source path below. The import path (`aisoc_plugin_sdk`) and API surface stay identical once it ships.
 
 ## Installation
 
@@ -12,8 +12,10 @@ response actions, and data-source connectors.
 git clone https://github.com/beenuar/AiSOC.git
 cd AiSOC && pip install -e "packages/plugin-sdk-py[dev]"
 
-# v8.0+ (once aisoc-plugin-sdk lands on PyPI):
-pip install aisoc-plugin-sdk
+# Not yet on PyPI — the upload is blocked on registry credentials,
+# which is an account action rather than a code change. Until then, install
+# from source with the command above.
+#   pip install aisoc-plugin-sdk
 ```
 
 ## Quick Start

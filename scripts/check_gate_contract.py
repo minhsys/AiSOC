@@ -137,6 +137,33 @@ ANY_SHAPE = "*"
 #: both shapes out for the other four would have duplicated four paragraphs
 #: to express "no change".
 EMPTY_TREE_EXCEPTIONS: dict[str, dict[str, tuple[str, str]]] = {
+    "resolve_port_conflicts.py": {
+        ANY_SHAPE: (
+            "passed",
+            "Not a check of the repository. It asks the operating system which TCP ports are "
+            "held and moves AiSOC off the ones that are, so `make up` resolves a conflict "
+            "instead of refusing to start. Exit 0 means 'no port is in use', which is a real "
+            "finding about the host rather than a tree it never opened — and the one piece of "
+            "repository content it does read, the port inventory in scripts/doctor.sh, it "
+            "refuses to run without: a bare tree missing that file exits 1 with the reason, "
+            "Its --self-test proves the two properties that have already been wrong once, the "
+            "probe reporting a held port as held and the overlay using `ports: !override`.",
+        )
+    },
+    "compare_eval_runs.py": {
+        ANY_SHAPE: (
+            "inconclusive",
+            "Not a check of the repository. It is a two-input comparator: it takes --before and "
+            "--after eval reports and publishes the delta between them, so there is no tree for "
+            "it to credit and argparse correctly refuses a probe that supplies neither. Asking "
+            "it whether an empty tree is clean is a question it cannot be asked, rather than one "
+            "it answers wrongly. What it must get right instead is refusing comparisons that "
+            "would read as results, and that is covered by scripts/tests/test_compare_eval_runs.py "
+            "in both directions: an axis measured before and not after reports 'not comparable' "
+            "rather than a -0.62 regression, two runs over different datasets are refused "
+            "outright, and a balanced pair still compares so the refusals are not vacuous.",
+        )
+    },
     "wet_eval_check.py": {
         ANY_SHAPE: (
             "passed",
@@ -146,6 +173,21 @@ EMPTY_TREE_EXCEPTIONS: dict[str, dict[str, tuple[str, str]]] = {
             "from the job graph rather than from anything intrinsic. There is no tree for it to credit, "
             "so its --self-test checks the verdict it does render: should_run across present, absent, "
             "partial and dry-run secrets.",
+        )
+    },
+    "check_backup_restore_parity.py": {
+        ANY_SHAPE: (
+            "passed",
+            "Its entire subject is scripts/backup.sh and scripts/restore.sh, and scripts/ is the "
+            "one directory the scratch tree has to keep for a gate to be runnable at all. So the "
+            "probe cannot pose the question: the two files it compares are present in the scratch "
+            "tree, it reads them, and exit 0 is a real finding about a tree it genuinely opened "
+            "rather than a tree it never did. The same situation as security_audit's "
+            "validate-ignores arm below, for the same reason. The case the probe is reaching for "
+            "— a tree where those files are absent — is covered directly: the gate exits 2 naming "
+            "the directory it looked in, verified by running it from a bare repository, and it "
+            "exits 2 again if backup.sh declares no backup functions, so a parse that silently "
+            "matched nothing cannot read as parity either.",
         )
     },
     "security_audit.py": {

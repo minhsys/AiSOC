@@ -15,7 +15,7 @@
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { Suspense, useEffect, useState } from 'react';
-import { authApi } from '@/lib/api';
+import { API_BASE, authApi, onboardingApi } from '@/lib/api';
 import { isDemoMode } from '@/lib/demoMode';
 
 type Phase = 'idle' | 'pending' | 'success' | 'error';
@@ -64,12 +64,60 @@ function LoginInner() {
   const [password, setPassword] = useState('');
   const [phase, setPhase] = useState<Phase>('idle');
   const [error, setError] = useState<string | null>(null);
+  const [sso, setSso] = useState<{ sso_enabled: boolean; provider: string; login_label: string; local_login_enabled: boolean } | null>(null);
+
+  // An SSO round-trip lands here with the session in the fragment; consume
+  // it before the stored-token redirect below can read a still-empty store.
+  const [handoffPending] = useState(() =>
+    typeof window !== 'undefined' && window.location.hash.includes('access_token='),
+  );
+  useEffect(() => {
+    if (!handoffPending) return;
+    authApi.completeSsoHandoff().then((ok) => {
+      if (ok) router.replace(next);
+      else setError('The SSO sign-in could not be completed. Try again or sign in with your password.');
+    });
+  }, [handoffPending, next, router]);
 
   useEffect(() => {
     if (authApi.isAuthenticated()) {
       router.replace(next);
     }
   }, [next, router]);
+
+  useEffect(() => {
+    let alive = true;
+    authApi.ssoStatus().then((s) => {
+      if (alive) setSso(s);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+/**
+ * Where to send someone after they sign in.
+ *
+ * A tenant with nothing connected and no alerts used to land on
+ * `/dashboard`: every tile zero and nothing saying what to do next. They
+ * go to the setup wizard instead.
+ *
+ * Only when the caller did not ask for somewhere specific. An expired
+ * session that bounced someone off `/alerts` should return them to
+ * `/alerts`, not to a wizard they have seen before.
+ *
+ * Never throws. Failing to work out where to land is not a reason to
+ * fail a sign-in that already succeeded.
+ */
+async function landingRoute(requested: string): Promise<string> {
+  if (requested && requested !== '/dashboard') return requested;
+  try {
+    const status = await onboardingApi.status();
+    return status.first_run ? '/onboarding' : requested || '/dashboard';
+  } catch {
+    return requested || '/dashboard';
+  }
+}
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -80,7 +128,7 @@ function LoginInner() {
     try {
       await authApi.login(email.trim(), password);
       setPhase('success');
-      router.replace(next);
+      router.replace(await landingRoute(next));
     } catch (err) {
       console.error('[login] failed', err);
       setPhase('error');
@@ -160,6 +208,28 @@ function LoginInner() {
           )}
 
           {/* Form */}
+          {sso?.sso_enabled && (
+            <div className="mb-4">
+              <a
+                href={`${API_BASE}/auth/${sso.provider === 'saml' ? 'saml/login' : 'oidc/login'}?redirect=${encodeURIComponent(next)}`}
+                className="w-full inline-flex items-center justify-center gap-2 rounded-xl border border-indigo-500/40 bg-indigo-500/10 px-4 py-2.5 text-sm font-semibold text-indigo-200 hover:bg-indigo-500/20 transition"
+                data-testid="sso-login-button"
+              >
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} aria-hidden="true">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75A2.25 2.25 0 004.5 12.75v6.75a2.25 2.25 0 002.25 2.25z" />
+                </svg>
+                {sso.login_label || 'Continue with SSO'}
+              </a>
+              {sso.local_login_enabled ? (
+                <div className="my-4 flex items-center gap-3 text-[11px] uppercase tracking-widest text-zinc-600">
+                  <span className="h-px flex-1 bg-zinc-800" />
+                  or
+                  <span className="h-px flex-1 bg-zinc-800" />
+                </div>
+              ) : null}
+            </div>
+          )}
+
           <form onSubmit={submit} className="space-y-4" noValidate>
             <label className="block">
               <span className="block text-xs uppercase tracking-wider text-zinc-500 mb-2">

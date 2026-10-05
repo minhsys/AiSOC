@@ -42,21 +42,50 @@ Rotate `SECRET_KEY` periodically. Doing so invalidates every active session, whi
 
 ### Single Sign-On (SSO)
 
-AiSOC supports two enterprise SSO protocols out of the box:
+:::info Sign-in completes; the IdP test matrix does not yet
 
-- **OIDC** — configured via `services/api/app/auth/oidc.py`. Point AiSOC at your IdP's discovery URL, set the client ID/secret, and map IdP groups to AiSOC roles in the role mapping config. Common IdPs tested: Okta, Entra ID (Azure AD), Google Workspace, Auth0.
-- **SAML 2.0** — configured via `services/api/app/auth/saml.py`. Upload your IdP metadata XML or set the `SAML_IDP_METADATA_URL`. Group-to-role mapping uses the same shape as OIDC.
+Both protocols now **complete a sign-in**: the callback provisions a local
+user just in time, binds the tenant from the configured connection, maps IdP
+groups to a role, and issues the same bearer token `POST /auth/login` issues,
+signed with the same key.
 
-Both providers issue the same internal JWT after authentication, so authorization (RBAC, RLS) works identically regardless of how the user signed in.
+The tenant comes from the connection row an administrator configured, never
+from the assertion. An identity provider that can name its own tenant can
+name somebody else's, so reading `tenant_id` from a claim would be a
+cross-tenant provisioning hole.
+
+A group can map to `viewer`, `soc_analyst`, `threat_hunter`, `soc_lead` or
+`tenant_admin`. It cannot map to `admin` or `platform_admin`: `v14.0.0` made
+those unreachable from every API route so only `bootstrap_admin` can mint
+one, and a group mapping would be a way back in.
+
+**Still outstanding**: the end to end CI test against a containerised test
+identity provider. What is published here is tested against the provisioning
+path, not against a real Okta, Entra or Keycloak.
+
+:::
+
+The two protocols:
+
+- **OIDC**, in `services/api/app/auth/oidc.py`. Discovery URL, client id and
+  secret, and IdP group to role mapping.
+- **SAML 2.0**, in `services/api/app/auth/saml.py`. IdP metadata by file or by
+  URL, with the same group mapping shape as OIDC.
+
+Both are intended to issue the same internal bearer token, so that RBAC and
+RLS apply identically however a user signed in.
 
 ### Multi-Factor Authentication
 
 Two MFA paths are available:
 
 - **WebAuthn / passkeys** — implemented in [`services/api/app/api/v1/endpoints/passkeys.py`](https://github.com/beenuar/AiSOC/blob/main/services/api/app/api/v1/endpoints/passkeys.py). Required for the [Responder PWA](../intro) (`/responder/*` route). Passkey-only login means there is no password fallback for on-call responders — you authenticate with the device, biometric, or hardware key the user registered.
-- **TOTP** — standard 6-digit time-based codes for analyst console accounts when SSO is not in use. Backup codes are generated at enrolment and shown once.
+- **TOTP**, with backup codes and per-role enforcement, is **planned and not
+  implemented**. No TOTP enrolment, verification or backup-code path exists in
+  the tree. Restored by parity 4.2.
 
-Both MFA methods are enforced per-user, configurable per-role: tenant admins can require MFA for any role they choose.
+Passkeys are enforced for the Responder PWA. **Per-role MFA enforcement for the
+console is not implemented**; it arrives with parity 4.2.
 
 ### API keys
 
@@ -93,9 +122,39 @@ Defined in [`ROLE_PERMISSIONS`](https://github.com/beenuar/AiSOC/blob/main/servi
 
 Wildcards are supported (`*` grants everything). For everything else, the check is exact string match — no implicit hierarchies, no inherited verbs. This is deliberate: it keeps the permission list auditable.
 
+### Role grants are scoped to the granter
+
+The table above is the whole reason this section exists. Two of those roles hold `*`, so a single role string decides whether an account has every permission in the product — and `POST /api/v1/tenants/me/users` used to take that string from the request body and store it with no allow-list and no comparison against the caller. A `tenant_admin`, which is scoped on purpose, could create a `platform_admin`, sign in as it, and reach `roles:write` and `plugins:admin` (GHSA-pm3f-h6gc-rvgp).
+
+[`app/core/role_grants.py`](https://github.com/beenuar/AiSOC/blob/main/services/api/app/core/role_grants.py) is the one place that decides a grant, and the rule is about the granter rather than the route:
+
+**No principal may confer authority it does not itself hold.**
+
+Concretely, a grant is refused when the role is not in `ROLE_PERMISSIONS` at all (`422`), when it confers a permission the caller lacks (`403`), or when it is one of the roles nobody may confer from a request (`403`). Three consequences are worth stating outright:
+
+- **`platform_admin` and `admin` are unreachable from every API route**, including for a caller that already holds `*`. Every route that could mint one resolves its tenant from the caller's own session, so a wildcard principal created through one is a deployment-wide administrator made through a single tenant's door. The only way to create one is [`app/scripts/bootstrap_admin.py`](https://github.com/beenuar/AiSOC/blob/main/services/api/app/scripts/bootstrap_admin.py), which runs out of band with database credentials.
+- That set is **derived** from `ROLE_PERMISSIONS`, not listed. A role declared `["*"]` tomorrow is un-grantable the moment it is declared.
+- A `tenant_admin` can still create and promote to every other role, including `tenant_admin`. What it can no longer do is create something above itself.
+
+The same rule covers authority that is not spelled "role": API-key scopes (a key is a bearer credential, so its scopes must be a subset of its minter's — the check this replaced named `("platform_admin", "tenant_admin")` in a tuple and covered only `*`, which let a `tenant_admin` mint a wildcard key and let anyone with `users:write` mint a `plugins:admin` key they were themselves refused), the database-backed RBAC roles below, MSSP delegations, and organisation membership, where an `admin` may neither appoint an `owner` nor demote the sitting one.
+
+#### "Does not itself hold" means the permissions the caller was admitted on
+
+A principal's authority resolves in three tiers, in this order: an API key's `scopes`, then the database-backed RBAC tables, then the static `ROLE_PERMISSIONS` map. `require_permission` — the door on every route — implements all three. The grant check implemented the first and the third, so a caller admitted through the middle tier had its grant measured against a different authority than the one that let it in (GHSA-4gx4-x7gm-4xq8, reported by [HaiND](https://github.com/Haind03)).
+
+That gap is only reachable when a tenant uses database-backed roles, and it is exactly the configuration where it hurts: narrowing an account is what those tables are *for*. A `tenant_admin` restricted to `users:write` in `user_roles` still carried 28 permissions statically, so it could assign itself a role carrying any of the other 27 and resolve them on its next request. Six routes shared the defective resolver, not the one the report named — authoring a role, re-permissioning one, assigning one, creating a user, delegating to a child tenant, and minting an API key. The last needs no target user and yields a durable credential.
+
+The resolver now reads the same three tiers in the same order, so the authority that admits a caller is the authority that bounds what it confers. A tenant with no RBAC rows resolves nothing and keeps conferring exactly what its static role confers.
+
+[`scripts/check_role_grant_scope.py`](https://github.com/beenuar/AiSOC/blob/main/scripts/check_role_grant_scope.py) fails CI if a handler binds a request model declaring `role`, `org_role`, `granted_role`, `scopes`, `role_id` or `permission_ids` without reaching that module. Run against the tree before the fix it names all nine handlers, which is why it exists instead of an allow-list on the route the report happened to name.
+
+It also fails if a call to `authorize_role_grant`, `authorize_role_change` or `authorize_permission_grant` omits `granter_permissions=`. That direction exists because the first one passed on the vulnerable tree: it asked whether each route *reached* the chokepoint, and all six did. Reaching the right function while handing it the wrong authority is indistinguishable from a correct grant unless something checks the argument.
+
 ### Custom roles
 
 Custom roles can be defined by inserting rows into the `roles` table with the desired permission list. They are scoped per-tenant; one tenant's `compliance_auditor` does not bleed into another's.
+
+These rows are a live authorization path rather than documentation: `CurrentUser.has_permission_db` resolves `user_roles` → `role_permissions` → `permissions` and prefers it over `ROLE_PERMISSIONS` for any principal holding a row. So authoring a role, and attaching one to a user, are both grants and both go through the check above — a caller may not build or hand out a permission set larger than its own.
 
 ### Permission denied vs. not found
 
@@ -387,6 +446,20 @@ The chain is **per-tenant** so tenant operations stay isolated. Legacy rows that
 The set of hashed fields is deliberately conservative — `tenant_id`, `actor_id`, `actor_email`, `actor_ip`, `action`, `resource`, `resource_id`, the **redacted** `changes`, `metadata_`, `created_at`, and the row `id`. Adding a hashed field is a chain-breaking schema change.
 
 The log is **append-only**: there is no `UPDATE` or `DELETE` endpoint, and the table has RLS enabled so a tenant can only read their own events. The middleware that auto-populates audit on common write paths is [`services/api/app/middleware/audit_middleware.py`](https://github.com/beenuar/AiSOC/blob/main/services/api/app/middleware/audit_middleware.py); high-value actions (case state transitions, playbook executions, credential rotations) call `emit_audit(...)` explicitly so the `changes` payload is precise. Both paths participate in the hash chain.
+
+#### Serialized append, and why a fork was possible before it
+
+Appending to a hash chain is a read-modify-write on a shared head, and until migration `074_audit_chain_serialized_append.sql` nothing made the read and the write atomic. Two writers could resolve the same head and both append to it, and the chain forked. A fork is indistinguishable from a removed row, so `verify_chain()` reports it as broken — correctly.
+
+The commonest case was a single request with two writers: a handler's `emit_audit(...)` on the request session and the middleware's row on a session of its own. Three things close it, and each answers a different question:
+
+* **One writer per request.** The middleware now writes only when the request produced no audit row of its own. This is what makes serializing safe at all — the middleware runs *before* the request session's dependency teardown, so making it wait on the handler's transaction waits on something that cannot commit until the middleware returns.
+* **A per-tenant append lock.** `audit_chain_head` holds one row per tenant with the current head and the next chain position. Appenders take a row lock on it, so concurrent appends for a tenant queue rather than race. There is deliberately **no lock timeout**: waiting is correct, and timing out drops an audit row, which is worse than a fork because a missing row is undetectable.
+* **A unique index that makes a fork unrepresentable.** `uq_audit_log_chain_successor` is `UNIQUE (tenant_id, COALESCE(prev_hash, ''))`. A fork *is* two rows claiming the same predecessor, so the database cannot store one. This guarantee does not depend on the lock being taken or on any application code behaving.
+
+`chain_index` records the position the writer actually chained at, so a replay reads rows in the order they were written instead of inferring it from `(created_at, id)` — which ties on a random UUID when two rows share a microsecond. A gap in that sequence is direct evidence of a deleted row.
+
+**Rows written before the change were not re-chained.** Rewriting an append-only log so that a known-broken history reads as clean is the integrity problem the chain exists to detect. The discontinuity is recorded instead: `chain_epoch` is 1 for pre-074 rows and 2 for rows from the serialized writer, the unique index covers epoch 2 only, and `GET /api/v1/health/audit-chain` reports breaks split by epoch. A deployment that forked before the change will keep reporting those breaks, permanently and on purpose; the number to alert on is `replay_breaks_since_serialized_writer`, which cannot be historical.
 
 For SOC 2 / ISO 27001 evidence collection, the [Compliance service](https://github.com/beenuar/AiSOC/blob/main/services/api/app/services/compliance.py) reads from this log directly — there is no separate compliance event store to keep in sync.
 

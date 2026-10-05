@@ -234,16 +234,21 @@ does not.
 
 | Profile | Services |
 | --- | --- |
-| *(default — CORE)* | **postgres** (5432) · **redis** (6379) · **zookeeper** · **kafka** (9092) · **qdrant** (6333) · **litellm** (4000, LLM gateway) · **ollama** (11434, local model) · **ollama-pull** (one-shot model fetch) · **ingest-worker** (8081, Go) · **fusion** (8003) · **api** (8000) · **agents** (8001) · **threatintel** (8005) · **realtime** (8086) · **web** (3000) |
-| `full` | **clickhouse** (8123/9000) · **neo4j** (7474/7687) · **opensearch** (9200) · **ueba** (8007) · **connectors** (8088) · **enrichment** (8080, Go) · **kafka-ui** (8090) · **actions** (8002) |
+| *(default — CORE)* | **postgres** (5432) · **redis** (6379) · **zookeeper** · **kafka** (9092) · **qdrant** (6333) · **litellm** (4000, LLM gateway) · **ollama** (11434, local model) · **ollama-pull** (one-shot model fetch) · **ingest-worker** (8081, Go) · **fusion** (8003) · **api** (8000) · **agents** (8001) · **threatintel** (8005) · **realtime** (8086) · **web** (3000) · **connectors** (8088) · **actions** (8002) |
+| `full` | **clickhouse** (8123/9000) · **neo4j** (7474/7687) · **opensearch** (9200) · **ueba** (8007) · **enrichment** (8080, Go) · **kafka-ui** (8090) |
 | `extras` | **honeytokens** (8008) · **purple-team** (8006) |
-| `chatops` | **slack-bot** (8009) · **actions** (8002) |
+| `chatops` | **slack-bot** (8009) |
 | `monitoring` | **prometheus** (9091) · **grafana** (3001) · **alertmanager** (9094) · **tempo** (3200) · **otel-collector** (4317/4318) |
 | `osquery` | **osquery-tls** (8091) |
 
-CORE is 14 long-running services — 15 counting `ollama-pull`, which fetches
-the model once and exits — and `full` is 22; `actions` is in both `full` and
-`chatops`, so it is counted once. Named profiles compose, so
+CORE is 16 long-running services, or 17 counting `ollama-pull`, which fetches
+the model once and exits, and `full` is 22. `connectors` and `actions` moved
+into CORE because the API service in CORE already pointed at both and
+federated search defaults on, so the capability was enabled and aimed at a
+hostname that does not resolve; the measured cost of moving them is 124.8 MiB
+([ADR-0007](https://github.com/beenuar/AiSOC/blob/main/docs/decisions/0007-connectors-and-actions-in-core.md)).
+They are now in no profile, which means every profile run includes them, so
+`chatops` still gets `actions` for `slack-bot`. Named profiles compose, so
 `docker compose --profile full --profile extras up -d` is valid; it just does
 not wait for health the way `make up-full` does.
 
@@ -265,6 +270,27 @@ left the default install routing a key nobody had
   cost, because the gateway reports it.
 - **If no model is reachable at all**: every alert takes the deterministic
   path and the console labels it as such. Nothing pretends the AI ran.
+
+**Where that model runs is a separate choice**, and `make up` takes the one
+that works everywhere: CPU. Three alternatives:
+
+| | Command | Works on |
+|---|---|---|
+| NVIDIA GPU | `make up-gpu` | Linux, Windows + WSL2 |
+| An Ollama you already run | `make up-host-llm` | everything, and the **only** GPU route on a Mac |
+| A hosted provider | configured in the console | everything |
+
+`make doctor` says which fits the host you are on, and
+`GET /api/v1/llm/runtime` says which is in effect right now — asking Ollama
+rather than reading the compose file back, because a GPU reservation is a
+request and a model can still land on the CPU.
+
+On Apple Silicon `make up-gpu` cannot help: Docker Desktop does not pass the
+Metal GPU into a Linux container, so a container there is CPU-only whatever is
+reserved. A natively-installed Ollama does use Metal, which is what
+`make up-host-llm` points at. The preflight says this rather than letting you
+find out slowly. Full detail: [Where the model
+runs](./operations/where-the-model-runs).
 
 ### Database migrations — nothing to run
 
@@ -424,7 +450,7 @@ You should see the operator commands: `serve`, `db`, `mcp`, `submit`,
 aisoc serve
 ```
 
-Under the hood this runs `docker compose -f infra/compose/docker-compose.dev.yml up -d`
+Under the hood this runs `docker compose -f docker-compose.yml -f infra/compose/docker-compose.dev.yml up -d`
 against the dev profile. The command resolves the repo root automatically, so
 it works from any subdirectory.
 
@@ -548,13 +574,17 @@ aisoc mcp install --host <editor>
 
 `aisoc mcp serve` prefers the local TypeScript build at
 `services/mcp/dist/index.js` when present, and falls back to
-`npx @aisoc/mcp` otherwise — so it works on a fresh clone before you've
-run `pnpm build`.
+`npx @aisoc/mcp` otherwise.
+
+**Run `pnpm build` first.** `@aisoc/mcp` is not published to npm yet
+(`registry.npmjs.org/@aisoc/mcp` answers 404), so on a fresh clone the
+fallback cannot resolve and only the local build works. Publishing is tracked
+with the rest of the package work.
 
 ### 7. Tear down
 
 ```bash
-docker compose -f infra/compose/docker-compose.dev.yml down
+docker compose -f docker-compose.yml -f infra/compose/docker-compose.dev.yml down
 ```
 
 Or keep the stack running and re-submit different fixtures — `aisoc

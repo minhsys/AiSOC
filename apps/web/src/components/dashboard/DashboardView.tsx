@@ -17,6 +17,8 @@
 import React, { Component, Suspense, type ErrorInfo, type ReactNode, useState, useEffect, useRef, useCallback } from 'react';
 import useSWR from 'swr';
 import { metricsApi, type DashboardMetrics } from '@/lib/api';
+import { useTimeWindow } from '@/components/layout/TimeWindowProvider';
+import { TIME_WINDOW_LONG_LABEL, TIME_WINDOW_SHORT_LABEL } from '@/lib/timeWindow';
 import { clsx } from 'clsx';
 import dynamic from 'next/dynamic';
 import Link from 'next/link';
@@ -227,14 +229,31 @@ function MetricCard({ label, value, sub, color = 'blue', trend }: MetricCardProp
  *                     data for this panel. Say *that*, and point at the thing
  *                     that would produce some.
  */
+/**
+ * Three states, not two.
+ *
+ * This had an error branch and an empty branch, and the error branch runs
+ * first — which reads as complete right up until you notice that the empty
+ * branch is also what renders *before* the request lands. On first paint,
+ * with no data and no error yet, `/dashboard` asserted "No alerts in the last
+ * 24 hours": a measured claim about a window nothing had looked at, made
+ * milliseconds before the failing request came back.
+ *
+ * `pending` is the missing third state. It covers the request still being in
+ * flight and the request having answered without the figures this panel needs
+ * — both are "not measured", and neither is a report of zero.
+ */
 function PanelUnavailable({
   error,
+  pending,
   onRetry,
   emptyTitle,
   emptyDescription,
   action,
 }: {
   error?: unknown;
+  /** The answer is not in. Never claim a measurement. */
+  pending?: boolean;
   onRetry?: () => void;
   emptyTitle: string;
   emptyDescription: string;
@@ -247,6 +266,15 @@ function PanelUnavailable({
         description="The metrics API did not respond. Nothing is rendered here rather than a placeholder number."
         error={error}
         onRetry={onRetry}
+        className="px-4 py-6"
+      />
+    );
+  }
+  if (pending) {
+    return (
+      <EmptyState
+        title="Not loaded yet"
+        description="Waiting on the metrics API. This panel will say what it found once it answers."
         className="px-4 py-6"
       />
     );
@@ -429,9 +457,24 @@ function useDashboardLayout() {
 // ─── Main Dashboard ───────────────────────────────────────────────────────────
 
 export function DashboardView() {
-  const { data: rawMetrics, error: metricsError, mutate: mutateMetrics } = useSWR(
-    'dashboard-metrics',
-    () => metricsApi.getDashboard(),
+  // The global selector in the header. Every fetch below binds to it, so
+  // changing the window actually changes what is shown -- it used to drive
+  // nothing at all.
+  const { window: timeWindow } = useTimeWindow();
+
+  const {
+    data: rawMetrics,
+    error: metricsError,
+    isLoading: metricsLoading,
+    mutate: mutateMetrics,
+  } = useSWR(
+    // The window is part of the key, which is the whole fix: it was the
+    // constant string 'dashboard-metrics', so SWR served one cache entry for
+    // every window and the selector could not have refetched even if it had
+    // asked. A key that does not name its inputs is a cache that cannot
+    // distinguish them.
+    ['dashboard-metrics', timeWindow],
+    () => metricsApi.getDashboard(timeWindow),
     {
       fallbackData: demoFallback(MOCK_METRICS),
       refreshInterval: 60000,
@@ -477,12 +520,28 @@ export function DashboardView() {
         }
       : null;
 
+  /**
+   * Whether these panels have anything measured to report.
+   *
+   * Both halves matter. `metricsLoading` is the request still being in flight,
+   * which is the first-paint case. `!metrics` also covers the request having
+   * answered with a payload that carries no alert totals — equally unmeasured,
+   * and equally not a zero. A panel reached through either branch must not
+   * describe a result.
+   */
+  const metricsPending = metricsLoading || (!metrics && !metricsError);
+
   const sources = metrics?.sources ?? [];
   const topMitre = metrics?.topMitre ?? [];
   const activeSourceCount = sources.filter((s) => s.status === 'active').length;
 
+  const periodLabel = TIME_WINDOW_SHORT_LABEL[timeWindow] ?? '';
+  const trendTimeFmt =
+    (timeWindow) === '7d' || (timeWindow) === '30d'
+      ? 'MMM d'
+      : 'HH:mm';
   const trendData = (metrics?.alertsTrend ?? []).map((d) => ({
-    time: format(new Date(d.timestamp), 'HH:mm'),
+    time: format(new Date(d.timestamp), trendTimeFmt),
     count: d.count,
   }));
 
@@ -505,13 +564,13 @@ export function DashboardView() {
 
     // PR-3 / W1: Six-tile funnel KPI strip (events → correlations → alerts +
     // signal/noise, MTTD, analyst queue) backed by /api/v1/metrics/funnel.
-    'funnel-kpis': <FunnelKpiBar period="24h" />,
+    'funnel-kpis': <FunnelKpiBar period={timeWindow} />,
 
     // PR-3 / W1+W9: Efficiency ratios (correlation efficiency, alert yield,
     // MITRE coverage) alongside per-stage pipeline health.
     'efficiency-and-pipeline': (
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <EfficiencyReport period="24h" />
+        <EfficiencyReport period={timeWindow} />
         <PipelineHealth />
       </div>
     ),
@@ -537,20 +596,20 @@ export function DashboardView() {
                 funnel strip above does publish real deltas. */}
             <MetricCard
               label="Active Alerts"
-              value={metrics.alerts.total}
-              sub={`${metrics.alerts.new} new today`}
+              value={metrics.alerts.active ?? metrics.alerts.total}
+              sub={`${metrics.alerts.total} in last ${periodLabel}`}
               color="blue"
             />
             <MetricCard
-              label="Critical"
-              value={metrics.alerts.critical}
-              sub="Require immediate action"
-              color="red"
+              label="Critical Active"
+              value={metrics.alerts.criticalActive ?? metrics.alerts.critical}
+              sub={`${metrics.alerts.resolved ?? 0} resolved`}
+              color={metrics.alerts.criticalActive ? 'red' : 'gray'}
             />
             <MetricCard
               label="Open Cases"
               value={metrics.cases.open}
-              sub={`${metrics.cases.inProgress} in progress`}
+              sub={`${metrics.cases.inProgress} in progress · ${metrics.cases.openedThisWeek ?? 0} opened / ${metrics.cases.closedThisWeek ?? 0} closed (7d)`}
               color="orange"
             />
             {/* `mttr` is hours and this rendered it with an `m` suffix, so a
@@ -582,6 +641,7 @@ export function DashboardView() {
         ) : (
           <PanelUnavailable
             error={metricsError}
+            pending={metricsPending}
             onRetry={retryMetrics}
             emptyTitle="No dashboard metrics yet"
             emptyDescription="Connect a data source to start populating alert, case and MTTR counters."
@@ -594,17 +654,20 @@ export function DashboardView() {
       <div className="grid grid-cols-3 gap-4">
         <div className="col-span-2 bg-gray-900/60 border border-gray-800/60 rounded-xl p-5">
           <div className="flex items-center justify-between mb-4">
-            <h3 className="text-sm font-medium text-gray-300">Alert Volume (24h)</h3>
-            <span className="text-xs text-gray-500">Last 24 hours</span>
+            <h3 className="text-sm font-medium text-gray-300">Alert Volume ({periodLabel})</h3>
+            <span className="text-xs text-gray-500">Last {periodLabel}</span>
           </div>
           {trendData.length > 0 ? (
             <RechartsArea data={trendData} />
           ) : (
             <PanelUnavailable
               error={metricsError}
+              pending={metricsPending}
               onRetry={retryMetrics}
-              emptyTitle="No alerts in the last 24 hours"
-              emptyDescription="The volume curve plots hourly alert counts once alerts start arriving."
+              emptyTitle={`No alerts in the last ${TIME_WINDOW_LONG_LABEL[
+                timeWindow
+              ].replace(/^Last /, '')}`}
+              emptyDescription="The volume curve plots alert counts once alerts start arriving."
             />
           )}
         </div>
@@ -628,6 +691,7 @@ export function DashboardView() {
           ) : (
             <PanelUnavailable
               error={metricsError}
+              pending={metricsPending}
               onRetry={retryMetrics}
               emptyTitle="No severity data"
               emptyDescription="Severity counts appear once the API returns alert metrics."
@@ -646,6 +710,7 @@ export function DashboardView() {
           ) : (
             <PanelUnavailable
               error={metricsError}
+              pending={metricsPending}
               onRetry={retryMetrics}
               emptyTitle="No technique coverage yet"
               emptyDescription="Tactics rank by alert count once detections start firing."
@@ -657,6 +722,7 @@ export function DashboardView() {
           {sources.length === 0 ? (
             <PanelUnavailable
               error={metricsError}
+              pending={metricsPending}
               onRetry={retryMetrics}
               emptyTitle="No sources connected"
               emptyDescription="Connect a data source and its event volume appears here."

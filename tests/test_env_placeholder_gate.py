@@ -68,15 +68,22 @@ DELIBERATE_DEFAULTS: dict[str, str] = {
     "AISOC_AGENTS_URL": "the compose hostname the console proxies agent calls to",
     "AISOC_REALTIME_URL": "the compose hostname the console proxies WS/SSE to",
     "AISOC_DEMO_MODE": "a boolean; false is the correct value for every deployment that is not the public demo",
+    "AISOC_GPU_COUNT": (
+        "a device count, not a secret. 1 is the right value for every host with one "
+        "GPU, and it is only read by `make up-gpu` — the default `make up` ignores it"
+    ),
+    "RETRO_HUNT_ENABLED": (
+        "a boolean, and off is the correct value for every deployment: a sweep reads back "
+        "over a tenant's history, which is a cost and a privacy decision, so it waits for "
+        "both this switch and the tenant's own opt-in"
+    ),
     "AISOC_REALTIME_TICKET_TTL_SECONDS": "a duration",
     "CONNECTORS_SERVICE_URL": "the compose hostname of the connectors service",
     "CONNECTORS_SERVICE_TIMEOUT_SECONDS": "a duration",
-    "POSTGRES_PASSWORD": "dev Postgres password; works out of the box, documented as changeable",
-    "AISOC_APP_DB_PASSWORD": "dev password for the runtime DB role; same reasoning",
-    "DATABASE_URL": "a DSN built from the two passwords above",
+    "DATABASE_URL": "a DSN that references the generated passwords rather than repeating them",
     "DATABASE_MIGRATION_URL": "the owner-role DSN used only by the migration runner",
-    "REDIS_URL": "dev Redis DSN",
-    "CLICKHOUSE_URL": "dev ClickHouse DSN",
+    "REDIS_URL": "a DSN that references REDIS_PASSWORD rather than repeating it",
+    "CLICKHOUSE_URL": "a DSN that references CLICKHOUSE_PASSWORD rather than repeating it",
     "KAFKA_BOOTSTRAP_SERVERS": "a host:port",
     "OPENSEARCH_URL": "a URL",
     "QDRANT_URL": "a URL",
@@ -94,9 +101,6 @@ DELIBERATE_DEFAULTS: dict[str, str] = {
     "SPLUNK_SCHEME": "a URL scheme",
     "SPLUNK_VERIFY_SSL": "a boolean, and the secure default",
     "AWS_REGION": "a region",
-    "NEXT_PUBLIC_API_URL": "a localhost URL",
-    "NEXT_PUBLIC_REALTIME_URL": "a localhost URL",
-    "NEXT_PUBLIC_WS_URL": "a localhost URL",
 }
 
 #: The exact strings the old grep failed to match. Pinned as a regression test:
@@ -145,6 +149,22 @@ def test_every_shipped_value_is_either_a_placeholder_or_a_declared_default() -> 
     )
 
 
+def test_no_declared_default_outlives_the_value_it_describes() -> None:
+    """The list above runs in one direction only unless this runs the other.
+
+    A row whose variable no longer ships a non-empty value is prose nobody
+    checks: `POSTGRES_PASSWORD` sat here described as "works out of the box,
+    documented as changeable" for as long as the template shipped
+    `aisoc_dev_secret`, and would have kept saying so after it stopped.
+    """
+    live = {key for _lineno, key, value in _example_entries() if value.strip() and not check_env_placeholders.is_placeholder(value)}
+    stale = sorted(set(DELIBERATE_DEFAULTS) - live)
+    assert not stale, (
+        "these are declared as real defaults but .env.example no longer ships a non-empty "
+        f"value for them: {stale}. Remove the row, or the description outlives the value."
+    )
+
+
 @pytest.mark.parametrize("value", HISTORICAL_PLACEHOLDERS)
 def test_the_detector_still_catches_every_placeholder_this_repo_has_shipped(value: str) -> None:
     assert check_env_placeholders.is_placeholder(value), (
@@ -188,6 +208,39 @@ def test_generated_secrets_ship_empty(key: str) -> None:
         f".env.example ships {key}={values[-1]!r}. It must ship empty: the vault treats empty as "
         "'not configured' and takes its documented development path, while any other invalid value "
         "raises and surfaces as HTTP 500 at the connector wizard."
+    )
+
+
+#: Prose that states, in words, how many secrets first run generates. Each is
+#: a place a reader is told a number; none of them was derived from anything.
+_COUNTED_IN_PROSE = (
+    ("README.md", "generates the **{word}** secrets in it"),
+    ("apps/docs/docs/deployment/docker.md", "generates the {word} secrets the stack needs"),
+)
+
+_NUMBER_WORDS = ("zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen").split()
+
+
+def test_the_published_count_is_the_real_count() -> None:
+    """A count copied into prose goes stale silently.
+
+    README said "the **six** secrets" while `GENERATED` held ten, because the
+    two lists were maintained by hand and compared by nothing — the same
+    shape as the detector-versus-template drift this file exists for. The
+    number is spelled in words on purpose (it reads better in a sentence),
+    so it is derived and compared rather than matched loosely.
+    """
+    expected = _NUMBER_WORDS[len(ensure_env.GENERATED)]
+    stale: list[str] = []
+    for relative, template in _COUNTED_IN_PROSE:
+        text = (REPO / relative).read_text(encoding="utf-8")
+        if template.format(word=expected) not in text:
+            found = [w for w in _NUMBER_WORDS if template.format(word=w) in text]
+            stale.append(f"  {relative}: says {found or ['nothing matching the sentence']}, should say {expected!r}")
+    assert not stale, (
+        f"scripts/ensure_env.py generates {len(ensure_env.GENERATED)} secrets and these disagree:\n"
+        + "\n".join(stale)
+        + "\n\nIf the sentence was reworded, update _COUNTED_IN_PROSE in this file so it keeps being checked."
     )
 
 

@@ -3,6 +3,7 @@
 from fastapi import APIRouter
 
 from app.api.v1.endpoints import (
+    agent_tools,
     agents,
     airgap,
     alert_explain,
@@ -15,21 +16,23 @@ from app.api.v1.endpoints import (
     audit,
     auth,
     autonomy_policy,
+    branding,
     business_context,
     cases,
     community,
     compliance,
+    compliance_framework,
     connectors,
     costs,
     data_lifecycle,
     deployment,
     detection_compat,
-    detection_loop,
     detection_proposals,
     detection_rules,
     easm,
     effective_permissions,
     email_approval,
+    evaluations,
     federated,
     feedback,
     fusion,
@@ -44,17 +47,20 @@ from app.api.v1.endpoints import (
     insider_threat,
     insights,
     investigations,
+    kill_switch,
     knowledge_base,
     lake,
     live_actions,
     llm_credentials,
     llm_status,
     marketplace,
+    mcp_servers,
     metrics,
     mssp,
     nl_detection,
     nl_query,
     oauth,
+    onboarding,
     oncall,
     passkeys,
     phishing,
@@ -69,17 +75,21 @@ from app.api.v1.endpoints import (
     replay,
     report_builder,
     reports,
+    retro_hunts,
     rule_tuning,
     sandbox,
     saved_hunts,
     saved_views,
-    shifts,
+    scim_tokens,
     sla,
+    sso_connections,
     stix_taxii,
     tenant_provision,
+    tenant_skills,
     tenants,
     threat_intel,
     translation,
+    usage,
     waitlist,
 )
 
@@ -108,7 +118,12 @@ api_router.include_router(connectors.router)
 # swaps the code, encrypts tokens via the credential vault, and lands the
 # operator back on /onboarding.
 api_router.include_router(oauth.router)
+# The setup wizard the console shows a first-run tenant instead of an
+# empty dashboard, plus the sample-data button it offers an evaluator who
+# does not yet have credentials for anything.
+api_router.include_router(onboarding.router, prefix="/onboarding", tags=["onboarding"])
 api_router.include_router(tenants.router)
+api_router.include_router(usage.router)
 api_router.include_router(detection_rules.router)
 # Frontend-shape facade: /api/v1/detection/rules + /api/v1/detection/test
 api_router.include_router(detection_compat.router)
@@ -120,6 +135,12 @@ api_router.include_router(detection_proposals.router)
 # Mutations stamp suppression_config and write detection.tuning.* audit log.
 api_router.include_router(rule_tuning.router)
 api_router.include_router(federated.router)
+# The typed surface an investigation agent reaches a customer's SIEM, EDR,
+# IdP and cloud audit trail through. Deliberately beside `federated`: it
+# reuses that endpoint's fan-out rather than building a second one, and adds
+# the typed query, the per-tenant advertisement and the caps an agent needs
+# and a console does not.
+api_router.include_router(agent_tools.router)
 api_router.include_router(graph.router)
 api_router.include_router(playbooks.router)
 # One playbook step, graded on its own capability, through the same governed
@@ -129,9 +150,21 @@ api_router.include_router(playbook_steps.router)
 api_router.include_router(plugins.router)
 api_router.include_router(community.router)
 api_router.include_router(marketplace.router)
+api_router.include_router(mcp_servers.router)
+# Gap-closure Phase 6.1 and 6.2: tenant-authored investigation skills:
+# authored in YAML, validated against the tools this tenant's agent can
+# actually call, backtested through the Phase 1 replay with and without the
+# skill, and only then activated. The agents service resolves the active set
+# on the path of an investigation.
+api_router.include_router(tenant_skills.router)
 api_router.include_router(rbac.router)
 api_router.include_router(audit.router)
+api_router.include_router(branding.router)
 api_router.include_router(compliance.router)
+# After `compliance.router`, deliberately. The per-framework routes are
+# `/{framework}`, which compiles to `[^/]+` and would swallow the sibling
+# literals `/frameworks`, `/evidence` and `/report` if it matched first.
+api_router.include_router(compliance_framework.router)
 api_router.include_router(metrics.router)
 # Pipeline health snapshot — v1.5 SOC Console parity.
 # /health/pipeline returns the 5-stage ingest→normalize→fuse→correlate→alert
@@ -146,6 +179,7 @@ api_router.include_router(health.router)
 api_router.include_router(insights.router)
 api_router.include_router(sla.router)
 api_router.include_router(investigations.router)
+api_router.include_router(kill_switch.router)
 
 # Public investigation-replay publishing — v8 W3.
 # /ledger/{run_id}/publish[/preview] (auth) turns a tenant-private ledger into
@@ -191,6 +225,10 @@ api_router.include_router(live_actions.router)
 # list pages. Per-user-per-tenant CRUD; tenant scoping via RLS, user
 # scoping in the API layer (every query filters on user_id).
 api_router.include_router(saved_views.router)
+# Administering SCIM credentials, which is a console action. The SCIM
+# surface those credentials authenticate is mounted at /scim/v2 in main.py.
+api_router.include_router(scim_tokens.router)
+api_router.include_router(sso_connections.router)
 
 # Wave 3 — operational maturity
 api_router.include_router(assets.router)
@@ -217,7 +255,6 @@ api_router.include_router(business_context.router)
 api_router.include_router(nl_detection.router)
 
 # Closed-loop detection engineering: FP → LLM Sigma draft → DAC proposal (Tier 2)
-api_router.include_router(detection_loop.router)
 
 # Natural-language query → ES|QL / SPL / KQL translation + execution (Tier 2)
 api_router.include_router(nl_query.router)
@@ -246,6 +283,11 @@ api_router.include_router(phishing.router)
 # provider, and air-gapped mode permits local providers only.
 api_router.include_router(sandbox.router)
 
+# Gap-closure Phase 1.4 — replay evaluation: triage measured against this
+# tenant's own analysts on their own closed findings. Distinct from
+# `replay.router` above, which publishes a redacted ledger to a share link.
+api_router.include_router(evaluations.router)
+
 # Knowledge-base + RAG over org docs/runbooks (Tier 3)
 api_router.include_router(knowledge_base.router)
 
@@ -255,6 +297,7 @@ api_router.include_router(posture.router)
 api_router.include_router(easm.router)
 api_router.include_router(identity_graph.router)
 api_router.include_router(reports.router)
+api_router.include_router(retro_hunts.router)
 
 # Wave 7 — customizable dashboard / report builder
 api_router.include_router(report_builder.router)
@@ -280,7 +323,6 @@ api_router.include_router(llm_credentials.router)
 api_router.include_router(stix_taxii.router)
 
 # Shift handoff and SOC analyst scheduling
-api_router.include_router(shifts.router)
 
 # Deployment configuration and air-gap bundle management
 api_router.include_router(deployment.router)

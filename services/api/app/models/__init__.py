@@ -3,6 +3,7 @@
 from app.db.database import Base
 from app.models.alert import Alert
 from app.models.asset import AlertAssetCorrelation, Asset, AssetVulnerability
+from app.models.branding import OrgBrandAsset, OrgBranding
 from app.models.case import Case, CaseTask, CaseTimeline
 from app.models.connector import Connector
 from app.models.detection_proposal import DetectionEvalBaseline, DetectionRuleProposal
@@ -18,6 +19,7 @@ from app.models.investigation import (
     InvestigationRun,
 )
 from app.models.llm_credential import TenantLlmCredential
+from app.models.mcp_server import McpServer
 from app.models.mssp import (
     MSSPDelegation,
     MSSPRuleOverride,
@@ -46,6 +48,7 @@ from app.models.responder import (
 )
 from app.models.saved_hunt import SavedHunt
 from app.models.saved_view import SavedView
+from app.models.scim import ScimGroup, ScimGroupMember, ScimToken, ScimUser
 from app.models.tenant import ApiKey, Tenant, User
 from app.models.threat_intel import ThreatActor, ThreatIntelFeed, ThreatIntelIOC
 
@@ -82,13 +85,20 @@ __all__ = [
     "MSSPTenantMetrics",
     "MSSPTenantNote",
     "OAuthAppCredential",
+    "OrgBrandAsset",
+    "OrgBranding",
     "Organization",
+    "ScimGroup",
+    "ScimGroupMember",
+    "ScimToken",
+    "ScimUser",
     "OrganizationMember",
     "OrganizationMemberTenant",
     "OrganizationTenant",
     "OAuthState",
     "TenantInboxToken",
     "TenantLlmCredential",
+    "McpServer",
     "PasskeyCredential",
     "PasskeyChallenge",
     "OnCallStatus",

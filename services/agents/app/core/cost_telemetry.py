@@ -66,7 +66,7 @@ from typing import Any
 import structlog
 
 from app.core.gateway_cost import GatewayCost, extract_gateway_cost, extract_resolved_model
-from app.core.schema_bootstrap import ensure_table
+from app.core.schema_bootstrap import ensure_columns, ensure_table
 
 logger = structlog.get_logger()
 
@@ -283,6 +283,17 @@ CREATE INDEX IF NOT EXISTS aisoc_run_costs_tenant_run
     ON aisoc_run_costs (tenant_id, run_id);
 """
 
+#: The columns ``_RUN_COSTS_PROVENANCE_DDL`` adds, listed so the writer can
+#: ask whether they are there before asking for the privilege to add them.
+_RUN_COSTS_PROVENANCE_COLUMNS = (
+    "measured_cost_usd",
+    "measured_call_count",
+    "estimated_cost_usd",
+    "estimated_call_count",
+    "unpriced_call_count",
+    "resolved_model",
+)
+
 #: Cost provenance, added by ``services/api/migrations/063_cost_provenance.sql``.
 #: Applied here too because this writer has to run against a database whose
 #: migrations it does not own, and a write that silently drops the provenance
@@ -322,14 +333,15 @@ async def _get_pool() -> Any | None:
             if not await ensure_table(conn, "aisoc_run_costs", _RUN_COSTS_DDL):
                 await pool.close()
                 return None
-            try:
-                await conn.execute(_RUN_COSTS_PROVENANCE_DDL)
-            except Exception as exc:  # noqa: BLE001
-                # The runtime role may hold DML only, in which case migration
-                # 055 is the one that adds these. Loud enough to diagnose a
-                # dashboard stuck on "not measured", quiet enough not to fail
-                # the run: the token counts still land.
-                logger.warning("cost_telemetry.provenance_columns_unavailable", error=str(exc))
+            # Probe before altering, for the same reason as the table above:
+            # ownership is checked before `IF NOT EXISTS`, so this raised
+            # `must be owner of table aisoc_run_costs` on every run against a
+            # database where all six columns were already present and being
+            # written. `ensure_columns` reports only when they are genuinely
+            # absent, and never fails the run either way — the token counts
+            # still land, and a dashboard stuck on "not measured" is
+            # diagnosable from the message it now prints.
+            await ensure_columns(conn, "aisoc_run_costs", _RUN_COSTS_PROVENANCE_COLUMNS, _RUN_COSTS_PROVENANCE_DDL)
         _POOL = pool
         return _POOL
     except Exception as exc:
@@ -459,6 +471,18 @@ class CostTracker:
 
     _token: Any = field(default=None, init=False, repr=False)
 
+    # ── In-loop budget enforcement (parity 2.6) ──────────────────────────
+
+    @property
+    def tokens_used(self) -> int:
+        """Prompt plus completion tokens across every call in this run."""
+        return sum(r.prompt_tokens + r.completion_tokens for r in self._records)
+
+    @property
+    def calls_made(self) -> int:
+        """How many model calls this run has placed."""
+        return len(self._records)
+
     async def __aenter__(self) -> CostTracker:
         # Bind into the current context so nested agents can find us.
         self._token = _current_tracker.set(self)
@@ -546,6 +570,14 @@ class CostTracker:
         return sum(1 for r in self._records if r.cost_source == UNPRICED)
 
     @property
+    def prompt_tokens(self) -> int:
+        return sum(r.prompt_tokens for r in self._records)
+
+    @property
+    def completion_tokens(self) -> int:
+        return sum(r.completion_tokens for r in self._records)
+
+    @property
     def total_tokens(self) -> int:
         return sum(r.prompt_tokens + r.completion_tokens for r in self._records)
 
@@ -566,6 +598,11 @@ class CostTracker:
         reading a key by that name has no way to ask how it was arrived at.
         Anything that needs one dollar figure should use ``measured_cost_usd``
         and say "not measured" when ``measured_call_count`` is zero.
+
+        The prompt/completion split is rolled up alongside the total because
+        every ``CallRecord`` already carries both and the summary was the only
+        place the split was dropped — a consumer wanting per-investigation
+        token shape had to re-estimate numbers the tracker had measured.
         """
         return {
             "run_id": self.run_id,
@@ -575,6 +612,8 @@ class CostTracker:
             "estimated_cost_usd": self.estimated_cost_usd,
             "estimated_call_count": self.estimated_call_count,
             "unpriced_call_count": self.unpriced_call_count,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
             "total_tokens": self.total_tokens,
             "total_latency_ms": self.total_latency_ms,
             "call_count": len(self._records),

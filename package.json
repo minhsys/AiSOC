@@ -33,7 +33,7 @@
     "eval:public": "python3 scripts/run_evals.py --out eval_report.json && python3 scripts/render_eval_charts.py eval_report.json",
     "marketplace:build": "python3 scripts/build_marketplace.py",
     "marketplace:check": "python3 scripts/build_marketplace.py --check",
-    "marketplace:sync": "python3 scripts/build_marketplace.py && python3 scripts/curate_detections.py && cp marketplace/index.json apps/web/public/marketplace/index.json && cp marketplace/curated.json apps/web/public/marketplace/curated.json && echo 'marketplace/index.json + curated.json built and synced to apps/web/public/'",
+    "marketplace:sync": "python3 scripts/build_marketplace.py && python3 scripts/curate_detections.py && cp marketplace/curated.json apps/web/public/marketplace/curated.json && echo 'marketplace index built and synced to apps/web/public/ and services/api/app/data/'",
     "marketplace:curate": "python3 scripts/curate_detections.py",
     "marketplace:curate:check": "python3 scripts/curate_detections.py --check",
     "aisoc:lab": "bash scripts/lab.sh",
@@ -51,10 +51,10 @@
     "demo:public:setup": "bash infra/cloudflare/tunnel.sh"
   },
   "devDependencies": {
-    "@types/node": "^26.1.1",
-    "prettier": "^3.9.5",
+    "@types/node": "^26.6.3",
+    "prettier": "^3.9.9",
     "tsx": "^4.23.15",
-    "turbo": "^2.10.7",
+    "turbo": "^2.11.4",
     "typescript": "^6.0.3"
   },
   "engines": {
@@ -64,6 +64,7 @@
   "packageManager": "pnpm@8.15.1",
   "pnpm": {
     "overrides": {
+      "axios": ">=1.20.0 <2",
       "shell-quote": ">=1.8.4",
       "form-data": ">=4.0.6",
       "ws": ">=8.21.0",
@@ -79,6 +80,7 @@
       "http-proxy-middleware": ">=2.0.10 <4",
       "launch-editor": ">=2.14.1 <3",
       "uuid": ">=11.1.1 <12",
+      "webpack-dev-middleware": ">=7.4.6 <8",
       "webpack-dev-server": ">=5.2.6 <6",
       "@babel/plugin-transform-modules-systemjs": ">=7.29.4 <8",
       "brace-expansion@1": ">=1.1.18 <2",
@@ -88,7 +90,8 @@
       "ip-address": ">=10.3.1 <11",
       "js-yaml@3": ">=3.15.2 <4",
       "js-yaml@4": ">=4.3.2 <5",
-      "serialize-javascript": ">=7.0.3 <8",
+      "serialize-javascript": ">=7.1.2 <8",
+      "http-cache-semantics": ">=4.3.0 <5",
       "sharp": ">=0.35.4",
       "svgo@3": ">=3.3.5 <4",
       "websocket-driver": ">=0.7.5",

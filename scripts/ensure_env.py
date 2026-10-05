@@ -92,6 +92,107 @@ GENERATED: dict[str, tuple[Callable[[], str], str]] = {
         lambda: secrets.token_urlsafe(32),
         "Shared bearer for service-to-service calls (API -> connectors, ueba, honeytokens, purple-team).",
     ),
+    # Distinct from AISOC_SERVICE_TOKEN: the actions service reaches vendor
+    # APIs and can isolate a host or disable an account, so it does not share
+    # a credential with the read-mostly services above.
+    #
+    # It was absent here while docker-compose.yml said it "must match" on the
+    # api and actions services, so no install had one, and the guard that
+    # reads it exempted itself whenever it was empty and AISOC_DEV_MODE was
+    # set — which it is by default. Generating it is what lets that guard
+    # fail closed without breaking the documented path.
+    "AISOC_ACTIONS_SERVICE_TOKEN": (
+        lambda: secrets.token_urlsafe(32),
+        "Shared bearer for the actions service (API -> actions). Gates every response action.",
+    ),
+    # The agents service's own credential, and the one case where the two
+    # sides could not meet in the middle: eight modules in `services/agents`
+    # read it, and `alert_writeback.service_token_valid` on the API verifies
+    # it *without* falling back to AISOC_SERVICE_TOKEN. Nothing generated it
+    # and no manifest passed it, so on every default install organisation
+    # memory, tenant skills, recent dispositions, identity context,
+    # knowledge-base runbooks, the MCP toolset, the playbook action bridge
+    # and SIEM writeback were all silently off — each logging its own
+    # `no_service_token` warning into a stream nobody reads and returning an
+    # empty result that looks exactly like "this tenant has none".
+    "AISOC_AGENTS_SERVICE_TOKEN": (
+        lambda: secrets.token_urlsafe(32),
+        "Shared bearer between the API and the agents service. Gates triage context, MCP tools and SIEM writeback.",
+    ),
+    "AISOC_API_SERVICE_TOKEN": (
+        lambda: secrets.token_urlsafe(32),
+        "Shared bearer a peer service presents to the API. Gates the agent's customer tools, lake pivots and hunts.",
+    ),
+    # The HS256 key the API signs realtime tickets with and the realtime edge
+    # verifies them against. Both sides previously fell back to a constant
+    # committed to this repository whenever this was unset — which no manifest
+    # ever set — so anyone who could reach the edge could mint a ticket for any
+    # tenant by signing with a published value.
+    "AISOC_REALTIME_JWT_SECRET": (
+        lambda: secrets.token_urlsafe(32),
+        "HS256 key for realtime WebSocket/SSE tickets. Shared by the API (mints) and realtime (verifies).",
+    ),
+    # Service-to-service bearer for realtime's /internal/* fan-out routes.
+    # Their guard treated an unset value as authorized, and nothing set it, so
+    # the routes accepted an arbitrary tenant_id from any caller that could
+    # reach the port.
+    "REALTIME_INTERNAL_TOKEN": (
+        lambda: secrets.token_urlsafe(32),
+        "Bearer for realtime's /internal/* fan-out (API/agents -> realtime). Sent as x-internal-token.",
+    ),
+    # Service-to-service bearer for slack-bot's POST /internal/approval-card,
+    # a route that posts into a workspace channel. Its guard treated an unset
+    # value as "no auth needed" whenever AISOC_DEV_MODE was set, and compose
+    # defaults that flag to 1 while this variable appeared only commented out
+    # in `.env.example` — so nothing generated it and the exemption was the
+    # only state a stock install ran in. Generating it lets the guard require
+    # it unconditionally.
+    "AISOC_INTERNAL_TOKEN": (
+        lambda: secrets.token_urlsafe(32),
+        "Bearer for slack-bot's /internal/approval-card (agents -> slack-bot). Sent as X-AiSOC-Internal-Token.",
+    ),
+    # The two `enforce_secure_defaults` refuses to boot without once
+    # ENVIRONMENT is production, which it now is by default. Neither was
+    # generated while `development` was the default, because in a
+    # development-class environment the check only warns. So flipping the
+    # default without adding these would have turned "anonymous admin" into
+    # "the API will not start", which is a worse first run and not a fix.
+    "METRICS_TOKEN": (
+        lambda: secrets.token_urlsafe(32),
+        "Bearer for /metrics. Prometheus sends it; without it the endpoint is unauthenticated.",
+    ),
+    "JWT_SECRET": (
+        lambda: secrets.token_urlsafe(32),
+        "HS256 key for the session tokens the SAML and OIDC callbacks issue.",
+    ),
+    # The datastore passwords. `.env.example` shipped these as
+    # `aisoc_dev_secret` / `aisoc_app_dev_secret` / `redis_dev_secret` /
+    # `clickhouse_dev_secret`, and `docker-compose.prod.yml` guarded each one
+    # with `${VAR:?… the development default is a published literal}`.
+    # Compose's `:?` rejects an unset or empty variable and cannot look at a
+    # value, so every one of those guards accepted the exact literal its own
+    # message named. `preflight-secrets` in that file refuses the value at
+    # boot; generating them here means a fresh install never holds one.
+    #
+    # Hex rather than urlsafe base64: these travel inside DSNs
+    # (`redis://:$REDIS_PASSWORD@…`) and a `/` or `+` in the userinfo would
+    # have to be percent-encoded by every consumer that builds one.
+    "POSTGRES_PASSWORD": (
+        lambda: secrets.token_hex(24),
+        "Postgres owner role. Owns every table and applies the migration chain; no service connects as it.",
+    ),
+    "AISOC_APP_DB_PASSWORD": (
+        lambda: secrets.token_hex(24),
+        "Postgres runtime role (aisoc_app). DML only, so the row-level-security policies apply to it.",
+    ),
+    "REDIS_PASSWORD": (
+        lambda: secrets.token_hex(24),
+        "Redis AUTH password. Referenced by REDIS_URL rather than repeated inside it.",
+    ),
+    "CLICKHOUSE_PASSWORD": (
+        lambda: secrets.token_hex(24),
+        "ClickHouse event-lake password. Referenced by CLICKHOUSE_URL rather than repeated inside it.",
+    ),
 }
 
 

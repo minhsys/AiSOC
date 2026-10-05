@@ -44,7 +44,7 @@ function safeBase(url: string): string {
   return url;
 }
 
-const API_BASE = safeBase(process.env.NEXT_PUBLIC_API_URL || '');
+export const API_BASE = safeBase(process.env.NEXT_PUBLIC_API_URL || '');
 const AGENTS_BASE = safeBase(process.env.NEXT_PUBLIC_AGENTS_URL || '');
 const ACTIONS_BASE = safeBase(process.env.NEXT_PUBLIC_ACTIONS_URL || '');
 const FUSION_BASE = safeBase(process.env.NEXT_PUBLIC_FUSION_URL || '');
@@ -154,6 +154,105 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * The headers every console call to an AiSOC API must carry.
+ *
+ * Exported because not every call can go through {@link apiRequest}: the
+ * NDJSON and SSE endpoints need the raw `Response` so the caller can read
+ * `response.body`. Those five call sites used to build their own header
+ * object, and every one of them sent `X-Tenant-Id` and no token — which
+ * reads like an identity and is not one. The API authenticates a bearer
+ * token; a tenant header is a caller-supplied claim.
+ *
+ * `X-Tenant-Id` resolves at call time so the tenant switcher applies to the
+ * very next request without a page reload.
+ */
+export function apiHeaders(extra?: HeadersInit): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'X-Tenant-Id': getActiveTenantId(),
+    ...(extra as Record<string, string> | undefined),
+  };
+
+  if (typeof window !== 'undefined') {
+    try {
+      if (!headers.Authorization && !headers.authorization) {
+        const token = window.localStorage.getItem(AUTH_TOKEN_KEY);
+        if (token) headers.Authorization = `Bearer ${token}`;
+      }
+    } catch {
+      /* localStorage unavailable; ignore */
+    }
+  }
+
+  return headers;
+}
+
+
+/**
+ * Whether a JWT's `exp` has passed. True when it cannot be read.
+ *
+ * Deliberately does not verify the signature: the browser cannot, and
+ * this is a usability check rather than a security one. The API verifies
+ * for real, and a forged token simply 401s there.
+ */
+export function isTokenExpired(token: string, nowSeconds?: number): boolean {
+  const parts = token.split('.');
+  if (parts.length !== 3) return true;
+  try {
+    const payload = JSON.parse(
+      atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')),
+    ) as { exp?: number };
+    if (typeof payload.exp !== 'number') return false;
+    // A small skew, so a token that expires mid-request does not bounce
+    // the user out of a page that was working a second ago.
+    const now = nowSeconds ?? Math.floor(Date.now() / 1000);
+    return payload.exp <= now - 5;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Routes that must not trigger the 401 self-heal.
+ *
+ * Signing in is where a 401 means "wrong password", not "your session
+ * died" — redirecting there would replace the form's error message with a
+ * reload of the same form.
+ *
+ * `/auth/register` was listed here for one commit and the console
+ * route-contract gate rejected it: the API serves `login`, `refresh`,
+ * `me` and `me/preferences`, and nothing else under `/auth`. An exemption
+ * for a route that does not exist is dead weight that reads like a
+ * promise.
+ */
+const AUTH_EXEMPT_PATHS = ['/api/v1/auth/login', '/api/v1/auth/refresh'];
+
+/**
+ * Clear a dead session and send the user to sign in again.
+ *
+ * Called on a 401 from any route that is not itself part of signing in.
+ * Without this a user whose token expired mid-session saw every panel
+ * fail with no explanation and no way to recover.
+ */
+function handleUnauthorized(path: string): void {
+  if (typeof window === 'undefined') return;
+  if (AUTH_EXEMPT_PATHS.some((exempt) => path.startsWith(exempt))) return;
+  // Already on the sign-in page: clearing is right, navigating would loop.
+  const onLogin = window.location.pathname.startsWith('/login');
+  try {
+    window.localStorage.removeItem(AUTH_TOKEN_KEY);
+    window.localStorage.removeItem(AUTH_REFRESH_KEY);
+    window.localStorage.removeItem(AUTH_USER_KEY);
+  } catch {
+    /* localStorage unavailable; the redirect below still helps */
+  }
+  if (!onLogin) {
+    const next = encodeURIComponent(window.location.pathname + window.location.search);
+    window.location.assign(`/login?next=${next}`);
+  }
+}
+
 async function request<T>(path: string, options: FetchOptions = {}): Promise<T> {
   const { params, baseUrl, ...fetchOptions } = options;
 
@@ -169,32 +268,7 @@ async function request<T>(path: string, options: FetchOptions = {}): Promise<T> 
     if (qs) url += `?${qs}`;
   }
 
-  const headers: HeadersInit = {
-    'Content-Type': 'application/json',
-    // Resolve at call-time so the tenant switcher takes effect on the very
-    // next fetch (no full page reload needed).
-    'X-Tenant-Id': getActiveTenantId(),
-    ...fetchOptions.headers,
-  };
-
-  // Mobile responder PWA auth: if a passkey-issued JWT is present in
-  // localStorage, attach it as a Bearer token. The desktop console relies on
-  // cookies set by the API gateway, so this is purely additive.
-  if (typeof window !== 'undefined') {
-    try {
-      const existing =
-        (headers as Record<string, string>).Authorization ??
-        (headers as Record<string, string>).authorization;
-      if (!existing) {
-        const token = window.localStorage.getItem('aisoc.responder.accessToken');
-        if (token) {
-          (headers as Record<string, string>).Authorization = `Bearer ${token}`;
-        }
-      }
-    } catch {
-      /* localStorage unavailable; ignore */
-    }
-  }
+  const headers = apiHeaders(fetchOptions.headers);
 
   let response: Response;
   try {
@@ -213,6 +287,11 @@ async function request<T>(path: string, options: FetchOptions = {}): Promise<T> 
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => '');
+    if (response.status === 401) {
+      // Self-heal rather than leaving the user on a page where every
+      // panel fails silently and nothing offers a way back.
+      handleUnauthorized(path);
+    }
     throw new ApiError(
       `API ${response.status} ${response.statusText} — ${path}`,
       response.status,
@@ -222,9 +301,101 @@ async function request<T>(path: string, options: FetchOptions = {}): Promise<T> 
 
   if (response.status === 204) return {} as T;
   // Some endpoints (the agent stream, NDJSON) might not be JSON. Callers that
-  // need streams should use fetch() directly. Here we assume JSON.
+  // need streams should use fetch() with apiHeaders(). Here we assume JSON.
   return (await response.json()) as T;
 }
+
+/**
+ * The credentialed JSON client, for calls with no typed wrapper yet.
+ *
+ * Sixty-one console call sites reached the API with no `Authorization`
+ * header, forty-five of them through a bare `fetch(url)`. They worked only
+ * because the API resolved a credential-free request to a demo administrator
+ * in a development-class environment. Prefer a typed namespace below when one
+ * covers the route; reach for this when none does, rather than for `fetch`.
+ *
+ * `scripts/check_console_auth_headers.py` keeps the class closed.
+ */
+export async function apiRequest<T>(path: string, options: FetchOptions = {}): Promise<T> {
+  return request<T>(path, options);
+}
+
+/**
+ * SWR fetcher that carries a credential.
+ *
+ * SWR calls a fetcher as `f(key)`, so a fetcher has nowhere to put options
+ * and every single-argument fetcher in this console was anonymous by
+ * construction. This one routes through {@link request}, so it also throws
+ * {@link ApiError} with the status intact, which `describeApiFailure` needs
+ * to tell a console bug from an outage.
+ */
+export async function authedFetcher<T>(url: string): Promise<T> {
+  return request<T>(url);
+}
+
+/**
+ * A credentialed `fetch` that returns the raw `Response`.
+ *
+ * For the endpoints whose body is not JSON: NDJSON streams, SSE, PDF and
+ * Markdown downloads. Identical to `fetch` except that the credential and
+ * tenant headers are not optional.
+ */
+export async function apiFetch(path: string, options: FetchOptions = {}): Promise<Response> {
+  const { params, baseUrl, ...fetchOptions } = options;
+  let url = `${baseUrl ?? API_BASE}${path}`;
+  if (params) {
+    const searchParams = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') {
+        searchParams.set(key, String(value));
+      }
+    });
+    const qs = searchParams.toString();
+    if (qs) url += `?${qs}`;
+  }
+  return fetch(url, { ...fetchOptions, headers: apiHeaders(fetchOptions.headers), cache: 'no-store' });
+}
+
+
+// ─── Onboarding ──────────────────────────────────────────────────────────────
+
+export interface SetupStep {
+  key: string;
+  label: string;
+  done: boolean;
+  why: string;
+  href: string | null;
+  detail: string | null;
+}
+
+export interface OnboardingStatus {
+  first_run: boolean;
+  steps: SetupStep[];
+  connectors: number;
+  alerts: number;
+  sample_data_loaded: boolean;
+}
+
+export interface SampleDataResult {
+  accepted: number;
+  rejected: number;
+  scenarios: { key: string; title: string; severity: string; why: string }[];
+  note: string;
+}
+
+/**
+ * What a tenant still has to set up, and the one button that gives an
+ * evaluator something to look at.
+ *
+ * `first_run` is derived from the tenant's own data server-side rather
+ * than from a stored flag, so it stays true if somebody connects a source
+ * through the API or deletes their last one.
+ */
+export const onboardingApi = {
+  status: () => request<OnboardingStatus>('/api/v1/onboarding/status'),
+  loadSampleData: () =>
+    request<SampleDataResult>('/api/v1/onboarding/sample-data', { method: 'POST' }),
+};
 
 // ─── Auth ────────────────────────────────────────────────────────────────────
 
@@ -267,6 +438,20 @@ function persistAuth(tokens: TokenResponse, user: AuthUser): void {
 }
 
 export const authApi = {
+  /**
+   * Public SSO availability for the login screen: whether SSO is offered,
+   * under what label, and whether password sign-in remains open. Reveals
+   * no provider internals; a failure reads as "no SSO" rather than an
+   * error state, so a status outage never blocks the password form.
+   */
+  ssoStatus: async (): Promise<{ sso_enabled: boolean; provider: string; login_label: string; local_login_enabled: boolean }> => {
+    try {
+      return await request('/api/v1/auth/sso/status');
+    } catch {
+      return { sso_enabled: false, provider: 'oidc', login_label: 'Continue with SSO', local_login_enabled: true };
+    }
+  },
+
   /**
    * Email + password login against ``POST /api/v1/auth/login``.
    *
@@ -317,10 +502,59 @@ export const authApi = {
     }
   },
 
+  /**
+   * Whether there is a session that can still make a request.
+   *
+   * This used to answer "is a token stored", which is a different
+   * question and produced an inescapable lockout: `/login` saw a stored
+   * token, redirected to `/dashboard`, every call there 401'd, and
+   * nothing sent the user back. The only way out was clearing browser
+   * storage, which is not a thing to ask of an operator.
+   *
+   * An unreadable or unparseable token counts as **not** authenticated:
+   * the pessimistic answer costs a sign-in, the optimistic one costs the
+   * lockout.
+   */
   isAuthenticated(): boolean {
     if (typeof window === 'undefined') return false;
     try {
-      return Boolean(window.localStorage.getItem(AUTH_TOKEN_KEY));
+      const token = window.localStorage.getItem(AUTH_TOKEN_KEY);
+      if (!token) return false;
+      return !isTokenExpired(token);
+    } catch {
+      return false;
+    }
+  },
+
+  /**
+   * Complete an SSO handoff that the IdP redirected back into the URL
+   * fragment (`#access_token=...&refresh_token=...`). Browsers never send
+   * fragments to servers, so the tokens appear in no access log or Referer
+   * header; this consumes them the moment the login screen mounts, verifies
+   * the access token against `/auth/me`, persists the session exactly like
+   * a password login would, and scrubs the fragment from history so the
+   * tokens do not linger in the address bar or browser session history.
+   */
+  async completeSsoHandoff(): Promise<boolean> {
+    if (typeof window === 'undefined') return false;
+    try {
+      const hash = window.location.hash;
+      if (!hash.includes('access_token=')) return false;
+      const params = new URLSearchParams(hash.replace(/^#/, ''));
+      const accessToken = params.get('access_token');
+      if (!accessToken) return false;
+      const refreshToken = params.get('refresh_token') || '';
+      window.history.replaceState(null, '', window.location.pathname + window.location.search);
+      const res = await fetch(`${API_BASE}/api/v1/auth/me`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      if (!res.ok) return false;
+      const user = await res.json();
+      persistAuth(
+        { access_token: accessToken, refresh_token: refreshToken, token_type: 'bearer', expires_in: 0 },
+        user,
+      );
+      return true;
     } catch {
       return false;
     }
@@ -328,14 +562,9 @@ export const authApi = {
 
   /** Merge user preferences on the server (theme, layout, etc.). */
   async updateUserPreferences(preferences: Record<string, unknown>): Promise<AuthUser> {
-    const token = typeof window !== 'undefined'
-      ? window.localStorage.getItem(AUTH_TOKEN_KEY)
-      : null;
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (token) headers['Authorization'] = `Bearer ${token}`;
     const response = await fetch(`${API_BASE}/api/v1/auth/me/preferences`, {
       method: 'PATCH',
-      headers,
+      headers: apiHeaders(),
       body: JSON.stringify({ preferences }),
     });
     if (!response.ok) throw new Error('Failed to update preferences');
@@ -404,6 +633,74 @@ export interface TenantUser {
   last_login: string | null;
   created_at: string;
 }
+
+/**
+ * What the product is called and what it looks like, for this tenant.
+ *
+ * Resolved server-side from the organisation the tenant belongs to, so the
+ * console never has to know whether a deployment is white-labelled: an
+ * unbranded one gets the platform defaults from the same endpoint. One code
+ * path rather than a branded one and an unbranded one that drift.
+ */
+export interface Branding {
+  product_name: string;
+  primary_color: string;
+  accent_color: string;
+  support_email: string | null;
+  support_url: string | null;
+  sender_name: string;
+  footer_text: string;
+  /** A path on this deployment, never a third-party address. */
+  logo_url: string | null;
+  org_id: string | null;
+  is_white_labelled: boolean;
+}
+
+export const brandingApi = {
+  /** Readable by any authenticated member; the console calls it per page load. */
+  async get(): Promise<Branding> {
+    return request<Branding>('/api/v1/branding');
+  },
+};
+
+export interface RetroHuntSettings {
+  enabled: boolean;
+  lookback_days: number;
+  include_federated: boolean;
+  max_sweeps_per_hour: number;
+  max_sweeps_per_day: number;
+  sweeps_this_hour: number;
+  sweeps_today: number;
+  sweeps_skipped_budget: number;
+}
+
+export const retroHuntsApi = {
+  /**
+   * This tenant's answer to "may AiSOC sweep my history".
+   *
+   * A tenant that has never opted in has no settings row, and the API returns
+   * the column defaults rather than a 404 -- "you have not opted in" is a
+   * state with a correct answer.
+   */
+  async getSettings(): Promise<RetroHuntSettings> {
+    return request<RetroHuntSettings>('/api/v1/retro-hunts/settings');
+  },
+
+  /**
+   * Opt in or out. The budget fields are read-only here by design: they are
+   * the operator's ceiling on what one tenant can cost the deployment.
+   */
+  async putSettings(body: {
+    enabled: boolean;
+    lookback_days: number;
+    include_federated: boolean;
+  }): Promise<RetroHuntSettings> {
+    return request<RetroHuntSettings>('/api/v1/retro-hunts/settings', {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    });
+  },
+};
 
 export const tenantsApi = {
   /**
@@ -646,6 +943,9 @@ export interface Alert {
   mitreAttack?: MitreAttack[];
   iocs?: AlertIOC[];
   rawEvent?: Record<string, unknown>;
+  /** Where-in-the-source-console coordinates (rule id, agent, original alert id) parsed
+   *  server-side from the ingested payload - search the source console with these. */
+  wazuhLocator?: Record<string, unknown>;
   assignee?: string;
   caseId?: string;
   tags?: string[];
@@ -894,6 +1194,9 @@ function normalizeAlert(raw: unknown): Alert {
     rawEvent:
       (r.raw_event as Record<string, unknown> | undefined) ??
       (r.rawEvent as Record<string, unknown> | undefined),
+    wazuhLocator:
+      (r.wazuh_locator as Record<string, unknown> | undefined) ??
+      (r.wazuhLocator as Record<string, unknown> | undefined),
     assignee: pickStr('assignee', 'assignee'),
     caseId: pickStr('case_id', 'caseId'),
     tags,
@@ -1007,17 +1310,6 @@ export const alertsApi = {
       method: 'POST',
       body: JSON.stringify({ ids, action, ...data }),
     }),
-
-  getTimeline: (id: string) =>
-    request<{
-      events: Array<{
-        id: string;
-        timestamp: string;
-        type: string;
-        title: string;
-        description: string;
-      }>;
-    }>(`/api/v1/alerts/${id}/timeline`),
 
   /**
    * Structured AI explanation for one alert (Stage 2 #6).
@@ -1311,10 +1603,33 @@ export const entityRiskApi = {
 
 // ─── Cases ───────────────────────────────────────────────────────────────────
 
+/**
+ * The six states a case can hold, matching the `aisoc_cases` CHECK and
+ * `services/api/app/services/case_status.py`.
+ *
+ * This read `open | in_progress | pending | resolved | closed`, which shares
+ * exactly two members with the real vocabulary. Three of its values the
+ * database rejects outright, and the four states a case is actually *in* for
+ * most of its life -- new, triaged, investigating, contained -- were absent.
+ * Every `Record<CaseStatus, …>` keyed off this union was therefore complete
+ * by the type checker and missing an entry for most real rows, so the case
+ * workspace rendered an undefined label and the status dropdown offered three
+ * values the API refuses.
+ */
+export const CASE_STATUSES = [
+  'new',
+  'triaged',
+  'investigating',
+  'contained',
+  'resolved',
+  'closed',
+] as const;
+
 export type CaseStatus =
-  | 'open'
-  | 'in_progress'
-  | 'pending'
+  | 'new'
+  | 'triaged'
+  | 'investigating'
+  | 'contained'
   | 'resolved'
   | 'closed';
 export type CaseSeverity = 'critical' | 'high' | 'medium' | 'low';
@@ -1367,34 +1682,22 @@ export interface Case {
   tasks?: CaseTask[];
 }
 
-// The backend uses a 6-state lifecycle (`new | triaged | investigating |
-// contained | resolved | closed`) while the web console renders a simpler
-// 5-state model. Without translation, `STATUS_CONFIG[c.status]` returns
-// `undefined` and `<CaseCard>` throws a TypeError, which React surfaces as a
-// blank loading state on /cases. Keep these maps colocated with the Case type.
-const BACKEND_TO_UI_STATUS: Record<string, CaseStatus> = {
-  new: 'open',
-  open: 'open',
-  triaged: 'pending',
-  pending: 'pending',
-  investigating: 'in_progress',
-  in_progress: 'in_progress',
-  contained: 'in_progress',
-  resolved: 'resolved',
-  closed: 'closed',
-};
-
-const UI_TO_BACKEND_STATUS: Record<CaseStatus, string> = {
-  open: 'new',
-  pending: 'triaged',
-  in_progress: 'investigating',
-  resolved: 'resolved',
-  closed: 'closed',
-};
-
+// The console speaks the backend vocabulary directly.
+//
+// There were two translation maps here, and the round trip through them was
+// **destructive**: `contained` came in as `in_progress`, and `in_progress`
+// went back out as `investigating`. So opening a contained case and saving
+// any edit -- a title, an assignee -- silently moved it backwards and
+// discarded the containment an analyst had recorded. The lossiness is
+// structural: six states cannot round-trip through five.
+//
+// The UI simplification they existed for is not worth that. Four of the six
+// states now have their own label and colour, which is more information
+// than the collapsed model carried anyway.
 function toUiStatus(raw: unknown): CaseStatus {
-  if (typeof raw !== 'string') return 'open';
-  return BACKEND_TO_UI_STATUS[raw] ?? 'open';
+  if (typeof raw !== 'string') return 'new';
+  const known: readonly string[] = CASE_STATUSES;
+  return known.includes(raw) ? (raw as CaseStatus) : 'new';
 }
 
 export interface CasesResponse {
@@ -1625,18 +1928,26 @@ export function normalizeCasesResponse(raw: unknown, filters: CaseFilters = {}):
 }
 
 export const casesApi = {
+  /** Explicit reopen — the sanctioned backwards status move (PATCH is
+   * forward-only and answers 422 on backwards transitions). */
+  async reopen(
+    caseId: string,
+    opts: { reason: string; status?: 'new' | 'triaged' | 'investigating' },
+  ): Promise<Case> {
+    const raw = await request<unknown>(`/api/v1/cases/${encodeURIComponent(caseId)}/reopen`, {
+      method: 'POST',
+      body: JSON.stringify(opts),
+    });
+    return normalizeCase(raw);
+  },
+
   list: async (filters: CaseFilters = {}) => {
-    // Translate UI status filter into the backend lifecycle vocabulary so
-    // querying "In Progress" in the console actually returns rows where the
-    // backend stored "investigating".
+    // The status filter is passed through unchanged. It used to be rewritten
+    // through a five-state UI vocabulary, which could not express `contained`
+    // at all and mapped it onto `investigating` on the way back.
     const params: Record<string, string> = {};
     for (const [key, value] of Object.entries(filters)) {
       if (value === undefined || value === null || value === '') continue;
-      if (key === 'status' && typeof value === 'string' && value !== 'all') {
-        params.status =
-          UI_TO_BACKEND_STATUS[value as CaseStatus] ?? value;
-        continue;
-      }
       params[key] = String(value);
     }
     const raw = await request<unknown>('/api/v1/cases', { params });
@@ -1786,7 +2097,7 @@ export const casesApi = {
   /** Trigger a browser download of the PDF report. */
   downloadReportPdf: async (caseId: string, runId: string): Promise<void> => {
     const resp = await fetch(`${API_BASE}/api/v1/cases/${caseId}/investigations/${runId}/report.pdf`, {
-      headers: { 'X-Tenant-Id': TENANT_ID },
+      headers: apiHeaders(),
     });
     if (!resp.ok) {
       const err = await resp.text().catch(() => resp.statusText);
@@ -1824,18 +2135,7 @@ export const casesApi = {
    * report surfaces behave consistently in the PWA.
    */
   openAutoSummaryHtml: async (caseId: string): Promise<void> => {
-    const headers: Record<string, string> = {
-      Accept: 'text/html',
-      'X-Tenant-Id': TENANT_ID,
-    };
-    if (typeof window !== 'undefined') {
-      try {
-        const token = window.localStorage.getItem(AUTH_TOKEN_KEY);
-        if (token) headers.Authorization = `Bearer ${token}`;
-      } catch {
-        /* localStorage unavailable; ignore */
-      }
-    }
+    const headers = apiHeaders({ Accept: 'text/html' });
 
     const url = `${API_BASE}/api/v1/cases/${caseId}/summary?format=html`;
     const response = await fetch(url, { headers, cache: 'no-store' });
@@ -2004,6 +2304,7 @@ export const ledgerApi = {
 // ─── Metrics / Dashboard ─────────────────────────────────────────────────────
 
 export interface DashboardMetrics {
+  period?: '1h' | '24h' | '7d' | '30d';
   alerts: {
     total: number;
     new: number;
@@ -2013,6 +2314,12 @@ export interface DashboardMetrics {
     low: number;
     info?: number;
     resolvedToday: number;
+    /** Unresolved alerts only (excludes resolved/closed). */
+    active?: number;
+    /** Unresolved critical alerts only. */
+    criticalActive?: number;
+    /** Alerts in resolved state (all time). */
+    resolved?: number;
     /** Mean time to resolve, in **hours**, from closed cases. */
     mttr: number;
     /** Cases the mean was taken over. Zero means unmeasured, not zero hours. */
@@ -2022,6 +2329,10 @@ export interface DashboardMetrics {
     open: number;
     inProgress: number;
     resolvedThisWeek: number;
+    /** Created within the rolling 7d window. */
+    openedThisWeek?: number;
+    /** Closed (closed_at set) within the rolling 7d window. */
+    closedThisWeek?: number;
   };
   sources: Array<{ name: string; count: number; status: string }>;
   topMitre: Array<{ tactic: string; count: number }>;
@@ -2052,14 +2363,21 @@ export interface FunnelMetrics {
   /** Alerts produced per event-of-interest, clamped to [0, 1]. */
   alert_yield: number;
   mitre_coverage: { covered: number; total: number; ratio: number };
-  /** Period-over-period deltas (fraction, e.g. 0.05 = +5%). */
+  /**
+   * Period-over-period deltas as **percentages**, e.g. `5.0` = +5%.
+   *
+   * This said "fraction, e.g. 0.05 = +5%", which is backwards: the
+   * backend's `_pct_delta` multiplies by 100 before returning, and
+   * `test_funnel_and_pipeline.py` pins `_pct_delta(150.0, 100.0) == 50.0`.
+   * The renderer believed the comment and scaled a second time.
+   */
   deltas: {
-    events_of_interest: number;
-    correlation_instances: number;
-    alerts_generated: number;
-    signal_to_noise: number;
-    mttd_seconds: number;
-    analyst_queue_depth: number;
+    events_of_interest: number | null;
+    correlation_instances: number | null;
+    alerts_generated: number | null;
+    signal_to_noise: number | null;
+    mttd_seconds: number | null;
+    analyst_queue_depth: number | null;
   };
   /** ISO-8601 server timestamp. */
   generated_at: string;
@@ -2077,6 +2395,14 @@ export interface PipelineStage {
   p95_latency_ms: number;
   error_rate: number;
   status: 'unknown' | 'green' | 'yellow' | 'red';
+  /**
+   * Numeric fields above that this stage could not measure. They still carry
+   * `0` on the wire; render them as `n/a`, never as a value. Optional because
+   * an older API will not send it -- treat absent as "nothing declared",
+   * which is the pre-existing behaviour rather than a silent claim of
+   * full instrumentation.
+   */
+  unmeasured?: string[];
 }
 
 export interface PipelineHealth {
@@ -2170,11 +2496,26 @@ export interface CostAggregate {
   totals: CostAggregateRow | null;
 }
 
-export const metricsApi = {
-  getDashboard: () =>
-    request<DashboardMetrics>('/api/v1/metrics/dashboard'),
+/**
+ * The windows every metrics route accepts, matching `_PERIOD_QUERY`'s pattern
+ * server-side and `TIME_WINDOWS` in `lib/timeWindow.ts`. Named once so the
+ * four call sites below cannot drift apart from each other.
+ */
+export type TimeWindowParam = '1h' | '24h' | '7d' | '30d';
 
-  getAlertTrend: (period: '1h' | '24h' | '7d' | '30d') =>
+export const metricsApi = {
+  /**
+   * Dashboard tiles for a time window.
+   *
+   * `period` was not a parameter: the console shipped a global time-window
+   * selector whose only consumer was itself, so changing it re-rendered a
+   * header and fetched nothing. Defaulted rather than required so no existing
+   * caller changes behaviour by omission.
+   */
+  getDashboard: (period: TimeWindowParam = '24h') =>
+    request<DashboardMetrics>('/api/v1/metrics/dashboard', { params: { period } }),
+
+  getAlertTrend: (period: TimeWindowParam) =>
     request<{ data: Array<{ timestamp: string; count: number }> }>(
       `/api/v1/metrics/alerts/trend`,
       {
@@ -2183,7 +2524,7 @@ export const metricsApi = {
     ),
 
   /** Funnel KPIs (events → correlations → alerts) with deltas. */
-  getFunnel: (period: '1h' | '24h' | '7d' | '30d' = '24h') =>
+  getFunnel: (period: TimeWindowParam = '24h') =>
     request<FunnelMetrics>('/api/v1/metrics/funnel', { params: { period } }),
 
   /** Per-stage pipeline health (ingest → normalize → fuse → correlate → alert). */
@@ -2196,7 +2537,8 @@ export const metricsApi = {
    * Tenant-scoped server-side; the client just needs the bearer token
    * and X-Tenant-Id header that `request()` already attaches.
    */
-  getSOC: () => request<SOCMetrics>('/api/v1/metrics/soc'),
+  getSOC: (period: TimeWindowParam = '24h') =>
+    request<SOCMetrics>('/api/v1/metrics/soc', { params: { period } }),
 };
 
 // ─── Operational health: connector fleet, rejected events, alert posture ─────
@@ -2310,6 +2652,13 @@ export interface InsightTile {
   key: string;
   label: string;
   value: number;
+  /**
+   * Rows the mean was averaged over. `0` means the window measured
+   * nothing, so `value` is a placeholder rather than a result — the
+   * console renders "not measured" instead. Optional so a server that
+   * predates the field is handled without a cast.
+   */
+  sample_count?: number;
   unit: 'hours' | 'pct' | 'count' | 'usd' | 'hours_saved';
   previous_value: number;
   delta_pct: number | null;
@@ -3024,26 +3373,99 @@ export interface IOCLookup extends ThreatIndicator {
   raw?: Record<string, unknown>;
 }
 
-export const threatIntelApi = {
-  lookup: (ioc: string) =>
-    request<IOCLookup>('/api/v1/enrichment/lookup', {
-      params: { ioc },
-    }),
+/**
+ * The outcome of one IOC lookup. Three states, deliberately — "the store
+ * answered and holds nothing on this indicator" and "the store did not
+ * answer" are different facts, and only the first of them is good news.
+ *
+ * Collapsing them is what the console used to do: the lookup `catch` set a
+ * `notFound` flag that rendered a green **CLEAN — no threat indicators found
+ * for this IOC**, so a transport error, a 5xx, or a route that did not exist
+ * all read to an analyst as an all-clear on the indicator they were checking.
+ * It called `/api/v1/enrichment/lookup`, which the API does not serve, so
+ * every lookup took that branch and the panel had only ever said "clean".
+ */
+export type IOCLookupOutcome =
+  | { status: 'match'; indicator: ThreatIndicator }
+  | { status: 'clean' }
+  | { status: 'failed'; reason: string };
 
-  bulkLookup: (iocs: string[]) =>
-    request<{ results: IOCLookup[] }>('/api/v1/enrichment/bulk', {
-      method: 'POST',
-      body: JSON.stringify({ iocs }),
-    }),
+export const threatIntelApi = {
+  /**
+   * Look one indicator up in the tenant's threat-intel store.
+   *
+   * Goes to `/api/v1/threat-intel/indicators`, the route that serves the
+   * page's own list — so the lookup reads the same store the table does, and
+   * a match here is an indicator the deployment actually holds. The response
+   * carries `degraded`/`reason`, which the backend already sets when it
+   * answered from a fallback or could not reach its index; that is treated as
+   * a failed lookup rather than a clean one, because a partial store cannot
+   * support "we hold nothing on this".
+   */
+  lookup: async (ioc: string): Promise<IOCLookupOutcome> => {
+    let response: {
+      indicators?: ThreatIndicator[];
+      degraded?: boolean;
+      reason?: string;
+    };
+    try {
+      response = await request('/api/v1/threat-intel/indicators', { params: { q: ioc } });
+    } catch (err) {
+      const status = err instanceof ApiError ? err.status : undefined;
+      // status 0 is `request`'s own marker for "never reached the server".
+      const detail =
+        status === undefined || status === 0
+          ? 'the threat-intel service could not be reached'
+          : `the threat-intel service answered HTTP ${status}`;
+      return { status: 'failed', reason: detail };
+    }
+
+    if (response.degraded) {
+      return {
+        status: 'failed',
+        reason: response.reason?.trim() || 'the threat-intel store answered from a degraded source',
+      };
+    }
+
+    const match = (response.indicators ?? []).find(
+      (candidate) => candidate.value?.toLowerCase() === ioc.toLowerCase(),
+    );
+    return match ? { status: 'match', indicator: match } : { status: 'clean' };
+  },
+
+  // `bulkLookup` used to live here. It posted `{ iocs: [...] }` to
+  // `/api/v1/enrichment/bulk` and had **zero callers**. That path is not
+  // served by the API — measured against a running stack, 404 — and the
+  // request shape was not the one the enrichment service reads either
+  // (`POST /enrich/bulk` takes `{ items: [...] }`). It is deleted rather
+  // than repointed: an exported helper aimed at a route that does not exist
+  // is a loaded gun, because whoever wires it up first gets a rejected
+  // promise and, following the shape `lookup` used to have, renders it as a
+  // clean verdict. A bulk lookup can be written against
+  // `/api/v1/threat-intel/indicators` — the route `lookup` uses — when
+  // something needs one.
 
   // `total` is the store's count of indicators in scope; `shown` is how many
   // this response carries. They are different numbers and the console renders
   // both — it used to render the page length as the catalogue size.
+  //
+  // `degraded`/`reason` are on the type because the route sets them and the
+  // list path was throwing them away. Measured against a running stack with
+  // no threat-intel service, this route answers **HTTP 200** with
+  // `{"indicators":[],"total":0,"degraded":true,"reason":"the threat-intel
+  // service did not answer (ConnectError); no indicators can be listed"}` —
+  // so a consumer keying only on "did the request succeed" reads an explicit
+  // non-measurement as a measurement of zero. `lookup` above already treats
+  // the same flag as a failed lookup.
   list: (filters: { type?: IndicatorType; tag?: string; q?: string } = {}) =>
-    request<{ indicators: ThreatIndicator[]; total: number; shown?: number; bounded?: boolean }>(
-      '/api/v1/threat-intel/indicators',
-      { params: filters as Record<string, string> },
-    ),
+    request<{
+      indicators: ThreatIndicator[];
+      total: number;
+      shown?: number;
+      bounded?: boolean;
+      degraded?: boolean;
+      reason?: string;
+    }>('/api/v1/threat-intel/indicators', { params: filters as Record<string, string> }),
 };
 
 // ─── AI Agents ────────────────────────────────────────────────────────────────
@@ -3060,30 +3482,6 @@ export interface AgentInvestigation {
 }
 
 export const agentsApi = {
-  investigate: (alertId: string) =>
-    request<AgentInvestigation>('/api/v1/agents/investigate', {
-      method: 'POST',
-      body: JSON.stringify({ alertId }),
-    }),
-
-  getInvestigation: (id: string) =>
-    request<AgentInvestigation>(`/api/v1/agents/investigations/${id}`),
-
-  /**
-   * Stream an investigation as Server-Sent Events / NDJSON. Returns the
-   * raw `Response` so callers can pipe to a reader.
-   */
-  streamInvestigation: (alertId: string, signal?: AbortSignal) =>
-    fetch(`${AGENTS_BASE}/api/v1/agents/investigate/stream`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Tenant-Id': TENANT_ID,
-      },
-      body: JSON.stringify({ alertId }),
-      signal,
-    }),
-
   /**
    * Stream a structured "Explain this alert" walkthrough as NDJSON.
    *
@@ -3097,14 +3495,11 @@ export const agentsApi = {
   ) =>
     fetch(`${AGENTS_BASE}/api/v1/explain`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Tenant-Id': TENANT_ID,
-      },
+      headers: apiHeaders(),
       body: JSON.stringify({
         alert: payload.alert,
         alert_id: payload.alertId,
-        tenant_id: TENANT_ID,
+        tenant_id: getActiveTenantId(),
       }),
       signal,
     }),
@@ -3311,7 +3706,37 @@ export interface SavedSearch {
   pinned?: boolean;
 }
 
+/** What `POST /api/v1/agents/hunt` answers. */
+export interface AgentHuntResponse {
+  hypothesis: string;
+  /**
+   * Whether the hunt *ran*. Not the same as `matches.length > 0`: a hunt
+   * that could not run is not a hunt that found nothing, and collapsing
+   * the two is how a console shows a reassuring empty result for a search
+   * that never happened. False always carries an `unavailable_reason`.
+   */
+  checked: boolean;
+  matches: Record<string, unknown>[];
+  /** Plans the validator would not run. Shown, not swallowed. */
+  refusals: string[];
+  unavailable_reason: string | null;
+}
+
 export const huntApi = {
+  /**
+   * Natural-language hunting through the agent (parity 6.1).
+   *
+   * The agent plans; the planner validates every attempt against the
+   * allowed shape. The model never writes a query directly. The tenant
+   * comes from the caller's token server-side and is deliberately not a
+   * parameter here.
+   */
+  runAgentHunt: (hypothesis: string) =>
+    request<AgentHuntResponse>('/api/v1/agents/hunt', {
+      method: 'POST',
+      body: JSON.stringify({ hypothesis }),
+    }),
+
   search: (query: HuntQuery) =>
     request<HuntResponse>('/api/v1/hunt/search', {
       method: 'POST',
@@ -3868,19 +4293,8 @@ export const graphApi = {
       params: filters as Record<string, string | number>,
     }),
 
-  getPaths: (entity: string, options: { maxHops?: number } = {}) =>
-    request<{ paths: AttackPath[] }>(`/api/v1/graph/paths`, {
-      params: { entity, ...options },
-    }),
-
   getMitreCoverage: () =>
     request<MitreCoverage>('/api/v1/graph/mitre/coverage'),
-
-  getBlastRadius: (entity: string) =>
-    request<{ radius: AttackGraph; affectedAssets: string[] }>(
-      `/api/v1/graph/blast-radius`,
-      { params: { entity } },
-    ),
 
   /**
    * Fetch the reconstructed attack-path graph for a single case.
@@ -4159,6 +4573,12 @@ export interface DetectionProposalEvalVerdict {
   max_regression_pp?: number;
   regressed?: boolean;
   passed?: boolean;
+  /**
+   * Written only by `POST /{id}/evaluate-rule`. `/decide` answers HTTP
+   * 412 without it, which is why the Approve button could not succeed
+   * before the console had a caller for that route.
+   */
+  candidate_rule?: { passed?: boolean; ran_at?: string };
 }
 
 export interface DetectionProposal {
@@ -4178,6 +4598,10 @@ export interface DetectionProposal {
   tags: string[];
   status: DetectionProposalStatus;
   eval_result: DetectionProposalEvalVerdict | Record<string, never>;
+  /** What this rule claims to catch, carried so the approval gate can replay it. */
+  positive_fixtures?: Array<Record<string, unknown>>;
+  /** What it claims to ignore. Empty means the proposal makes no such claim. */
+  negative_fixtures?: Array<Record<string, unknown>>;
   review_comments: Array<{
     actor_id: string;
     actor_email?: string;
@@ -4250,6 +4674,34 @@ export const detectionProposalsApi = {
     request<DetectionProposal>(`/api/v1/detection-proposals/${id}/eval`, {
       method: 'POST',
       body: JSON.stringify(body),
+    }),
+
+  /**
+   * Run the candidate rule body against its own fixtures.
+   *
+   * This had no web client at all, and it is the gate `/decide` requires:
+   * approving returns HTTP 412 unless `eval_result.candidate_rule` exists,
+   * and this route is the only thing that writes that key. So the console
+   * rendered an Approve button that could not succeed, and the gate was
+   * reachable only by calling the API directly.
+   */
+  evaluateRule: (
+    id: string,
+    body: {
+      positive_fixtures: Array<Record<string, unknown>>;
+      negative_fixtures: Array<Record<string, unknown>>;
+    },
+  ) =>
+    request<DetectionProposal>(`/api/v1/detection-proposals/${id}/evaluate-rule`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /** Replay a candidate rule over real tenant events in the lake. */
+  backtestProposal: (id: string, body?: { days?: number; limit?: number }) =>
+    request<Record<string, unknown>>(`/api/v1/detection-proposals/${id}/backtest`, {
+      method: 'POST',
+      body: JSON.stringify(body ?? {}),
     }),
 
   // Triggers a synchronous run of `scripts/run_evals.py` server-side and
@@ -4556,10 +5008,7 @@ export const copilotApi = {
   streamChat: (req: CopilotChatRequest, signal?: AbortSignal) =>
     fetch(`${API_BASE}/api/v1/copilot/chat/stream`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Tenant-Id': TENANT_ID,
-      },
+      headers: apiHeaders(),
       body: JSON.stringify(req),
       signal,
     }),
@@ -4668,10 +5117,7 @@ export const contextualApi = {
   stream: (req: ContextualActionRequest, signal?: AbortSignal) =>
     fetch(`${AGENTS_BASE}/api/v1/contextual/action/stream`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Tenant-Id': TENANT_ID,
-      },
+      headers: apiHeaders(),
       body: JSON.stringify(req),
       signal,
     }),
@@ -5025,7 +5471,176 @@ export const autonomyPolicyApi = {
       `/api/v1/autonomy-policy/${encodeURIComponent(action)}`,
       { method: 'DELETE' },
     ),
+
+  /** Which alert classes this tenant is measuring rather than acting on. */
+  shadowMode: () =>
+    request<ShadowModeResponse>('/api/v1/autonomy-policy/shadow-mode'),
+
+  /** Start or stop measuring one alert class. */
+  setShadowMode: (alertClass: string, enabled: boolean) =>
+    request<ShadowModeEntry>(
+      `/api/v1/autonomy-policy/shadow-mode/${encodeURIComponent(alertClass)}`,
+      { method: 'PUT', body: JSON.stringify({ enabled }) },
+    ),
+
+  /** Capabilities this tenant has earned, or that an operator overruled into place. */
+  grants: () => request<GrantListResponse>('/api/v1/autonomy-policy/grants'),
+
+  /**
+   * Ask for a capability. A refusal is a 200 with `granted: false` and the
+   * reasons: being told no by a safety control is the control working, and
+   * surfacing it as an error invites a client to retry it.
+   */
+  requestGrant: (payload: PromotionRequestBody) =>
+    request<PromotionResponse>('/api/v1/autonomy-policy/grants', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  /** Hand a capability back. Audited as a revocation, not as a demotion. */
+  revokeGrant: (params: { scope_kind: string; scope_key: string; capability: string }) =>
+    request<void>(
+      `/api/v1/autonomy-policy/grants?${new URLSearchParams(params).toString()}`,
+      { method: 'DELETE' },
+    ),
+
+  /** Rolling agreement between the agent and this tenant's own analysts. */
+  agreement: (params?: { scope_kind?: string; scope_key?: string }) => {
+    const query = new URLSearchParams();
+    if (params?.scope_kind) query.set('scope_kind', params.scope_kind);
+    if (params?.scope_key) query.set('scope_key', params.scope_key);
+    const suffix = query.toString();
+    return request<AgreementResponse>(
+      `/api/v1/autonomy-policy/agreement${suffix ? `?${suffix}` : ''}`,
+    );
+  },
 };
+
+// ─── Shadow mode and rolling agreement (gap-closure Phase 2.1 / 2.2) ─────────
+//
+// Every rate below is `number | null`, and `null` means there was no
+// denominator. It renders as "not measured", never as 0: a zero in the
+// agreement column says the agent was wrong every time, and "it was never
+// asked" is a different fact calling for a different response. The counts
+// travel with the rates for the same reason — 100% over four answers is not
+// the claim 100% over four hundred is.
+
+export interface ShadowModeEntry {
+  alert_class: string;
+  enabled: boolean;
+  enabled_at?: string | null;
+  updated_at?: string | null;
+  updated_by?: string | null;
+}
+
+export interface ShadowModeResponse {
+  tenant_id: string;
+  entries: ShadowModeEntry[];
+}
+
+export interface AgreementWindow {
+  resolved: number;
+  labelled: number;
+  unlabeled: number;
+  answered: number;
+  abstained: number;
+  agreed: number;
+  malicious_support: number;
+  malicious_caught: number;
+  agreement_rate: number | null;
+  malicious_recall: number | null;
+  abstention_rate: number | null;
+}
+
+export interface AgreementScope {
+  key: string;
+  window: AgreementWindow;
+}
+
+export interface AgreementThresholds {
+  min_decisions: number;
+  min_malicious: number;
+  min_agreement: number;
+  min_malicious_recall: number;
+  max_abstention_rate: number;
+  window_days: number;
+  demotion_agreement: number;
+  demotion_malicious_recall: number;
+  drift_sample: number;
+  drift_min_answered: number;
+}
+
+// ─── Evidence-gated autonomy (gap-closure Phase 2.3) ────────────────────────
+//
+// `source` and `is_override` are both carried because the distinction has to
+// survive without anyone inferring it. An override is autonomy a human
+// overruled a refusal to grant, and six months later "was this earned" must
+// be answerable from the row rather than reconstructed from the numbers.
+
+export type GrantState = 'shadow' | 'granted' | 'demoted';
+export type GrantSource = 'earned' | 'operator_override';
+
+export interface AutonomyGrant {
+  id: string;
+  scope_kind: string;
+  scope_key: string;
+  capability: string;
+  state: GrantState;
+  source: GrantSource;
+  is_override: boolean;
+  evidence?: Record<string, unknown> | null;
+  granted_at?: string | null;
+  demoted_at?: string | null;
+  demoted_reason?: string | null;
+  override_reason?: string | null;
+}
+
+export interface GrantListResponse {
+  tenant_id: string;
+  grants: AutonomyGrant[];
+  /** Grants this request's reconciliation pass demoted. */
+  demoted_now: Array<Record<string, unknown>>;
+}
+
+export interface PromotionRequestBody {
+  scope_kind: string;
+  scope_key: string;
+  capability: string;
+  override?: boolean;
+  override_reason?: string | null;
+}
+
+export interface PromotionResponse {
+  granted: boolean;
+  state: GrantState;
+  source: GrantSource;
+  is_override: boolean;
+  /** What to fix on a refusal; what was waived on an override. */
+  refusals: string[];
+  evidence: Record<string, unknown>;
+  changed: boolean;
+}
+
+export interface AgreementResponse {
+  tenant_id: string;
+  scope_kind: string;
+  scope_key: string;
+  window: AgreementWindow;
+  /**
+   * The trailing slice of the most recent decisions, scored on its own. A
+   * window average is where a gradual decline hides, so any surface showing
+   * one has to show both or it is showing the flattering half.
+   */
+  recent: AgreementWindow;
+  window_start: string;
+  window_end: string;
+  thresholds: AgreementThresholds;
+  reconciled: number;
+  by_alert_class: AgreementScope[];
+  by_rule: AgreementScope[];
+  by_source: AgreementScope[];
+  by_model: AgreementScope[];
+}
 
 // ─── Analyst override feedback loop (Tier 1.5) ───────────────────────────────
 //
@@ -5076,6 +5691,77 @@ export interface AlertOverrideResponse {
 export interface RedispositionApplyRequest {
   alert_ids: string[];
   new_disposition: AnalystVerdict;
+  /**
+   * Blast-radius control: sha256 over the exact alert set + disposition,
+   * mirroring the server's compute_confirmation_token. Required — apply
+   * fails validation without it.
+   */
+  confirmation_token: string;
+}
+
+/** Mirror of the server's canonical token (sorted ids joined, hashed).
+ *  Uses WebCrypto when available (secure context) and a pure-JS SHA-256
+ *  fallback otherwise — the console is often served over plain HTTP on a
+ *  LAN address, where crypto.subtle is undefined. */
+export async function computeRedispositionToken(
+  alertIds: string[],
+  newDisposition: string,
+): Promise<string> {
+  const canonical = [...alertIds].sort().join('|') + '=>' + newDisposition;
+  if (globalThis.crypto?.subtle) {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical));
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+  return sha256Hex(canonical);
+}
+
+/* Compact SHA-256 (public-domain style), fallback for insecure contexts. */
+function sha256Hex(ascii: string): string {
+  const K = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+  ];
+  const rotr = (x: number, n: number) => (x >>> n) | (x << (32 - n));
+  const bytes = Array.from(new TextEncoder().encode(ascii));
+  const bitLen = bytes.length * 8;
+  bytes.push(0x80);
+  while (bytes.length % 64 !== 56) bytes.push(0);
+  const hi = Math.floor(bitLen / 0x100000000);
+  const lo = bitLen >>> 0;
+  bytes.push((hi >>> 24) & 0xff, (hi >>> 16) & 0xff, (hi >>> 8) & 0xff, hi & 0xff);
+  bytes.push((lo >>> 24) & 0xff, (lo >>> 16) & 0xff, (lo >>> 8) & 0xff, lo & 0xff);
+  let h = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+  const w = new Array<number>(64);
+  for (let i = 0; i < bytes.length; i += 64) {
+    for (let j = 0; j < 16; j++) {
+      w[j] = (bytes[i + j * 4] << 24) | (bytes[i + j * 4 + 1] << 16) | (bytes[i + j * 4 + 2] << 8) | bytes[i + j * 4 + 3];
+    }
+    for (let j = 16; j < 64; j++) {
+      const s0 = rotr(w[j - 15], 7) ^ rotr(w[j - 15], 18) ^ (w[j - 15] >>> 3);
+      const s1 = rotr(w[j - 2], 17) ^ rotr(w[j - 2], 19) ^ (w[j - 2] >>> 10);
+      w[j] = (w[j - 16] + s0 + w[j - 7] + s1) >>> 0;
+    }
+    let [a, b, c, d, e, f, g, hh] = h;
+    for (let j = 0; j < 64; j++) {
+      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (hh + S1 + ch + K[j] + w[j]) >>> 0;
+      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (S0 + maj) >>> 0;
+      hh = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    h = h.map((x, k) => (x + [a, b, c, d, e, f, g, hh][k]) >>> 0);
+  }
+  return h.map((x) => x.toString(16).padStart(8, '0')).join('');
 }
 
 export interface RedispositionApplyResponse {
@@ -5244,6 +5930,38 @@ export interface LlmCredentialView {
   last_rotated_at: string | null;
 }
 
+/**
+ * Where the local model is actually running, as Ollama reports it.
+ *
+ * Distinct from `LlmStatus`, which describes *configuration*. A GPU
+ * reservation is a request: a model can still land on the CPU for want of
+ * VRAM or a usable driver, so this is the outcome rather than the intent.
+ */
+export interface LlmRuntime {
+  placement: 'gpu' | 'partial' | 'cpu' | 'unknown' | 'unreachable' | 'not_local';
+  detail: string;
+  base_url: string;
+  /** What an operator can do about the answer. Never empty for a CPU verdict. */
+  options: string[];
+  /** Absent, not zero, when nothing is loaded — "not measured" is not "zero". */
+  model?: string;
+  vram_bytes?: number;
+  total_bytes?: number;
+}
+
+export const llmApi = {
+  /** Ask the model where it is running. Reports, never changes. */
+  runtime: () => request<LlmRuntime>('/api/v1/llm/runtime'),
+};
+
+export interface LlmCredentialTestResult {
+  outcome: 'ok' | 'refused' | 'unreachable' | 'unverified';
+  detail: string;
+  provider: string;
+  model?: string;
+  latency_ms?: number;
+}
+
 export const deploymentApi = {
   /** Live air-gap policy snapshot for this pod. Safe to poll. */
   getAirgapStatus: () => request<AirgapStatus>('/api/v1/airgap/status'),
@@ -5268,6 +5986,19 @@ export const deploymentApi = {
   /** Hard-delete the credential. Returns 204 on success. */
   deleteLlmCredential: () =>
     request<void>('/api/v1/llm/credentials', { method: 'DELETE' }),
+
+  /**
+   * Make one real call with the saved credential and report what happened.
+   *
+   * The routes above validate shape and never talk to the provider, so a
+   * revoked key used to surface as triage quietly falling back. `unverified`
+   * is a success-adjacent outcome: an air-gapped deployment refuses the
+   * egress rather than attempting it, which is the policy working.
+   */
+  testLlmCredential: () =>
+    request<LlmCredentialTestResult>('/api/v1/llm/credentials/test', {
+      method: 'POST',
+    }),
 };
 
 // ─── Reports / Executive digest (WS-G2) ─────────────────────────────────────
@@ -5386,18 +6117,7 @@ export const reportsApi = {
     if (params.period_start) search.set('period_start', params.period_start);
     if (params.period_end) search.set('period_end', params.period_end);
 
-    const headers: Record<string, string> = {
-      Accept: 'text/html',
-      'X-Tenant-Id': TENANT_ID,
-    };
-    if (typeof window !== 'undefined') {
-      try {
-        const token = window.localStorage.getItem(AUTH_TOKEN_KEY);
-        if (token) headers.Authorization = `Bearer ${token}`;
-      } catch {
-        /* localStorage unavailable; ignore */
-      }
-    }
+    const headers = apiHeaders({ Accept: 'text/html' });
 
     const url = `${API_BASE}/api/v1/reports/digest/weekly?${search.toString()}`;
     const response = await fetch(url, { headers, cache: 'no-store' });
@@ -5533,6 +6253,38 @@ export interface ByokSavings {
   savings_usd: number;
 }
 
+export interface StorageTierProjection {
+  tier: string;
+  retention_days: number;
+  resident_gb: number;
+  rate_usd_per_gb_month: number;
+  monthly_usd: number;
+}
+
+/**
+ * ADR-0005 / 6b — projected storage cost beside the measured LLM spend.
+ *
+ * A projection, never a bill: it runs the committed storage cost model over
+ * one measurement (the uncompressed bytes this tenant's events occupied in
+ * the lake) at reference list prices. `measured` is the field that matters —
+ * when it is false every money field is `null`, not `0`, because the lake
+ * runs in the `full` profile and a confident zero for a tenant nobody
+ * measured reads as free storage.
+ */
+export interface StorageCostProjection {
+  measured: boolean;
+  /** Why there is no projection. Null when there is one. */
+  unmeasured_reason: string | null;
+  raw_bytes_measured: number | null;
+  events_measured: number | null;
+  raw_tb_per_day: number | null;
+  monthly_usd: number | null;
+  usd_per_raw_tb_ingested: number | null;
+  tiers: StorageTierProjection[];
+  compression_ratio: number;
+  disclaimer: string;
+}
+
 export interface CostDashboard {
   tenant_id: string;
   period: DashboardPeriod;
@@ -5542,6 +6294,7 @@ export interface CostDashboard {
   top_cases: TopCostCase[];
   action_counts: ActionCount[];
   byok_savings: ByokSavings;
+  storage: StorageCostProjection;
 }
 
 /**
@@ -5603,18 +6356,7 @@ function buildAuditExportSearch(
 }
 
 function buildAuditExportHeaders(accept: string): Record<string, string> {
-  const headers: Record<string, string> = {
-    Accept: accept,
-    'X-Tenant-Id': TENANT_ID,
-  };
-  if (typeof window !== 'undefined') {
-    try {
-      const token = window.localStorage.getItem(AUTH_TOKEN_KEY);
-      if (token) headers.Authorization = `Bearer ${token}`;
-    } catch {
-      /* localStorage unavailable; ignore */
-    }
-  }
+  const headers = apiHeaders({ Accept: accept });
   return headers;
 }
 
@@ -5920,4 +6662,121 @@ export const apiKeysApi = {
 
   revoke: (id: string) =>
     request<void>(`/api/v1/api-keys/${id}`, { method: 'DELETE' }),
+};
+
+// ─── Replay evaluation (gap-closure Phase 1.4) ───────────────────────────────
+//
+// Wraps `services/api/app/api/v1/endpoints/evaluations.py`: measure triage
+// against a tenant's own analysts, on their own closed findings.
+//
+// Every field the console needs to show sample sizes beside the headline is
+// on the summary, not buried in `score`. That is deliberate on both sides: a
+// headline accuracy rendered without the count behind it is the single most
+// misleading thing this surface could print, so the two travel together
+// through the wire shape rather than by a convention the UI has to remember.
+//
+// `headline_accuracy` is `null` when the window held too few malicious cases
+// for a headline to mean anything, and `headline_withheld_reason` carries the
+// sentence explaining that. Null is not zero: a zero in an accuracy column
+// says the agent got every answer wrong, which is a different fact with a
+// different remedy.
+
+export type ReplayEvaluationStatus = 'queued' | 'running' | 'completed' | 'failed';
+
+export interface ReplayEvaluationSummary {
+  id: string;
+  status: ReplayEvaluationStatus;
+  error: string | null;
+  connector_id: string;
+  vendor: string;
+  window_start: string;
+  window_end: string;
+  train_fraction: number;
+  bootstrap_seed: number;
+  bootstrap_resamples: number;
+  findings_read: number;
+  findings_labelled: number;
+  decisions_recorded: number;
+  graded: number;
+  malicious_support: number;
+  headline_accuracy: number | null;
+  headline_withheld_reason: string | null;
+  malicious_recall: number | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  is_terminal: boolean;
+}
+
+export interface ReplayEvaluationDetail extends ReplayEvaluationSummary {
+  /** The full `ReplayScore.as_dict()`. */
+  score: Record<string, unknown> | null;
+  /** Split point, frozen-context provenance, attempted writes, envelope gaps. */
+  method: Record<string, unknown> | null;
+  /** The artefact stored when the run completed, not a re-render. */
+  report_markdown: string | null;
+}
+
+export interface ReplayableConnectorInfo {
+  connector_type: string;
+  vendor: string;
+  label: string;
+}
+
+export interface ReplayCapabilities {
+  connectors: ReplayableConnectorInfo[];
+  default_window_days: number;
+  default_train_fraction: number;
+  default_bootstrap_seed: number;
+  default_bootstrap_resamples: number;
+  /** Below this many malicious cases no headline accuracy is printed. */
+  min_malicious_for_headline: number;
+  max_findings: number;
+}
+
+export interface StartReplayInput {
+  connector_id: string;
+  since?: string;
+  until?: string;
+  train_fraction?: number;
+  limit?: number;
+}
+
+export type ReplayExportFormat = 'markdown' | 'json' | 'pdf';
+
+export const evaluationsApi = {
+  capabilities: () =>
+    request<ReplayCapabilities>('/api/v1/evaluations/replay/capabilities'),
+
+  list: (limit = 50) =>
+    request<ReplayEvaluationSummary[]>('/api/v1/evaluations/replay', {
+      params: { limit },
+    }),
+
+  get: (id: string) =>
+    request<ReplayEvaluationDetail>(`/api/v1/evaluations/replay/${id}`),
+
+  decisions: (id: string, limit = 2000) =>
+    request<Array<Record<string, unknown>>>(
+      `/api/v1/evaluations/replay/${id}/decisions`,
+      { params: { limit } },
+    ),
+
+  start: (data: StartReplayInput) =>
+    request<ReplayEvaluationSummary>('/api/v1/evaluations/replay', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  /**
+   * Where a download points. Built rather than fetched because the browser
+   * does the download, and the route already sets `Content-Disposition`.
+   *
+   * `exclude_latency` is offered on every format: the two wall-clock figures
+   * are the only part of the report that does not reproduce between runs, so
+   * an operator diffing two exports wants them gone.
+   */
+  exportUrl: (id: string, format: ReplayExportFormat, excludeLatency = false): string =>
+    `${API_BASE}/api/v1/evaluations/replay/${id}/export` +
+    `?format=${format}&exclude_latency=${excludeLatency ? 'true' : 'false'}`,
 };

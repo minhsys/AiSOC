@@ -131,6 +131,13 @@ AUTH_DEPENDENCY_NAMES = {
     "PortfolioScope",
     "_scope",
     "_admin_scope",
+    # SCIM resolves a hashed per-organisation bearer token to a principal
+    # carrying the tenant. The credential is the only source of the tenant on
+    # that surface: RFC 7643 defines no tenant attribute, so there is no
+    # request field for a handler to read one from.
+    "ScimPrincipal",
+    "scim_principal",
+    "ScimAuth",
 }
 
 #: Helpers that intersect a caller-supplied tenant with authorised scope.
@@ -197,6 +204,40 @@ IN_BAND_CREDENTIAL_ROUTES: dict[str, tuple[str, str]] = {
         "osqueryd bootstraps here and holds no bearer token; the per-tenant "
         "enroll secret is the credential and is checked before any write",
     ),
+    "services/api/app/api/v1/endpoints/mcp_servers.py::resolve_mcp_servers": (
+        "service_token_valid",
+        "the agents service reads its tenant's MCP servers here and holds no session; the shared service token is the "
+        "credential, compared in constant time and failing closed when unset. The tenant it names is the scope rather "
+        "than a narrowing of one, because a service token carries no tenant to intersect with, and this route refuses a "
+        "console session outright so no user's scope can reach it",
+    ),
+    "services/api/app/api/v1/endpoints/tenant_skills.py::resolve_tenant_skills": (
+        "service_token_valid",
+        "the agents service reads its tenant's active investigation skills here and holds no session; the shared service "
+        "token is the credential, compared in constant time and failing closed when unset. The named tenant is the scope "
+        "rather than a narrowing of one, for the same reason as the MCP registry above, and the RLS context is set from "
+        "that same value so the policy and the query predicate cannot disagree",
+    ),
+    "services/api/app/api/v1/endpoints/feedback.py::recent_dispositions": (
+        "service_token_valid",
+        "the agents service reads this tenant's last few analyst decisions here and holds no session; the shared service token is "
+        "the credential, compared in constant time and failing closed when unset. The named tenant is the scope rather than a "
+        "narrowing of one, and the RLS context is set from that same value so the policy and the query predicate cannot disagree",
+    ),
+    "services/api/app/api/v1/endpoints/graph.py::identity_context_for_triage": (
+        "service_token_valid",
+        "the agents service reads directory context for an alert's principals here and holds no session; the shared service token "
+        "is the credential, compared in constant time and failing closed when unset. The named tenant is the scope rather than a "
+        "narrowing of one, and it is bound into every node of the Cypher through the same _scoped() predicate the incident-context "
+        "traversal uses, so a shared Identity node cannot bridge two tenants",
+    ),
+    "services/api/app/api/v1/endpoints/knowledge_base.py::retrieve_runbooks_for_triage": (
+        "service_token_valid",
+        "the agents service retrieves this tenant's runbooks here on the path of a triage and holds no session; the "
+        "shared service token is the credential, compared in constant time and failing closed when unset. The named "
+        "tenant is the scope rather than a narrowing of one, for the same reason as the two above, and the RLS context "
+        "is set from that same value so the policy and the query predicate cannot disagree",
+    ),
 }
 
 #: Routes that are public by design. Each entry is (service, reason) and the
@@ -230,6 +271,14 @@ class Route:
     function: str
     methods: list[str]
     route_path: str
+    #: The router object the decorator hung off. Registration order only
+    #: matters between routes on the *same* router, so the shadowing gate
+    #: needs this to avoid pairing two routers that share a module.
+    router_objs: list[str] = field(default_factory=list)
+    #: False when a decorator was handed a variable instead of a literal, so
+    #: ``route_path`` is empty because nothing could be read rather than
+    #: because the route sits at a collection root.
+    path_is_literal: bool = True
     tenant_params: list[str] = field(default_factory=list)
     auth_deps: list[str] = field(default_factory=list)
     scope_calls: list[str] = field(default_factory=list)
@@ -279,8 +328,13 @@ def _annotation_names(annotation: ast.expr | None) -> set[str]:
     return _names_in(annotation)
 
 
-def _decorator_route_info(dec: ast.expr) -> tuple[str, str, str] | None:
-    """Return (router_object, method, route_path) for a route decorator."""
+def _decorator_route_info(dec: ast.expr) -> tuple[str, str, str | None] | None:
+    """Return (router_object, method, route_path) for a route decorator.
+
+    ``route_path`` is ``None`` when the decorator was handed something other
+    than a string literal, so a caller can tell "no path here to read" from
+    "the path is the empty string".
+    """
     if not isinstance(dec, ast.Call):
         return None
     func = dec.func
@@ -289,7 +343,11 @@ def _decorator_route_info(dec: ast.expr) -> tuple[str, str, str] | None:
     if not isinstance(func.value, ast.Name):
         return None
     router_obj = func.value.id
-    route_path = ""
+    # `None` rather than `""`: a decorator handed a variable and one handed
+    # the empty string (a collection root, `@router.get("")`) are different
+    # facts, and a reader that conflates them either skips 45 real routes or
+    # reports them all as unreadable.
+    route_path: str | None = None
     if dec.args and isinstance(dec.args[0], ast.Constant) and isinstance(dec.args[0].value, str):
         route_path = dec.args[0].value
     return router_obj, func.attr, route_path
@@ -397,7 +455,8 @@ def _scan_tree(tree: ast.AST, *, service: str, rel_path: str) -> list[Route]:
             continue
 
         methods: list[str] = []
-        route_path = ""
+        route_path: str | None = None
+        path_is_literal = True
         router_objs: set[str] = set()
         decorator_auth: set[str] = set()
 
@@ -408,7 +467,10 @@ def _scan_tree(tree: ast.AST, *, service: str, rel_path: str) -> list[Route]:
             router_obj, method, path = info
             router_objs.add(router_obj)
             methods.append(method)
-            route_path = route_path or path
+            if path is None:
+                path_is_literal = False
+            elif route_path is None:
+                route_path = path
             # dependencies=[...] declared on the route decorator itself
             assert isinstance(dec, ast.Call)
             for kw in dec.keywords:
@@ -455,7 +517,9 @@ def _scan_tree(tree: ast.AST, *, service: str, rel_path: str) -> list[Route]:
                 lineno=node.lineno,
                 function=node.name,
                 methods=sorted(set(methods)),
-                route_path=route_path,
+                route_path=route_path or "",
+                path_is_literal=path_is_literal,
+                router_objs=sorted(router_objs),
                 tenant_params=tenant_params,
                 auth_deps=sorted(auth_deps),
                 scope_calls=scope_calls,

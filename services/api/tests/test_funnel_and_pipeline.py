@@ -96,16 +96,18 @@ class TestPctDelta:
     """Period-over-period percentage helper.
 
     Tiny and pure — the contract is exactly two lines: zero-base
-    returns 0.0 (never ``inf``), otherwise round to two decimals.
+    returns ``None`` ("no baseline" — a fake 0.0 became a fake +0%
+    pill, and 1-from-16 unrounded scaled twice in the UI became the
+    -9375% tile), otherwise round to two decimals as PERCENT.
     """
 
-    def test_zero_previous_returns_zero(self) -> None:
+    def test_zero_previous_returns_none(self) -> None:
         from app.api.v1.endpoints.metrics import _pct_delta
 
-        # The dashboard cannot render ``inf`` or ``NaN`` — we'd
-        # rather show "no change" than a useless ∞ pill.
-        assert _pct_delta(10.0, 0.0) == 0.0
-        assert _pct_delta(0.0, 0.0) == 0.0
+        # No baseline exists when the previous window was empty;
+        # the UI renders None as "no baseline".
+        assert _pct_delta(10.0, 0.0) is None
+        assert _pct_delta(0.0, 0.0) is None
 
     def test_positive_change(self) -> None:
         from app.api.v1.endpoints.metrics import _pct_delta
@@ -1000,3 +1002,66 @@ class TestGetPipelineHealth:
         ):
             payload = await get_pipeline_health(user=_user(), db=MagicMock())
         assert payload.overall_status == "red"
+
+
+class TestEveryPlaceholderZeroDeclaresItself:
+    """A stage that hardcodes a metric must name it in ``unmeasured``.
+
+    This module's docstring promises "The SOC Console UI renders zeros as
+    'n/a' pills rather than zero-bars so operators don't read absence as
+    'all good'". The console had no way to honour that: an uninstrumented
+    cell and a measured zero arrived on the wire as the same ``0``, and
+    four of the five stages carry at least one. The panel therefore showed
+    ``0 backlog / < 1 ms / 0% errors`` under a "Live" header for the cells
+    it knew least about.
+
+    Asserted by reading the source for a hardcoded literal rather than by
+    calling each builder, because the question is about the *constant in
+    the code* — a builder driven by a mock could return a real zero and
+    prove nothing either way. The direction that matters is: a literal that
+    is not declared fails. Adding instrumentation and dropping the literal
+    passes, which is the change that should pass.
+    """
+
+    #: Field name → the literal that means "not measured here".
+    PLACEHOLDERS = {"backlog": "backlog=0,", "p95_latency_ms": "p95_latency_ms=0.0,", "error_rate": "error_rate=0.0,"}
+
+    def _constructions(self) -> list[tuple[int, str]]:
+        import pathlib
+        import re
+
+        source = (pathlib.Path(__file__).resolve().parents[1] / "app" / "api" / "v1" / "endpoints" / "health.py").read_text()
+        out: list[tuple[int, str]] = []
+        for match in re.finditer(r"PipelineStage\((.*?)\n\s*\)", source, re.S):
+            out.append((source[: match.start()].count("\n") + 1, match.group(1)))
+        return out
+
+    def test_the_endpoint_still_constructs_stages_here(self) -> None:
+        """A rename would otherwise make the next test vacuously true."""
+        assert len(self._constructions()) >= 5, "found no PipelineStage constructions; this gate is reading the wrong file"
+
+    def test_a_hardcoded_metric_is_declared_unmeasured(self) -> None:
+        offenders: list[str] = []
+        for lineno, body in self._constructions():
+            declared = body[body.index("unmeasured=") :] if "unmeasured=" in body else ""
+            for field, literal in self.PLACEHOLDERS.items():
+                if literal in body and field not in declared:
+                    offenders.append(f"health.py:{lineno} hardcodes {literal.rstrip(',')} without declaring it unmeasured")
+        assert not offenders, "a placeholder zero renders as a measurement:\n  " + "\n  ".join(offenders)
+
+    @pytest.mark.asyncio
+    async def test_a_tenant_with_no_connectors_measures_nothing_and_says_so(self) -> None:
+        from app.api.v1.endpoints.health import _ingest_stage
+
+        db = MagicMock()
+        db.execute = AsyncMock(return_value=MagicMock(all=MagicMock(return_value=[])))
+
+        stage = await _ingest_stage(db, uuid.uuid4(), now=datetime.now(UTC))
+
+        assert stage.status == "unknown"
+        assert set(stage.unmeasured) == {"backlog", "p95_latency_ms", "error_rate"}
+
+    def test_the_default_is_empty_so_an_omission_is_never_a_silent_claim(self) -> None:
+        from app.api.v1.endpoints.metrics import PipelineStage
+
+        assert PipelineStage(stage="x", backlog=1, p95_latency_ms=2.0, error_rate=0.5, status="green").unmeasured == []

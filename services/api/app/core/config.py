@@ -4,6 +4,7 @@ AiSOC — open-source AI Security Operations Center
 MIT License
 """
 
+import ipaddress
 import logging
 import os
 import warnings
@@ -23,6 +24,11 @@ INSECURE_SECRET_KEY_DEFAULTS: frozenset[str] = frozenset(
         "dev_secret_key_change_in_production",
         "changeme",
         "secret",
+        # The former realtime dev fallback. Published in this repository's
+        # history, so it is refused rather than forgotten: copying it out of an
+        # older checkout into .env must not produce a working deployment keyed
+        # on a value anyone can read.
+        "aisoc-dev-realtime-ticket-secret-not-for-production",
     }
 )
 
@@ -88,8 +94,91 @@ def is_auth_bypass_env(value: str | None) -> bool:
 
     Same canonical set as :func:`is_dev_env` minus ``"test"`` — see the
     module-level rationale.
+
+    Naming a dev-class environment is now necessary and **not sufficient**:
+    :func:`auth_bypass_refusal` has to return ``None`` as well.
     """
     return _normalize_env(value) in AUTH_BYPASS_ENVIRONMENTS
+
+
+# ------------------------------------------------------------------
+# The anonymous shim needs an explicit opt-in, not just an environment name
+# ------------------------------------------------------------------
+# ``ENVIRONMENT`` defaulted to ``development`` in ``docker-compose.yml``, in
+# ``.env.example``, and therefore in the ``.env`` that ``ensure_env.py``
+# copies from it. So every stock ``docker compose up`` served an
+# uncredentialed request as an administrator, and the single-host guide told
+# operators to publish that console on ``0.0.0.0``.
+#
+# An environment name cannot carry that weight on its own. It is a label
+# chosen for logging verbosity and docs URLs, it defaults to a dev-class
+# value, and nothing about setting it says "and make this host anonymous".
+# So the shim now needs a flag whose only meaning is the bypass, which no
+# compose file and no template sets, plus a bind address that keeps the
+# consequence on the operator's own machine.
+
+#: The environment variable whose only job is to enable the anonymous shim.
+#: Deliberately not ``AISOC_DEV_MODE``: that flag already means eight other
+#: things across nine services, and a flag that means many things cannot be
+#: refused for one of them.
+DEV_AUTH_BYPASS_VAR: Final[str] = "AISOC_DEV_AUTH_BYPASS"
+
+#: Where the deployment publishes the console and the API, comma-separated.
+#: Supplied by compose so the API can answer "is anyone but this machine able
+#: to reach me", which it otherwise cannot know: it binds inside a container
+#: and sees only ``0.0.0.0``.
+PUBLISHED_BIND_VAR: Final[str] = "AISOC_PUBLISHED_BIND_ADDRS"
+
+_TRUTHY: Final[frozenset[str]] = frozenset({"1", "true", "yes", "on"})
+
+
+def _is_loopback(address: str) -> bool:
+    """Whether ``address`` reaches only the machine the stack runs on."""
+    host = address.strip().lower()
+    if not host:
+        return True
+    # Strip a port, and the brackets an IPv6 host:port form carries.
+    if host.startswith("["):
+        host = host.partition("]")[0].lstrip("[")
+    elif host.count(":") == 1:
+        host = host.partition(":")[0]
+    if host in {"localhost", "::1", "ip6-localhost"}:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        # A hostname that is not obviously loopback. Treat as reachable: the
+        # safe answer when the question cannot be decided is the one that
+        # refuses the bypass.
+        return False
+
+
+def auth_bypass_refusal(env: str | None = None) -> str | None:
+    """Why the anonymous shim must not serve this request, or ``None``.
+
+    Returns a sentence for the log, so an operator who expected the bypass
+    learns which condition withheld it rather than seeing an unexplained 401.
+    """
+    resolved = _normalize_env(env if env is not None else current_env_from_os())
+    if resolved not in AUTH_BYPASS_ENVIRONMENTS:
+        return f"ENVIRONMENT is {resolved or 'unset'!r}, which is not one of {sorted(AUTH_BYPASS_ENVIRONMENTS)}"
+    if os.getenv(DEV_AUTH_BYPASS_VAR, "").strip().lower() not in _TRUTHY:
+        return (
+            f"{DEV_AUTH_BYPASS_VAR} is not set. Naming a development "
+            "environment no longer enables the anonymous shim on its own; set "
+            f"{DEV_AUTH_BYPASS_VAR}=1 deliberately, or use "
+            "infra/compose/docker-compose.dev.yml, which sets it"
+        )
+    published = [a for a in os.getenv(PUBLISHED_BIND_VAR, "").split(",") if a.strip()]
+    reachable = [a.strip() for a in published if not _is_loopback(a)]
+    if reachable:
+        return (
+            f"{DEV_AUTH_BYPASS_VAR} is set, but this deployment publishes "
+            f"{', '.join(reachable)}, which is not loopback. An anonymous "
+            "administrator on a reachable address is not a developer "
+            "convenience. Bind to 127.0.0.1, or authenticate"
+        )
+    return None
 
 
 def current_env_from_os() -> str:
@@ -297,6 +386,43 @@ class Settings(BaseSettings):
     )
     HUNT_SCHEDULER_POLL_INTERVAL_SECONDS: int = 30
 
+    # ------------------------------------------------------------------
+    # Intel-driven retro-hunts (gap-closure Phase 8.1).
+    #
+    # Off by default at the deployment level *and* per tenant. Two switches
+    # rather than one because they answer different questions: this one is the
+    # operator's ("may this deployment consume the intel topic at all"), and
+    # ``retro_hunt_settings.enabled`` is the customer's ("may AiSOC sweep my
+    # history"). A sweep costs warehouse time and, where it reaches a
+    # connected SIEM, possibly money, so neither answer may be assumed.
+    #
+    # The topic default is the one the *producer* actually uses.
+    # ``ThreatIntelPipeline.__init__`` carries a ``threat-intel-events``
+    # default that nothing reaches, because ``services/threatintel``'s
+    # lifespan overrides it with ``KAFKA_TOPIC_THREAT_INTEL``. A consumer that
+    # subscribed to the constructor default would read an empty topic forever
+    # and report healthy while doing so, so ``scripts/check_ioc_lake_mapping.py``
+    # compares this value against that service's setting.
+    # ------------------------------------------------------------------
+    # Default **off**, deliberately and permanently.
+    #
+    # A retro-hunt replays every newly-published indicator against a
+    # tenant's entire recorded history, so arming it on upgrade would
+    # change what a deployment does to its own lake without anyone asking
+    # — the same reasoning as the retention purge worker below.
+    #
+    # Off by default is not the same as untested: `retro-hunt-live.yml`
+    # grades the sweep and the consumer on every pull request, with the
+    # flag **on**, against a real ClickHouse and a real broker. See
+    # `docs/audit/MATURITY_DEFINITION.md` on why a flag's default does not
+    # bear on maturity but an ungraded flag does.
+    RETRO_HUNT_ENABLED: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("RETRO_HUNT_ENABLED", "AISOC_RETRO_HUNT_ENABLED"),
+    )
+    KAFKA_TOPIC_THREAT_INTEL: str = "aisoc.threat_intel"
+    RETRO_HUNT_CONSUMER_GROUP: str = "aisoc-retro-hunt"
+
     # Retention purge worker. Applies each tenant's configured retention
     # window by deleting aged rows from the ClickHouse lake and the Postgres
     # alerts table.
@@ -321,6 +447,53 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("RETENTION_WORKER_DRY_RUN", "AISOC_RETENTION_WORKER_DRY_RUN"),
     )
     RETENTION_WORKER_INTERVAL_SECONDS: int = 21600  # 6h
+
+    # Approval-SLA expiry (deferral 9b). On by default, unlike the retention
+    # purge: that one deletes data, this one marks an already-abandoned
+    # request as abandoned and dispatches nothing. Leaving it off would keep
+    # the state it closes, where a pending containment waits forever and
+    # nobody can tell it from one still under consideration.
+    APPROVAL_EXPIRY_ENABLED: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("APPROVAL_EXPIRY_ENABLED", "AISOC_APPROVAL_EXPIRY_ENABLED"),
+    )
+    APPROVAL_EXPIRY_INTERVAL_SECONDS: int = 300  # 5m
+
+    # Shadow-reconciliation sweep (gap-closure Phase 2.1, D15). Polls each
+    # measuring tenant's own SIEM for the closures their analysts made there,
+    # so a tenant whose queue lives in Splunk ES still accumulates the track
+    # record autonomy is earned on.
+    #
+    # Default **off**, per the standing rule that a feature which calls out
+    # ships off by default. Two different people are involved: a tenant
+    # enabling shadow mode has asked to be measured, and the operator of the
+    # deployment is the one who decides whether the platform may reach a
+    # third-party API on a timer. `GET /api/v1/health/shadow-reconciliation`
+    # reports "disabled" in those words rather than looking like a healthy
+    # idle sweep.
+    #
+    # Every other value here bounds what this deployment does to somebody
+    # else's SIEM: the tick cadence, a per-connector floor so a short cadence
+    # cannot become a poll storm, a cap on connectors per pass so a large
+    # estate is spread across passes, and a cap on one window so a connector
+    # that was blocked for a month catches up in steps rather than asking for
+    # the month in a single search.
+    SHADOW_RECONCILE_ENABLED: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("SHADOW_RECONCILE_ENABLED", "AISOC_SHADOW_RECONCILE_ENABLED"),
+    )
+    SHADOW_RECONCILE_INTERVAL_SECONDS: int = 900  # 15m
+    SHADOW_RECONCILE_MIN_CONNECTOR_INTERVAL_SECONDS: int = 3600  # 1h
+    SHADOW_RECONCILE_MAX_CONNECTORS_PER_TICK: int = 10
+    # Re-read this much of the previous window. A vendor's search index lags
+    # its own close events, so a window starting exactly where the last one
+    # ended steps over anything indexed late. Re-reading is free of
+    # consequence: an already-graded finding comes back as already_resolved.
+    SHADOW_RECONCILE_OVERLAP_SECONDS: int = 900  # 15m
+    # How far a first pass may reach back when a connector has no watermark.
+    SHADOW_RECONCILE_MAX_LOOKBACK_HOURS: int = 168  # 7d
+    SHADOW_RECONCILE_MAX_WINDOW_HOURS: int = 24
+    SHADOW_RECONCILE_LIMIT: int = 1000
 
     # Database
     # The default points at the bundled compose Postgres with its dev password.
@@ -484,10 +657,11 @@ class Settings(BaseSettings):
     # fan-out auth), so the realtime edge can be rotated independently and a
     # leaked ticket secret never forges a full API session.
     #
-    # When empty in a development-class environment, both services fall back
-    # to ``DEV_REALTIME_TICKET_SECRET`` so local docker-compose "just works".
-    # Outside development the ticket endpoint fails closed (503) until a real
-    # secret is wired, and the realtime service rejects every connection.
+    # Generated by ``make up`` and passed to both this service and realtime.
+    # When empty the ticket endpoint fails closed (503) and the realtime edge
+    # rejects every connection, in every environment — there is no development
+    # fallback, because the one that used to be here was a constant committed
+    # to this repository and no manifest ever set the real secret.
     AISOC_REALTIME_JWT_SECRET: str = ""
     # Time-to-live, in seconds, for minted realtime tickets. Kept short so a
     # leaked ticket is only briefly useful; the frontend re-mints on every
@@ -766,17 +940,23 @@ def realtime_ticket_secret(s: Settings | None = None) -> str | None:
 
     * If ``AISOC_REALTIME_JWT_SECRET`` is set to a non-empty, non-insecure
       value, use it (any environment).
-    * Otherwise, in a development-class environment, fall back to the shared
-      ``DEV_REALTIME_TICKET_SECRET`` so local stacks work with zero config.
-    * Otherwise (production with the secret unset or set to a known insecure
-      placeholder), return ``None`` — the caller must fail closed.
+    * Otherwise return ``None`` — the caller must fail closed.
+
+    There is deliberately no development fallback. Both this and the Node
+    verifier used to fall back to ``DEV_REALTIME_TICKET_SECRET``, a constant
+    committed to this repository, and no manifest ever set the real secret or
+    the environment variable the production check read — so that constant was
+    the effective HMAC key everywhere, and anyone who could reach the realtime
+    edge could mint a ticket for any tenant (GHSA-4m55-xhcm-wjcr).
+
+    ``make up`` now generates ``AISOC_REALTIME_JWT_SECRET`` and compose passes
+    it to this service and to realtime, so local stacks still work with zero
+    manual config — on a real key rather than a published one.
     """
     s = s or settings
     configured = (s.AISOC_REALTIME_JWT_SECRET or "").strip()
     if configured and configured not in INSECURE_SECRET_KEY_DEFAULTS:
         return configured
-    if is_dev_env(s.ENVIRONMENT):
-        return DEV_REALTIME_TICKET_SECRET
     return None
 
 
@@ -795,6 +975,46 @@ def warn_if_insecure_defaults(s: Settings | None = None) -> list[str]:
     """
     s = s or settings
     msgs: list[str] = []
+
+    # Postgres transport. `sslmode` unset means `prefer` in libpq, which
+    # negotiates TLS when the server offers it and silently falls back to
+    # cleartext when it does not — so an operator reading "prefer" has no
+    # way to know which of the two actually happened, and a server that
+    # stops offering TLS downgrades every connection without a single log
+    # line. `disable` is worse and is what `docker-compose.yml` ships.
+    #
+    # Named here rather than enforced in the driver because every service
+    # builds its own engine, and the one place they all pass through at
+    # boot is this collector.
+    dsn = str(getattr(s, "DATABASE_URL", "") or "")
+    if dsn:
+        from urllib.parse import parse_qs as _parse_qs
+        from urllib.parse import urlsplit as _urlsplit
+
+        query = _parse_qs(_urlsplit(dsn).query)
+        sslmode = (query.get("sslmode") or query.get("ssl") or [""])[0].strip().lower()
+        # An explicit, named opt-out, mirroring AISOC_ALLOW_CLEARTEXT_KAFKA.
+        # It exists because in production these messages are boot-blockers
+        # and the bundled compose Postgres serves no certificate — without
+        # it the documented `make up` path fails on a machine where there is
+        # nothing to fix, which is precisely how a security default gets
+        # patched out downstream. The compose file sets it with the reason
+        # written beside it, so the choice is visible rather than absent.
+        if os.getenv("AISOC_ALLOW_CLEARTEXT_DB", "").strip().lower() in {"1", "true", "yes", "on"}:
+            pass
+        elif sslmode in {"disable", "allow", "false", "0"}:
+            msgs.append(
+                f"DATABASE_URL carries sslmode={sslmode!r}, so every query — alerts, "
+                "entities, credentials in the vault's ciphertext column — crosses the "
+                "network in the clear. Use sslmode=require at minimum, or verify-full "
+                "with a CA bundle."
+            )
+        elif not sslmode:
+            msgs.append(
+                "DATABASE_URL sets no sslmode, which libpq reads as 'prefer': TLS when "
+                "the server offers it and cleartext when it does not, with no way to "
+                "tell which happened. Set sslmode explicitly."
+            )
 
     if s.SECRET_KEY in INSECURE_SECRET_KEY_DEFAULTS:
         msgs.append("SECRET_KEY is set to a known insecure placeholder; rotate before exposing this instance to the network.")

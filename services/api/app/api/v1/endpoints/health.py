@@ -75,18 +75,22 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from sqlalchemy import and_, func, select, text
 
-from app.api.v1.deps import AuthUser, DBSession
+from app.api.v1.deps import AuthUser, CurrentUser, DBSession, require_permission
 from app.api.v1.endpoints.metrics import PipelineHealth, PipelineStage
 from app.core.config import settings
+from app.db.rls import TenantDBSession
 from app.models.alert import Alert
 from app.models.connector import Connector
+from app.services.audit_hash import verify_chain_breaks
 from app.services.connector_freshness import compute_freshness
+from app.services.dlq_replay_gateway import DlqReplayRequest, DlqReplayResponse, run_replay
 from app.services.fleet_health import assess_fleet
+from app.services.replay_evaluation.vendors import replayable_connector_ids
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +181,7 @@ async def _ingest_stage(db, tenant_id, *, now: datetime) -> PipelineStage:
             p95_latency_ms=0.0,
             error_rate=0.0,
             status="unknown",
+            unmeasured=["backlog", "p95_latency_ms", "error_rate"],
         )
 
     statuses: list[str] = []
@@ -207,6 +212,7 @@ async def _ingest_stage(db, tenant_id, *, now: datetime) -> PipelineStage:
         p95_latency_ms=0.0,
         error_rate=error_rate,
         status=_worst_status(statuses),
+        unmeasured=["p95_latency_ms"],
     )
 
 
@@ -246,6 +252,7 @@ async def _normalize_stage(
             p95_latency_ms=0.0,
             error_rate=0.0,
             status="unknown",
+            unmeasured=["backlog", "p95_latency_ms", "error_rate"],
         )
 
     p95_seconds = max(0.0, float(p95_seconds))
@@ -254,6 +261,7 @@ async def _normalize_stage(
         backlog=0,
         p95_latency_ms=round(p95_seconds * 1000.0, 2),
         error_rate=0.0,
+        unmeasured=["backlog", "error_rate"],
         status=_status_from_latency(
             p95_seconds=p95_seconds,
             warn_seconds=warn_seconds,
@@ -299,6 +307,7 @@ async def _fuse_stage(
             p95_latency_ms=0.0,
             error_rate=0.0,
             status="unknown",
+            unmeasured=["backlog", "p95_latency_ms", "error_rate"],
         )
 
     p95_seconds = max(0.0, float(p95_seconds))
@@ -307,6 +316,7 @@ async def _fuse_stage(
         backlog=0,
         p95_latency_ms=round(p95_seconds * 1000.0, 2),
         error_rate=0.0,
+        unmeasured=["backlog", "error_rate"],
         status=_status_from_latency(
             p95_seconds=p95_seconds,
             warn_seconds=warn_seconds,
@@ -375,6 +385,7 @@ async def _correlate_stage(
         p95_latency_ms=0.0,
         error_rate=0.0,
         status=status,
+        unmeasured=["p95_latency_ms", "error_rate"],
     )
 
 
@@ -442,6 +453,7 @@ async def _alert_stage(
         p95_latency_ms=latency_ms,
         error_rate=0.0,
         status=status,
+        unmeasured=["error_rate"],
     )
 
 
@@ -618,3 +630,347 @@ async def get_dead_letters(
             for r in rows
         ],
     }
+
+
+@router.get("/audit-chain")
+async def get_audit_chain_health(
+    user: AuthUser,
+    db: DBSession,
+) -> dict[str, Any]:
+    """Whether the audit log's tamper-evidence actually covers this tenant.
+
+    `apps/docs/docs/operations/security.md` states that every state-changing
+    action is appended to an immutable, hash-chained log. That claim is only
+    true of rows that carry a hash, and the one signal that a row did not was
+    a `logger.warning` — which fired on every `alerts.explain` against a
+    default install for as long as a best-effort cost write could abort the
+    transaction underneath it. Nobody noticed, because an append-only log
+    going quiet looks exactly like an idle one.
+
+    So the question gets a surface. `unchained` counts rows this tenant holds
+    with no `entry_hash`, split into the ones written before migration 043
+    (which never had one and are not a defect) and the ones written after it
+    (which are). A reviewer asking "is the chain intact?" gets a number rather
+    than a grep.
+
+    `verified` replays the chain with `verify_chain` over the most recent
+    window, so a row that was rewritten in place is found rather than assumed
+    absent.
+
+    Since migration 074 the replay also separates breaks by `chain_epoch`.
+    Epoch 1 is the pre-074 unserialized writer, which could fork two audit
+    rows of one request onto the same predecessor; those rows were left
+    exactly as written rather than re-chained, so a healthy deployment can
+    legitimately hold epoch-1 breaks forever. An epoch-2 break cannot be
+    historical and is the number worth alerting on.
+    """
+    window = 500
+
+    counts = (
+        (
+            await db.execute(
+                text(
+                    """
+            SELECT
+              count(*) FILTER (WHERE entry_hash IS NULL)     AS unchained,
+              count(*) FILTER (WHERE entry_hash IS NOT NULL) AS chained,
+              count(*)                                       AS total,
+              count(*) FILTER (WHERE chain_epoch >= 2)       AS epoch2,
+              min(created_at) FILTER (WHERE entry_hash IS NULL) AS oldest_unchained,
+              max(created_at) FILTER (WHERE entry_hash IS NULL) AS newest_unchained
+            FROM audit_log
+            WHERE tenant_id = :tid
+            """
+                ),
+                {"tid": user.tenant_id},
+            )
+        )
+        .mappings()
+        .one()
+    )
+
+    # Ordered by `chain_index` first, which is the order the serialized
+    # appender actually chained in. `(created_at, id)` is the fallback for
+    # epoch-1 rows, which have no index — and is precisely the ambiguity
+    # `chain_index` exists to remove, since two rows sharing a microsecond
+    # tie-break on a random UUID and can replay in an order nobody wrote.
+    rows = (
+        (
+            await db.execute(
+                text(
+                    """
+                SELECT id, tenant_id, actor_id, actor_email, actor_ip,
+                       action, resource, resource_id, changes, metadata, created_at,
+                       prev_hash, entry_hash, chain_index, chain_epoch
+                FROM audit_log
+                WHERE tenant_id = :tid
+                ORDER BY chain_index DESC NULLS LAST, created_at DESC, id DESC
+                LIMIT :lim
+                """
+                ),
+                {"tid": user.tenant_id, "lim": window},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    replay = [dict(r) for r in reversed(rows)]
+    breaks = verify_chain_breaks(replay)
+    intact = not breaks
+    bad_index = int(breaks[0]["index"]) if breaks else None
+    reason = str(breaks[0]["reason"]) if breaks else None
+    epoch2_breaks = [b for b in breaks if (b.get("chain_epoch") or 1) >= 2]
+
+    head = (
+        (
+            await db.execute(
+                text("SELECT head_hash, next_index, updated_at FROM audit_chain_head WHERE tenant_id = :tid"),
+                {"tid": user.tenant_id},
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+
+    unchained = int(counts["unchained"] or 0)
+    return {
+        # Two facts, reported separately, because they have different causes
+        # and a single boolean would hide that. `chain_complete` is about rows
+        # written with no hash at all — what a failed chain computation
+        # produces, and what `aisoc_audit_chain_failures_total` counts.
+        # `replay_intact` is about the links between rows that do have one.
+        "chain_complete": unchained == 0,
+        "total_rows": int(counts["total"] or 0),
+        "chained_rows": int(counts["chained"] or 0),
+        # Every row here is one the tamper-evidence claim does not cover.
+        # Migration 043 made the columns nullable so existing deployments
+        # could adopt the chain without a flag day, so a non-zero count on an
+        # old tenant may be legacy — the timestamps say which.
+        "unchained_rows": unchained,
+        "oldest_unchained_at": counts["oldest_unchained"].isoformat() if counts["oldest_unchained"] else None,
+        "newest_unchained_at": counts["newest_unchained"].isoformat() if counts["newest_unchained"] else None,
+        "replay_window": len(replay),
+        # `replay_intact` covers the whole window including history. It can be
+        # false forever on a deployment that forked before migration 074, and
+        # that is the honest answer — those rows were not re-chained, because
+        # rewriting an append-only log so a known-broken history reads clean
+        # is the integrity problem the chain exists to detect.
+        "replay_intact": intact,
+        "replay_broken_at_index": bad_index,
+        "replay_reason": reason,
+        # Every break, not just the first. One forked append and ongoing
+        # tampering are different facts and a single boolean cannot tell them
+        # apart. Capped so a badly broken chain cannot return a huge payload.
+        "replay_breaks": breaks[:20],
+        "replay_break_count": len(breaks),
+        # The number to alert on. Epoch 2 is the serialized appender, whose
+        # forks are prevented by `uq_audit_log_chain_successor` rather than
+        # merely made unlikely — so a non-zero count here is a real defect or
+        # real tampering, never leftover history.
+        "replay_breaks_since_serialized_writer": len(epoch2_breaks),
+        "rows_from_serialized_writer": int(counts["epoch2"] or 0),
+        # The append head itself. A tenant that has audit rows and no head row
+        # would restart its chain from genesis on the next append, so its
+        # absence is worth seeing rather than inferring.
+        "chain_head": (
+            {
+                "head_hash": head["head_hash"],
+                "next_index": int(head["next_index"]),
+                "updated_at": head["updated_at"].isoformat() if head["updated_at"] else None,
+            }
+            if head is not None
+            else None
+        ),
+        # The counter is the alertable half; this is the on-demand half.
+        "metric": "aisoc_audit_chain_failures_total",
+    }
+
+
+@router.get("/shadow-reconciliation")
+async def get_shadow_reconciliation_health(
+    user: AuthUser,
+    db: DBSession,
+) -> dict[str, Any]:
+    """Whether closures made in this tenant's own SIEM are being polled back.
+
+    Gap-closure Phase 2.1 (D15).
+
+    A sweep that silently stopped and a sweep with nothing to do look identical
+    from outside, and that ambiguity is what made the original gap invisible:
+    the reconciler existed, nothing called it, and the only symptom available
+    to an operator was a scorecard that never filled in. So this reports the
+    subscription in every state, including the healthy one and the idle one,
+    and names which it is.
+
+    ``state`` is one of:
+
+    ``disabled``    the operator has not switched the sweep on. Not a fault,
+                    and not a healthy idle sweep either.
+    ``not_measuring`` the sweep runs, but this tenant has no alert class in
+                    shadow mode, so there is nothing to reconcile.
+    ``no_connector``  this tenant is measuring and has no enabled connector of
+                    a type with a closed-finding reader. Agreement is being
+                    measured on AiSOC closures only, which is the honest answer
+                    and is stated rather than left to be inferred.
+    ``blocked``     at least one connector needs an operator. The reason is a
+                    sentence, and it will not clear by waiting.
+    ``degraded``    at least one connector is failing transiently and is being
+                    retried.
+    ``ok``          every configured connector polled.
+    """
+    enabled = bool(settings.SHADOW_RECONCILE_ENABLED)
+
+    measuring = (
+        (
+            await db.execute(
+                text(
+                    """
+                    SELECT alert_class, COALESCE(enabled_at, updated_at) AS since
+                    FROM aisoc_shadow_mode
+                    WHERE tenant_id = :tid AND enabled IS TRUE
+                    ORDER BY alert_class
+                    """
+                ),
+                {"tid": user.tenant_id},
+            )
+        )
+        .mappings()
+        .all()
+    )
+
+    rows = (
+        (
+            await db.execute(
+                text(
+                    """
+                    SELECT s.connector_id, s.vendor, s.watermark_at, s.last_run_at, s.last_status,
+                           s.last_detail, s.last_considered, s.last_matched, s.consecutive_failures,
+                           s.blocked_reason, s.blocked_at, s.retry_after, c.name AS connector_name
+                    FROM aisoc_shadow_reconcile_state s
+                    LEFT JOIN connectors c ON c.id = s.connector_id AND c.tenant_id = s.tenant_id
+                    WHERE s.tenant_id = :tid
+                    ORDER BY s.last_run_at DESC NULLS LAST
+                    """
+                ),
+                {"tid": user.tenant_id},
+            )
+        )
+        .mappings()
+        .all()
+    )
+
+    # Which of this tenant's connectors the sweep *could* poll, asked of the
+    # same table the sweep asks so the two cannot disagree about what counts.
+    pollable = int(
+        (
+            await db.execute(
+                text(
+                    """
+                    SELECT COUNT(*)::int FROM connectors
+                    WHERE tenant_id = :tid AND is_enabled IS TRUE AND connector_type = ANY(:replayable)
+                    """
+                ),
+                {"tid": user.tenant_id, "replayable": replayable_connector_ids()},
+            )
+        ).scalar_one()
+        or 0
+    )
+
+    blocked = [r for r in rows if r["blocked_reason"]]
+    failing = [r for r in rows if r["last_status"] == "transient"]
+
+    if not enabled:
+        state = "disabled"
+        summary = (
+            "The shadow-reconciliation sweep is switched off, so closures your analysts make in your own "
+            "SIEM are not being polled back. Agreement is measured on closures made in AiSOC only."
+        )
+    elif not measuring:
+        state = "not_measuring"
+        summary = "No alert class is in shadow mode for this tenant, so there is nothing to reconcile."
+    elif pollable == 0:
+        state = "no_connector"
+        summary = (
+            "This tenant is measuring but has no enabled connector of a type with a closed-finding reader "
+            f"({', '.join(replayable_connector_ids())}). Agreement is measured on closures made in AiSOC only."
+        )
+    elif blocked:
+        state = "blocked"
+        summary = f"{len(blocked)} connector(s) need an operator before reconciliation can resume."
+    elif failing:
+        state = "degraded"
+        summary = f"{len(failing)} connector(s) are failing transiently and are being retried."
+    else:
+        state = "ok"
+        summary = f"Polling {pollable} connector(s) for closures made in your own SIEM."
+
+    return {
+        "state": state,
+        "summary": summary,
+        "enabled": enabled,
+        "interval_seconds": int(settings.SHADOW_RECONCILE_INTERVAL_SECONDS) if enabled else None,
+        "measuring_classes": [r["alert_class"] for r in measuring],
+        "pollable_connectors": pollable,
+        "supported_connector_types": replayable_connector_ids(),
+        "connectors": [
+            {
+                "connector_id": str(r["connector_id"]),
+                "connector_name": r["connector_name"],
+                "vendor": r["vendor"],
+                "status": r["last_status"],
+                "detail": r["last_detail"],
+                "watermark_at": r["watermark_at"].isoformat() if r["watermark_at"] else None,
+                "last_run_at": r["last_run_at"].isoformat() if r["last_run_at"] else None,
+                "closures_read": int(r["last_considered"] or 0),
+                "closures_matched": int(r["last_matched"] or 0),
+                "consecutive_failures": int(r["consecutive_failures"] or 0),
+                "needs_operator": bool(r["blocked_reason"]),
+                "blocked_reason": r["blocked_reason"],
+                "blocked_at": r["blocked_at"].isoformat() if r["blocked_at"] else None,
+                "retry_after": r["retry_after"].isoformat() if r["retry_after"] else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.post("/dead-letters/replay", response_model=DlqReplayResponse)
+async def replay_dead_letters(
+    request: DlqReplayRequest,
+    user: Annotated[CurrentUser, Depends(require_permission("connectors:write"))],
+    db: TenantDBSession,
+) -> DlqReplayResponse:
+    """Re-read a bounded range of refused messages and replay what now passes.
+
+    The action that follows a dead-letter queue, and the one Phase 5 left
+    undone: the backlog was reportable and nothing could drain it.
+
+    Safe rather than merely possible, in four ways.
+
+    *Deliberate.* The range is `(topic, partition, start_offset)`, supplied by
+    the caller. There is no "replay the backlog" — the excerpt stored on a
+    dead-letter row is a truncated triage record, not the event, so the
+    replay re-reads the real message from Kafka and the operator says which.
+
+    *Bounded.* `max_messages` is capped at 1000 by this request model, again
+    by the fusion service, and again by a CHECK constraint on the audit
+    table. A bound in one place is a bound the next caller skips.
+
+    *Authorised and attributable.* `connectors:write` rather than the
+    identity-only dependency the sibling GET carries, because this one
+    re-injects production traffic. The row records who asked.
+
+    *Observable, and honest about failure.* One `aisoc_dlq_replays` row per
+    request including dry runs, written before fusion is called so an
+    attempt that hangs still left evidence, and a failed replay reports the
+    reason rather than a zero that reads like "nothing to do".
+
+    The property that makes it safe at all is in fusion: every message is
+    re-validated by the validator that refused it, and one that still fails
+    is refused again instead of being produced. Replaying a poison batch into
+    the consumer that rejected it reproduces the outage, so a preview whose
+    `would_pass` is zero is the answer "your fix has not landed".
+
+    Defaults to a dry run. Pass `execute: true` once the preview is clean.
+    """
+    return await run_replay(db, tenant_id=user.tenant_id, requested_by=user.user_id, request=request)

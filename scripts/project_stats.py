@@ -81,12 +81,35 @@ def _executable_detections() -> int | None:
     return total
 
 
+#: Directories under `detections/` holding YAML that is not a detection rule.
+#: Kept equal to `detection_truth_table.py`'s `SKIP_DIRS`, because a rule
+#: count and a file count published under the same words is how two surfaces
+#: come to disagree while both are right.
+_NON_RULE_DIRS = {"fixtures", "playbooks"}
+
+
 def _detection_files_on_disk() -> int:
-    """Every YAML under detections/, including the quarantine.
+    """Detection *rules* on disk, including the quarantine.
 
     Reported alongside the executable count so the gap is visible rather than
     conflated. The two numbers have been published interchangeably before.
+
+    This used to count every YAML under `detections/` and print the result as
+    "Detection files on disk", which put 7,016 against the README's 6,991
+    under the same label. Both were right and they were counting different
+    things: the extra 25 are the standalone response playbooks under
+    `detections/playbooks/`, which are not detection rules. The rule count is
+    now the one the truth table and the README publish, and the wider file
+    count is printed beside it saying what it includes.
     """
+    d = ROOT / "detections"
+    if not d.is_dir():
+        return 0
+    return sum(1 for p in d.rglob("*.yaml") if not _NON_RULE_DIRS & set(p.relative_to(d).parts))
+
+
+def _detection_yaml_files() -> int:
+    """Every YAML under detections/, rules and playbooks alike."""
     d = ROOT / "detections"
     return sum(1 for _ in d.rglob("*.yaml")) if d.is_dir() else 0
 
@@ -102,8 +125,22 @@ def _compose_services() -> dict[str, int]:
         return {}
     doc = yaml.safe_load(f.read_text(encoding="utf-8")) or {}
     services = doc.get("services") or {}
-    core = [n for n, s in services.items() if not (s or {}).get("profiles")]
-    return {"core": len(core), "total": len(services), "optional": len(services) - len(core)}
+    # One-shots are excluded, matching `scripts/check_profile_service_counts.py`,
+    # which is the gate that holds every published figure to the compose file.
+    #
+    # This counted them, so it printed "17 core" against the 16 that gate
+    # enforces and the README states. Two scripts disagreeing about one
+    # number is how a reader learns not to trust either: "long-running
+    # services" is the figure the documents publish, and `ollama-pull`
+    # fetches the model and exits.
+    one_shot = frozenset({"ollama-pull"})
+    core = [n for n, svc in services.items() if not (svc or {}).get("profiles") and n not in one_shot]
+    resident = [n for n in services if n not in one_shot]
+    return {
+        "core": len(core),
+        "total": len(resident),
+        "optional": len(resident) - len(core),
+    }
 
 
 def _claim_gate_rows() -> dict[str, int]:
@@ -112,13 +149,25 @@ def _claim_gate_rows() -> dict[str, int]:
     if not f.is_file():
         return {}
     counts = {"GATED": 0, "PARTIAL": 0, "NO GATE": 0}
+
+    # The status column is located by reading the header, not by index.
+    # It was hardcoded to cells[3], and when a `Profile` column was
+    # inserted ahead of it every row's status became "core" — so this
+    # figure read **0 rows, 0 gated** against a real 278 for as long as
+    # that column has existed. Nothing caught it because the README does
+    # not publish this number, so no comparison existed to fail.
+    status_idx: int | None = None
     for line in f.read_text(encoding="utf-8").splitlines():
         if not line.startswith("| ") or line.startswith("| ---"):
             continue
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if len(cells) < 4:
+        if status_idx is None:
+            if "Status" in cells:
+                status_idx = cells.index("Status")
             continue
-        status = cells[3].upper()
+        if len(cells) <= status_idx:
+            continue
+        status = cells[status_idx].upper()
         # `GATED (ratchet)` counts as gated; check NO GATE first so the
         # substring "GATE" does not swallow it.
         if "NO GATE" in status:
@@ -141,6 +190,7 @@ def collect() -> dict:
         "connectors": _connectors(),
         "detections_executable": _executable_detections(),
         "detections_files_on_disk": _detection_files_on_disk(),
+        "detections_yaml_files": _detection_yaml_files(),
         "services_in_repo": _python_services(),
         "compose": _compose_services(),
         "claim_gate": _claim_gate_rows(),
@@ -154,13 +204,15 @@ def collect() -> dict:
 def _render(stats: dict) -> str:
     c = stats["compose"]
     g = stats["claim_gate"]
+    playbook_yaml = stats["detections_yaml_files"] - stats["detections_files_on_disk"]
     lines = [
         "",
         f"  AiSOC {stats.get('version', '?')} — figures recounted from the tree",
         "",
         f"  Connectors (registered)        {stats['connectors']}",
         f"  Detections (engine loads)      {stats['detections_executable']}",
-        f"  Detection files on disk        {stats['detections_files_on_disk']}  (includes quarantined imports the engine never evaluates)",
+        f"  Detection rules on disk        {stats['detections_files_on_disk']}  (includes quarantined imports the engine never evaluates)",
+        f"  YAML files under detections/   {stats['detections_yaml_files']}  (the extra {playbook_yaml} are response playbooks, not rules)",
         f"  Services in repo               {stats['services_in_repo']}",
     ]
     if c:

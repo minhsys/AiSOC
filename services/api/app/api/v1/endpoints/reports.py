@@ -1,5 +1,14 @@
 """Auto-generated board / executive report endpoints.
 
+Authorization
+-------------
+Templates and generation require ``reports:write``, held by ``tenant_admin``
+and ``soc_lead``. It is the permission named for exactly this act, it already
+existed, and it was already withheld from ``viewer`` — which could otherwise
+delete a board template or queue a report addressed to a recipient list of
+its choosing, since ``generate_report`` takes ``recipients`` from the body
+and persists it as ``delivered_to``.
+
 Author: Beenu <beenu@cyble.com>
 """
 
@@ -7,7 +16,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import HTMLResponse, Response
@@ -15,10 +24,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.v1.deps import CurrentUser
+from app.api.v1.deps import CurrentUser, require_permission
 from app.api.v1.endpoints.auth import get_current_user
 from app.db.database import get_db
 from app.models.report import ReportArtefact, ReportTemplate
+from app.services.branding.resolver import resolve_branding
 from app.services.digest_html import render_digest_html
 from app.services.digest_pdf import WeasyPrintUnavailableError, render_digest_pdf
 from app.services.executive_digest import ExecutiveDigest, build_weekly_digest
@@ -100,8 +110,8 @@ async def list_templates(
 @router.post("/templates", response_model=TemplateOut, status_code=status.HTTP_201_CREATED)
 async def create_template(
     body: TemplateCreate,
-    db: AsyncSession = Depends(get_db),
-    current_user: CurrentUser = Depends(get_current_user),
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[CurrentUser, Depends(require_permission("reports:write"))],
 ) -> ReportTemplate:
     template = ReportTemplate(
         **body.model_dump(),
@@ -129,8 +139,8 @@ async def get_template(
 @router.delete("/templates/{template_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 async def delete_template(
     template_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
-    current_user: CurrentUser = Depends(get_current_user),
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[CurrentUser, Depends(require_permission("reports:write"))],
 ) -> None:
     tmpl = await db.get(ReportTemplate, template_id)
     if not tmpl or tmpl.tenant_id != current_user.tenant_id:
@@ -166,8 +176,8 @@ async def list_artefacts(
 @router.post("/generate", response_model=ArtefactOut, status_code=status.HTTP_202_ACCEPTED)
 async def generate_report(
     body: GenerateRequest,
-    db: AsyncSession = Depends(get_db),
-    current_user: CurrentUser = Depends(get_current_user),
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[CurrentUser, Depends(require_permission("reports:write"))],
 ) -> ReportArtefact:
     """Enqueue a report generation job. Returns the artefact record immediately with status='pending'."""
     artefact = ReportArtefact(
@@ -243,11 +253,18 @@ async def weekly_digest(
     )
 
     if fmt == "html":
-        return HTMLResponse(content=render_digest_html(digest))
+        # Resolved from the caller's tenant, so a white-labelled
+        # organisation's report carries its own product name, palette and
+        # logo. The logo is inlined because this HTML becomes a PDF rendered
+        # server-side, and a remote reference there is an outbound request
+        # made by the server to a customer-supplied address.
+        branding = await resolve_branding(db, current_user.tenant_id, inline_logo=True)
+        return HTMLResponse(content=render_digest_html(digest, branding))
 
     if fmt == "pdf":
         try:
-            pdf_bytes = render_digest_pdf(digest)
+            branding = await resolve_branding(db, current_user.tenant_id, inline_logo=True)
+            pdf_bytes = render_digest_pdf(digest, branding)
         except WeasyPrintUnavailableError as exc:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

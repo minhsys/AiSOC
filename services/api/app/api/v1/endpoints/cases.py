@@ -33,22 +33,25 @@ Endpoints
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import uuid
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import quote
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query, Response, status
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import text
+from sqlalchemy import select, text
 
-from app.api.v1.deps import AuthUser, DBSession
+from app.api.v1.deps import AuthUser, DBSession, require_permission
 from app.core.logging import safe_log_value
+from app.services import case_orchestration, case_status, evidence_custody
+from app.services.audit import emit_audit
 from app.services.case_fanout import (
     FanoutResult,
     fanout_create_case,
@@ -68,6 +71,16 @@ router = APIRouter(prefix="/cases", tags=["cases"])
 # `/cases/{id}/investigations/{run_id}` for the web console and proxy through
 # to the agents service so the front end has a single, stable API origin.
 _AGENTS_URL = (os.getenv("AGENTS_SERVICE_URL") or os.getenv("AGENTS_API_URL") or "http://agents:8084").rstrip("/")
+
+# The agents service guards its routes with require_console_or_service_auth:
+# it accepts a console JWT or the shared service token paired with an explicit
+# tenant header, and fails closed (401 "missing bearer credential") otherwise.
+# This proxy forwards the user's *claims* but must present a credential of its
+# own: the agents service does not share the API's user database. Resolve the
+# same per-service token the agents service verifies (specific first, then
+# shared), matching tenant_scope.resolve_service_token's precedence.
+_AGENTS_SERVICE_TOKEN = (os.getenv("AISOC_AGENTS_SERVICE_TOKEN") or os.getenv("AISOC_SERVICE_TOKEN") or "").strip()
+
 
 # Tight allowlist for proxied request paths. We only ever proxy to a fixed
 # upstream (`_AGENTS_URL`) on a known set of investigation routes, so the
@@ -91,18 +104,58 @@ def _validate_agents_path(path: str) -> str:
 # Pydantic schemas
 # ────────────────────────────────────────────────────────────────────────────
 
-CaseStatus = Literal["new", "triaged", "investigating", "contained", "resolved", "closed"]
+CaseStatus = Literal["new", "triaged", "investigating", "contained", "resolved", "closed",
+                  # legacy/console aliases, normalized to the ladder above in update_case
+                  "open", "in_progress", "pending", "pending_closure", "cancelled"]
 CaseSeverity = Literal["info", "low", "medium", "high", "critical"]
 
 # Valid forward-only state transitions
-_TRANSITIONS: dict[str, set[str]] = {
-    "new": {"triaged"},
-    "triaged": {"investigating"},
-    "investigating": {"contained", "resolved"},
-    "contained": {"resolved"},
-    "resolved": {"closed"},
-    "closed": set(),
+# One copy, in `case_status`. This used to be declared here and the
+# metrics layer filtered on `"open"` and `"in_progress"` — states this
+# machine cannot produce — so two surfaces disagreed about what a case
+# status even is.
+_TRANSITIONS: dict[str, set[str]] = case_status.TRANSITIONS
+
+# The console historically spoke a second vocabulary (open/in_progress/pending/
+# cancelled — see packages/types CaseStatus), so every status the UI can send
+# is normalized onto the canonical ladder *before* the transition gate above
+# runs. Aliases never bypass validation; they only translate the vocabulary.
+_STATUS_ALIASES: dict[str, str] = {
+    "open": "new",
+    "in_progress": "investigating",
+    "pending": "contained",
+    "pending_closure": "contained",
+    "cancelled": "closed",
 }
+
+
+def _normalize_status(status: str) -> str:
+    return _STATUS_ALIASES.get(status, status)
+
+
+def _status_transition_ok(current: str, target: str) -> bool:
+    """Upstream's canonical gate: every move must be a declared edge in
+    `case_status.TRANSITIONS`. Backwards moves and undeclared skips are
+    rejected; reopening goes through the explicit reopen action."""
+    return target in _TRANSITIONS.get(current, set())
+
+#: The canonical ladder, in order, for the forward-walk used by the
+#: agent-launch advance.
+_LADDER = list(case_status.ALL_STATUSES)
+
+
+def _forward_to_investigating_ok(current: str) -> bool:
+    """Can an agent-investigation launch move this case to investigating?
+
+    Launching an investigation is a deliberate analyst action taken *on*
+    the case, so it may walk the case forward along the canonical ladder
+    (new -> triaged -> investigating) in one step. What it may never do
+    is move backwards, re-hit the same state, or touch a terminal case --
+    reopening remains the explicit POST /reopen path.
+    """
+    if current not in _LADDER or current in case_status.TERMINAL_STATUSES:
+        return False
+    return _LADDER.index(current) < _LADDER.index(case_status.INVESTIGATING)
 
 
 class CreateCaseRequest(BaseModel):
@@ -180,6 +233,15 @@ class CaseResponse(BaseModel):
     triaged_at: datetime | None
     resolved_at: datetime | None
     closed_at: datetime | None
+    #: When this case was last reopened. `None` means never -- which is the
+    #: honest value for every row that predates migration 090, since we
+    #: cannot know whether a historical case was reopened and inventing a
+    #: timestamp would be worse than saying nothing.
+    reopened_at: datetime | None = None
+    #: How many times. `reopened_at` is overwritten on each reopen, so it
+    #: cannot tell one reopen from four.
+    reopen_count: int = 0
+    reopen_reason: str | None = None
     created_at: datetime
     updated_at: datetime
     created_by: str | None
@@ -319,6 +381,11 @@ def _row_to_case(row: Any) -> CaseResponse:
         description=row.description,
         severity=row.severity,
         status=row.status,
+        # `getattr` with a default because this mapper is also handed rows
+        # from queries that select an explicit column list.
+        reopened_at=getattr(row, "reopened_at", None),
+        reopen_count=getattr(row, "reopen_count", 0) or 0,
+        reopen_reason=getattr(row, "reopen_reason", None),
         assignee=row.assignee,
         mitre_techniques=_coerce_mitre(row.mitre_techniques),
         alert_ids=list(row.alert_ids or []),
@@ -436,7 +503,9 @@ async def list_cases(
 
 
 @router.post("", response_model=CaseResponse, status_code=status.HTTP_201_CREATED, summary="Create case")
-async def create_case(body: CreateCaseRequest, db: DBSession, user: AuthUser) -> CaseResponse:
+async def create_case(
+    body: CreateCaseRequest, db: DBSession, user: Annotated[AuthUser, Depends(require_permission("cases:write"))]
+) -> CaseResponse:
     import json as _json
 
     case_id = uuid.uuid4()
@@ -521,8 +590,135 @@ async def get_case(case_id: str, db: DBSession, user: AuthUser) -> CaseResponse:
     return _row_to_case(row)
 
 
+class ReopenCaseRequest(BaseModel):
+    """Why this case is coming back."""
+
+    reason: str = Field(
+        min_length=8,
+        max_length=2000,
+        description="Why the case is being reopened. Recorded on the case and in the audit log.",
+    )
+    #: Where it lands. Restricted to the states a case can genuinely resume
+    #: in -- reopening straight to `contained` would assert a containment
+    #: nobody performed on this pass.
+    status: Literal["new", "triaged", "investigating"] = "investigating"
+
+
+@router.post("/{case_id}/reopen", response_model=CaseResponse, summary="Reopen a closed case")
+async def reopen_case(
+    case_id: str,
+    body: ReopenCaseRequest,
+    db: DBSession,
+    user: Annotated[AuthUser, Depends(require_permission("cases:write"))],
+) -> CaseResponse:
+    """Bring a terminal case back, deliberately and on the record.
+
+    Its own route rather than a backward edge in `TRANSITIONS`. The forward-only
+    machine is what makes "this case was closed" mean something, and adding
+    `closed -> investigating` to the table would let an ordinary `PATCH` --
+    a title edit that happens to carry a status -- walk a case backwards
+    silently. `PATCH` stays forward-only.
+
+    Three things separate this from a status change:
+
+    * a reason is required, because an unexplained reopen is exactly what an
+      auditor asks about six months later;
+    * `reopen_count` increments, so a case reopened four times is
+      distinguishable from one reopened once;
+    * `closed_at` and `resolved_at` are cleared, because leaving them set
+      would make the case terminal and active at the same time -- and every
+      closure metric reads those columns.
+    """
+    cid = await _resolve_case_id(case_id, db, user.tenant_id)
+    existing = (
+        await db.execute(
+            text("SELECT status, reopen_count FROM aisoc_cases WHERE id = :id AND tenant_id = :tenant_id").bindparams(
+                id=cid, tenant_id=user.tenant_id
+            )
+        )
+    ).fetchone()
+    if not existing:
+        raise HTTPException(status_code=404, detail="Case not found.")
+
+    if existing.status not in case_status.TERMINAL_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Case is {existing.status!r}, which is not a terminal state, so there is nothing "
+                f"to reopen. Use PATCH to move it to {sorted(case_status.TRANSITIONS.get(existing.status, set()))}."
+            ),
+        )
+
+    now = datetime.now(UTC)
+    await db.execute(
+        text(
+            """
+            UPDATE aisoc_cases
+               SET status = :status,
+                   reopened_at = :now,
+                   reopen_count = COALESCE(reopen_count, 0) + 1,
+                   reopen_reason = :reason,
+                   -- Cleared deliberately: a case that is open again has not
+                   -- been closed, and every closure metric reads these.
+                   closed_at = NULL,
+                   resolved_at = NULL,
+                   updated_at = :now
+             WHERE id = :id AND tenant_id = :tenant_id
+            """
+        ).bindparams(
+            status=body.status,
+            now=now,
+            reason=body.reason,
+            id=cid,
+            tenant_id=user.tenant_id,
+        )
+    )
+    await db.commit()
+
+    try:
+        await emit_audit(
+            db=db,
+            tenant_id=user.tenant_id,
+            actor_id=user.user_id,
+            actor_email=user.email,
+            action="case.reopen",
+            resource="case",
+            resource_id=str(cid),
+            changes={
+                "from_status": existing.status,
+                "to_status": body.status,
+                "reason": body.reason,
+                "reopen_count": (existing.reopen_count or 0) + 1,
+            },
+            # Which credential, not just which person. A key owned by an
+            # analyst resolves to that analyst's email, so without this an
+            # auditor cannot tell "Dana reopened this at her console" from "a
+            # key Dana minted a year ago reopened it from a script" -- and
+            # those call for different responses.
+            api_key_prefix=getattr(user, "api_key_prefix", None),
+        )
+    except Exception:  # noqa: BLE001 - an audit failure must not undo the reopen
+        # Roll the *failed audit attempt* back, not the reopen: that already
+        # committed above. Without this the session stays in a failed
+        # transaction and the read below raises, so an audit problem would
+        # surface to the caller as the reopen itself failing -- when in fact
+        # it succeeded and only the log entry did not. A live test caught
+        # exactly that.
+        await db.rollback()
+        logger.exception("cases.reopen.audit_failed case=%s", cid)
+
+    row = (
+        await db.execute(
+            text("SELECT * FROM aisoc_cases WHERE id = :id AND tenant_id = :tenant_id").bindparams(id=cid, tenant_id=user.tenant_id)
+        )
+    ).fetchone()
+    return _row_to_case(row)
+
+
 @router.patch("/{case_id}", response_model=CaseResponse, summary="Update case")
-async def update_case(case_id: str, body: UpdateCaseRequest, db: DBSession, user: AuthUser) -> CaseResponse:
+async def update_case(
+    case_id: str, body: UpdateCaseRequest, db: DBSession, user: Annotated[AuthUser, Depends(require_permission("cases:write"))]
+) -> CaseResponse:
     import json as _json
 
     cid = await _resolve_case_id(case_id, db, user.tenant_id)
@@ -534,12 +730,17 @@ async def update_case(case_id: str, body: UpdateCaseRequest, db: DBSession, user
     if not existing:
         raise HTTPException(status_code=404, detail="Case not found.")
 
+    if body.status is not None:
+        body.status = _normalize_status(body.status)
     if body.status and body.status != existing.status:
-        allowed = _TRANSITIONS.get(existing.status, set())
-        if body.status not in allowed:
+        if not _status_transition_ok(existing.status, body.status):
             raise HTTPException(
                 status_code=422,
-                detail=f"Invalid status transition: {existing.status} → {body.status}. Allowed: {sorted(allowed) or 'none'}",
+                detail=(
+                    f"Invalid status transition: {existing.status} → {body.status}. "
+                    f"Allowed: {sorted(_TRANSITIONS.get(existing.status, set())) or 'none'}; "
+                    "backwards moves require POST /cases/{id}/reopen."
+                ),
             )
 
     now = datetime.now(UTC)
@@ -587,6 +788,16 @@ async def update_case(case_id: str, body: UpdateCaseRequest, db: DBSession, user
         row = (await db.execute(q)).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Case not found.")
+        if body.status is not None:
+            await _append_custody(
+                db,
+                case_id=cid,
+                tenant_id=user.tenant_id,
+                user=user,
+                action="case_closed" if body.status == "closed" else "status_changed",
+                item=body.status,
+                detail={"to": body.status},
+            )
         await db.commit()
     except Exception as exc:
         await db.rollback()
@@ -637,8 +848,85 @@ async def update_case(case_id: str, body: UpdateCaseRequest, db: DBSession, user
     return response
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Evidence custody
+#
+# `evidence_chain` had three readers and no writer, so the report an auditor
+# exports from `GET /cases/{id}/evidence` was always `[]` under a heading
+# saying "Evidence Chain" — which reads as "no evidence was handled" rather
+# than "this product does not record custody".
+#
+# Appended in the same statement that performs the mutation being recorded,
+# so a custody entry cannot exist for a change that did not commit, and a
+# change cannot commit without its entry.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _append_custody(
+    db: Any,
+    *,
+    case_id: Any,
+    tenant_id: Any,
+    user: AuthUser,
+    action: str,
+    item: str | None = None,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    """Append one custody entry to this case's chain.
+
+    Reads the current chain to link the hash, then writes the extended
+    chain back. Best-effort by design: a custody write that failed must
+    not roll back the case change an analyst just made, because losing
+    the work is worse than losing one audit line. The failure is logged
+    at `warning` so it is visible rather than silent.
+    """
+    try:
+        current = await db.scalar(
+            text("SELECT evidence_chain FROM aisoc_cases WHERE id = :id AND tenant_id = :t").bindparams(id=case_id, t=tenant_id)
+        )
+        chain = evidence_custody.append_entry(
+            list(current or []),
+            action=action,
+            actor_id=getattr(user, "user_id", None),
+            actor_email=getattr(user, "email", None),
+            item=item,
+            detail=detail,
+        )
+        await db.execute(
+            text("UPDATE aisoc_cases SET evidence_chain = CAST(:c AS jsonb) WHERE id = :id AND tenant_id = :t").bindparams(
+                c=json.dumps(chain), id=case_id, t=tenant_id
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - never fail the caller's mutation
+        logger.warning(
+            "cases.custody_append_failed action=%s error=%s",
+            str(action).replace("\r", "").replace("\n", " ")[:80],
+            str(exc).replace("\r", "").replace("\n", " ")[:200],
+        )
+
+
+def case_queue_for(case_row: Any, queues: list[Any]) -> Any:
+    """Which queue this case belongs in.
+
+    Routed through `case_orchestration.resolve_queue` so precedence and
+    the name tiebreak live in one place — without the tiebreak two
+    equally-ranked queues resolve by row order and a case appears to
+    move between them on each read.
+    """
+    return case_orchestration.resolve_queue(
+        case_orchestration.CaseFacts(
+            severity=str(getattr(case_row, "severity", "medium") or "medium"),
+            case_type=getattr(case_row, "case_type", None),
+            tags=tuple(getattr(case_row, "tags", None) or ()),
+            opened_at=getattr(case_row, "opened_at", None),
+        ),
+        queues,
+    )
+
 @router.post("/{case_id}/alerts", response_model=CaseResponse, summary="Link alerts to a case")
-async def add_alerts(case_id: str, body: AddAlertsRequest, db: DBSession, user: AuthUser) -> CaseResponse:
+async def add_alerts(
+    case_id: str, body: AddAlertsRequest, db: DBSession, user: Annotated[AuthUser, Depends(require_permission("cases:write"))]
+) -> CaseResponse:
     cid = await _resolve_case_id(case_id, db, user.tenant_id)
     ids_str = [str(a) for a in body.alert_ids]
     q = text("""
@@ -652,8 +940,20 @@ async def add_alerts(case_id: str, body: AddAlertsRequest, db: DBSession, user: 
         row = (await db.execute(q)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Case not found.")
+        await _append_custody(
+            db,
+            case_id=cid,
+            tenant_id=user.tenant_id,
+            user=user,
+            action="alert_linked",
+            item=",".join(ids_str[:20]),
+            detail={"count": len(ids_str)},
+        )
         await db.commit()
-        return _row_to_case(row)
+        refreshed = (
+            await db.execute(text("SELECT * FROM aisoc_cases WHERE id = :id AND tenant_id = :t").bindparams(id=cid, t=user.tenant_id))
+        ).fetchone()
+        return _row_to_case(refreshed or row)
     except HTTPException:
         raise
     except Exception as exc:
@@ -663,7 +963,9 @@ async def add_alerts(case_id: str, body: AddAlertsRequest, db: DBSession, user: 
 
 
 @router.post("/{case_id}/observables", response_model=CaseResponse, summary="Update observable graph")
-async def update_observables(case_id: str, body: UpdateObservablesRequest, db: DBSession, user: AuthUser) -> CaseResponse:
+async def update_observables(
+    case_id: str, body: UpdateObservablesRequest, db: DBSession, user: Annotated[AuthUser, Depends(require_permission("cases:write"))]
+) -> CaseResponse:
     import json as _json
 
     cid = await _resolve_case_id(case_id, db, user.tenant_id)
@@ -709,7 +1011,9 @@ async def update_observables(case_id: str, body: UpdateObservablesRequest, db: D
 
 
 @router.post("/{case_id}/comments", response_model=CommentResponse, status_code=201, summary="Add comment")
-async def add_comment(case_id: str, body: AddCommentRequest, db: DBSession, user: AuthUser) -> CommentResponse:
+async def add_comment(
+    case_id: str, body: AddCommentRequest, db: DBSession, user: Annotated[AuthUser, Depends(require_permission("cases:write"))]
+) -> CommentResponse:
     cid = await _resolve_case_id(case_id, db, user.tenant_id)
     exists = (
         await db.execute(
@@ -783,7 +1087,9 @@ async def list_notes(case_id: str, db: DBSession, user: AuthUser) -> list[Commen
 
 
 @router.post("/{case_id}/notes", response_model=CommentResponse, status_code=201, summary="Add case note (alias of /comments)")
-async def add_note(case_id: str, body: AddCommentRequest, db: DBSession, user: AuthUser) -> CommentResponse:
+async def add_note(
+    case_id: str, body: AddCommentRequest, db: DBSession, user: Annotated[AuthUser, Depends(require_permission("cases:write"))]
+) -> CommentResponse:
     return await add_comment(case_id, body, db, user)
 
 
@@ -891,7 +1197,9 @@ async def case_timeline(case_id: str, db: DBSession, user: AuthUser) -> Timeline
                 # nothing and a poisoned ``alert_ids`` array would otherwise
                 # hydrate another tenant's alert title into this timeline.
                 await db.execute(
-                    text("SELECT id, title, severity, created_at FROM aisoc_alerts WHERE id = :id AND tenant_id = :tenant_id").bindparams(
+                    text(
+                        "SELECT id, title, severity, created_at FROM alerts WHERE id = :id AND tenant_id = CAST(:tenant_id AS uuid)"
+                    ).bindparams(
                         id=alert_id,
                         tenant_id=str(user.tenant_id),
                     )
@@ -974,7 +1282,7 @@ async def create_task(
     case_id: str,
     body: CreateTaskRequest,
     db: DBSession,
-    user: AuthUser,
+    user: Annotated[AuthUser, Depends(require_permission("cases:write"))],
 ) -> TaskResponse:
     cid = await _resolve_case_id(case_id, db, user.tenant_id)
     exists = (
@@ -1025,7 +1333,7 @@ async def update_task(
     task_id: uuid.UUID,
     body: UpdateTaskRequest,
     db: DBSession,
-    user: AuthUser,
+    user: Annotated[AuthUser, Depends(require_permission("cases:write"))],
 ) -> TaskResponse:
     cid = await _resolve_case_id(case_id, db, user.tenant_id)
     sets: list[str] = []
@@ -1089,9 +1397,12 @@ async def _agents_proxy(method: str, path: str, **kwargs: Any) -> httpx.Response
     safe_path = _validate_agents_path(path)
     url = f"{_AGENTS_URL}{safe_path}"
     timeout = kwargs.pop("timeout", 30.0)
+    headers = dict(kwargs.pop("headers", None) or {})
+    if _AGENTS_SERVICE_TOKEN:
+        headers.setdefault("Authorization", f"Bearer {_AGENTS_SERVICE_TOKEN}")
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            return await client.request(method, url, **kwargs)
+            return await client.request(method, url, headers=headers, **kwargs)
     except httpx.HTTPError as exc:
         logger.exception(
             "agents_proxy.request_failed",
@@ -1106,30 +1417,217 @@ async def _agents_proxy(method: str, path: str, **kwargs: Any) -> httpx.Response
         ) from exc
 
 
+async def _investigation_evidence(db: Any, cid: Any, tenant_id: Any) -> tuple[str, dict[str, Any]]:
+    """Assemble what the forensic agent should reason over, from the case's alerts.
+
+    The console used to send the literal string `"Investigate alert: <title>"`
+    and nothing else, so the agent reasoned over a one-line title while
+    auto-triage -- the same agent, the other entry point -- correctly passed
+    the whole `raw_event`. Two paths into one investigator, one of them
+    starved.
+
+    The evidence was never missing. `aisoc_cases.alert_ids` is written at case
+    creation and read by nothing, and `InvestigationRequest` on the agents
+    side has always declared `raw_alert`. This reads the first and fills the
+    second.
+
+    Returns `(summary, raw_alert)`. `raw_alert` stays `{}` when the case has
+    no alerts, which is honest: a case opened by hand has no telemetry, and
+    inventing a shape would hand the groundedness gate something to certify.
+    """
+    case_row = (
+        await db.execute(
+            text("SELECT title, description, severity, alert_ids FROM aisoc_cases WHERE id = :id AND tenant_id = :tenant_id").bindparams(
+                id=cid, tenant_id=tenant_id
+            )
+        )
+    ).fetchone()
+    if case_row is None:
+        return "", {}
+
+    alert_ids = [str(a) for a in (case_row.alert_ids or [])]
+    if not alert_ids:
+        summary = f"{case_row.title}"
+        if case_row.description:
+            summary = f"{summary}\n\n{case_row.description}"
+        return summary, {}
+
+    # Bounded. A correlated case can carry hundreds of alerts and the prompt
+    # has a budget; the newest are the ones an analyst is looking at.
+    rows = (
+        await db.execute(
+            text(
+                """
+                SELECT id, title, description, severity, confidence, status,
+                       connector_type, external_id, mitre_techniques, entities,
+                       raw_event, created_at
+                  FROM alerts
+                 WHERE tenant_id = :tenant_id AND id = ANY(CAST(:ids AS uuid[]))
+                 ORDER BY created_at DESC
+                 LIMIT 25
+                """
+            ).bindparams(tenant_id=tenant_id, ids=alert_ids)
+        )
+    ).fetchall()
+
+    alerts = [
+        {
+            "id": str(r.id),
+            "title": r.title,
+            "description": r.description,
+            "severity": r.severity,
+            "confidence": r.confidence,
+            "status": r.status,
+            "source": r.connector_type,
+            "vendor_id": r.external_id,
+            "mitre_techniques": list(r.mitre_techniques or []),
+            "entities": r.entities or {},
+            # The payload the connector actually delivered. This is the whole
+            # point: everything above is our summary of it.
+            "raw_event": r.raw_event or {},
+            "observed_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
+
+    lines = [case_row.title]
+    if case_row.description:
+        lines.append(case_row.description)
+    lines.append(f"{len(alerts)} correlated alert(s) on this case:")
+    lines += [f"  - [{a['severity']}] {a['title']} (source: {a['source'] or 'unknown'})" for a in alerts]
+
+    raw_alert: dict[str, Any] = {
+        "case": {
+            "id": str(cid),
+            "title": case_row.title,
+            "severity": case_row.severity,
+        },
+        "alerts": alerts,
+        # Stated rather than implied: the agent and the groundedness gate both
+        # need to know whether they are seeing everything.
+        "alert_count": len(alert_ids),
+        "alerts_included": len(alerts),
+        "truncated": len(alert_ids) > len(alerts),
+    }
+    return "\n".join(lines), raw_alert
+
+
 @router.post("/{case_id}/investigate", summary="Launch investigation for case")
 async def case_investigate(
     case_id: str,
     body: InvestigateRequest,
     db: DBSession,
-    user: AuthUser,
+    user: Annotated[AuthUser, Depends(require_permission("cases:write"))],
 ) -> dict[str, Any]:
     cid = await _resolve_case_id(case_id, db, user.tenant_id)
-    exists = (
+    case_row = (
         await db.execute(
-            text("SELECT 1 FROM aisoc_cases WHERE id = :id AND tenant_id = :tenant_id").bindparams(id=cid, tenant_id=user.tenant_id)
+            text("SELECT alert_ids FROM aisoc_cases WHERE id = :id AND tenant_id = :tenant_id").bindparams(id=cid, tenant_id=user.tenant_id)
         )
     ).fetchone()
-    if not exists:
+    if not case_row:
         raise HTTPException(status_code=404, detail="Case not found.")
+    case_alert_ids = [str(a) for a in (case_row.alert_ids or [])]
+
+    # The evidence, assembled server-side from the case's own alerts rather
+    # than taken from the caller. The console was sending the literal string
+    # "Investigate alert: <title>", so the forensic agent reasoned over a
+    # headline while auto-triage passed the whole raw event to the same code.
+    #
+    # Server-side because the browser does not hold the raw events and should
+    # not be trusted with what the agent reasons over even if it did: an
+    # attacker-influenced payload reaching a prompt is the injection surface
+    # `PromptInjectionGuard` exists for, and narrowing it to data we loaded
+    # ourselves is cheaper than guarding it.
+    derived_summary, raw_alert = await _investigation_evidence(db, cid, user.tenant_id)
+    # A caller-supplied summary is kept as a note rather than used in place of
+    # the evidence, so an analyst can say why they are looking.
+    summary = derived_summary
+    if body.alert_summary:
+        summary = f"{body.alert_summary}\n\n{derived_summary}" if derived_summary else body.alert_summary
 
     # Forward the authenticated tenant so the agents service attributes the run
     # to the real tenant instead of falling back to the "default" placeholder,
     # which the demo seed no longer maps to any tenant (issue #601). The ledger
     # is scoped by tenant_id, so without this the whole run is never persisted.
+    # Service-token path requires the acting tenant on the header, not just
+    # in the body: tenant_scope refuses a service token with no tenant.
+    # The agents service stores raw_alert on the run and every downstream
+    # agent reads it; forwarding {} meant the forensic/report models got an
+    # empty payload and filled the gap with fabricated artefacts
+    # (C:\\Windows\\Temp\\malware.exe and friends). Load the case's linked
+    # alerts and pass their real content, truncated so the prompt stays
+    # bounded and free of multi-MB raw blobs.
+    raw_alert_payload: dict[str, Any] = {}
+    try:
+        if case_alert_ids:
+            rows = (
+                await db.execute(
+                    text(
+                        "SELECT id, title, description, severity, connector_type, "
+                        "affected_ips, affected_hosts, affected_users, event_time, raw_event "
+                        "FROM alerts WHERE id::text = ANY(:ids) AND tenant_id = :tenant_id "
+                        "ORDER BY event_time DESC LIMIT 3"
+                    ).bindparams(ids=case_alert_ids, tenant_id=user.tenant_id)
+                )
+            ).mappings().all()
+            alerts_out = []
+            for r in rows:
+                raw = r["raw_event"] if isinstance(r["raw_event"], dict) else {}
+                full_log = raw.get("full_log") or ""
+                alerts_out.append(
+                    {
+                        "id": str(r["id"]),
+                        "title": r["title"],
+                        "description": (r["description"] or "")[:1000],
+                        "severity": r["severity"],
+                        "source": r["connector_type"],
+                        "affected_ips": list(r["affected_ips"] or [])[:20],
+                        "affected_hosts": list(r["affected_hosts"] or [])[:20],
+                        "affected_users": list(r["affected_users"] or [])[:20],
+                        "event_time": r["event_time"].isoformat() if r["event_time"] else None,
+                        "full_log": str(full_log)[:4000],
+                    }
+                )
+            if alerts_out:
+                raw_alert_payload = {"alerts": alerts_out}
+    except Exception:  # noqa: BLE001 - never block launch on enrichment
+        logger.warning("investigate.launch.raw_alert_enrichment_failed", case_id=str(cid), exc_info=True)
+
+    # Launching an agent investigation IS an analyst action: advance
+    # new/triaged cases to 'investigating' in the same request so the
+    # board reflects reality without a separate PATCH. Forward-only, same
+    # ladder rule — a contained/resolved case is never pulled backwards
+    # by a re-run.
+    try:
+        st_row = (
+            await db.execute(
+                text(
+                    "SELECT status FROM aisoc_cases WHERE id = :id AND tenant_id = :tenant_id"
+                ).bindparams(id=cid, tenant_id=user.tenant_id)
+            )
+        ).fetchone()
+        if st_row and _forward_to_investigating_ok(st_row.status):
+            await db.execute(
+                text(
+                    "UPDATE aisoc_cases SET status = 'investigating', updated_at = :now "
+                    "WHERE id = :id AND tenant_id = :tenant_id"
+                ).bindparams(id=cid, tenant_id=user.tenant_id, now=datetime.now(UTC))
+            )
+            await db.commit()
+    except Exception:  # noqa: BLE001 — never block the launch on the status bump
+        await db.rollback()
+        logger.warning("investigate.launch.status_advance_failed", case_id=str(cid), exc_info=True)
+
     resp = await _agents_proxy(
         "POST",
         f"/api/v1/cases/{cid}/investigate",
-        json={"alert_summary": body.alert_summary or "", "tenant_id": str(user.tenant_id)},
+        json={
+            "alert_summary": summary,
+            "raw_alert": raw_alert_payload,
+            "tenant_id": str(user.tenant_id),
+        },
+        headers={"X-AiSOC-Tenant-ID": str(user.tenant_id)},
     )
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
@@ -1149,30 +1647,119 @@ async def list_case_investigations(
     """
     cid = await _resolve_case_id(case_id, db, user.tenant_id)
     try:
-        resp = await _agents_proxy("GET", f"/api/v1/cases/{cid}/investigations")
-        if resp.status_code == 404:
-            return {"runs": []}
-        if resp.status_code >= 400:
-            return {"runs": []}
-        return resp.json()
+        resp = await _agents_proxy("GET", f"/api/v1/cases/{cid}/investigations", headers={"X-AiSOC-Tenant-ID": str(user.tenant_id)})
+        if resp.status_code < 400:
+            return resp.json()
     except HTTPException:
-        # Agents service unavailable — render a soft-empty list instead of 503.
-        return {"runs": []}
+        pass
+    # Agents service has no list route (or is unreachable) — fall back to the
+    # local ledger, which every run persists to anyway.
+    from app.models.investigation import InvestigationRun
+    rows = (
+        await db.execute(
+            select(InvestigationRun)
+            .where(InvestigationRun.tenant_id == user.tenant_id)
+            .where(InvestigationRun.case_id.in_([str(cid), str(case_id)]))
+            .order_by(InvestigationRun.created_at.desc())
+            .limit(20)
+        )
+    ).scalars().all()
+    return {
+        "runs": [
+            {
+                "run_id": str(r.id),
+                "case_id": r.case_id,
+                "status": r.status,
+                "model": r.model_used,
+                "iterations": r.iterations,
+                "total_tokens": r.total_tokens,
+                "started_at": r.started_at.isoformat() if r.started_at else None,
+                "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+                "error": r.error,
+            }
+            for r in rows
+        ]
+    }
 
 
 @router.get("/{case_id}/investigations/{run_id}", summary="Get investigation run")
 async def case_investigation_run(
     case_id: str,
     run_id: str,
+    db: DBSession,
     user: AuthUser,
 ) -> dict[str, Any]:
+    """One investigation run belonging to this case, in the caller's tenant."""
+    # Scoping kept out of the docstring because FastAPI publishes that verbatim
+    # in docs/openapi.yaml, and the rationale is for the next maintainer rather
+    # than for API consumers.
+    #
+    # This handler took no database session and never read `user.tenant_id`:
+    # `case_id` was declared and never used, and `run_id` alone was proxied to
+    # the agents service, so any authenticated user could read any run by id
+    # across tenants (GHSA-x2gf-3p79-wvgm). The sibling list route two
+    # functions up already resolved the case against the caller's tenant.
+    #
+    # Both halves below are needed. Resolving the case proves the caller may
+    # see *this case*; checking the run belongs to it proves the id in the path
+    # is not somebody else's run smuggled under a case the caller does own.
+    cid = await _resolve_case_id(case_id, db, user.tenant_id)
     # URL-encode the user-supplied run_id so it cannot inject `/`, `?`, `#`,
     # CR/LF, or other URL syntax into the proxied path.
     safe_run_id = quote(run_id, safe="")
-    resp = await _agents_proxy("GET", f"/api/v1/investigations/{safe_run_id}")
+    resp = await _agents_proxy("GET", f"/api/v1/investigations/{safe_run_id}", headers={"X-AiSOC-Tenant-ID": str(user.tenant_id)})
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
+    run = resp.json()
+
+    # A run that names a different case is not this case's run. Compared as
+    # strings because the agents service echoes whatever case id it was given.
+    run_case_id = run.get("case_id")
+    if run_case_id is not None and str(run_case_id) != str(cid):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Investigation run not found for this case")
+    return run
+
+
+@router.get(
+    "/{case_id}/investigations/{run_id}/report.md",
+    response_class=PlainTextResponse,
+    summary="Markdown incident report for one investigation run",
+)
+async def case_investigation_report_md(
+    case_id: str,
+    run_id: str,
+    db: DBSession,
+    user: AuthUser,
+) -> PlainTextResponse:
+    """The Markdown report the case workspace renders."""
+    # `CaseWorkspace.tsx` fetched this from two places and the route did not
+    # exist, so the report pane was permanently empty. The agents service has
+    # served `/api/v1/investigations/{run_id}/report.md` all along; nothing
+    # proxied it.
+    #
+    # Scoped in the same two steps as the sibling route above, and for the
+    # same reason: that one shipped without them and any authenticated user
+    # could read any run by id across tenants (GHSA-x2gf-3p79-wvgm).
+    # Resolving the case proves the caller may see this case; checking the
+    # run belongs to it proves the id in the path is not somebody else's run
+    # smuggled under a case the caller does own.
+    cid = await _resolve_case_id(case_id, db, user.tenant_id)
+    safe_run_id = quote(run_id, safe="")
+
+    meta = await _agents_proxy("GET", f"/api/v1/investigations/{safe_run_id}", headers={"X-AiSOC-Tenant-ID": str(user.tenant_id)})
+    if meta.status_code >= 400:
+        raise HTTPException(status_code=meta.status_code, detail=meta.text)
+    run_case_id = meta.json().get("case_id")
+    if run_case_id is not None and str(run_case_id) != str(cid):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Investigation run not found for this case",
+        )
+
+    resp = await _agents_proxy("GET", f"/api/v1/investigations/{safe_run_id}/report.md", headers={"X-AiSOC-Tenant-ID": str(user.tenant_id)})
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return PlainTextResponse(content=resp.text, media_type="text/markdown; charset=utf-8")
 
 
 # Filename sanitiser for Content-Disposition: keep only safe ASCII so the
@@ -1322,7 +1909,11 @@ async def case_investigation_pdf(
     user: AuthUser,
 ) -> Response:
     safe_run_id = quote(run_id, safe="")
-    resp = await _agents_proxy("GET", f"/api/v1/investigations/{safe_run_id}/report.pdf")
+    resp = await _agents_proxy(
+        "GET",
+        f"/api/v1/investigations/{safe_run_id}/report.pdf",
+        headers={"X-AiSOC-Tenant-ID": str(user.tenant_id)},
+    )
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     safe_case_id = _safe_filename_segment(case_id)

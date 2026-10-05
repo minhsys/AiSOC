@@ -1,12 +1,13 @@
 # AiSOC v8 — progress tracker
 
-**Last updated:** 2026-09-25
-**Current release:** `v10.0.0` (2026-09-25) · **Next:** unscheduled.
+**Last updated:** 2026-09-29
+**Current release:** `v13.0.0` (2026-09-29) · **Next:** unscheduled.
 Packaging is no longer named against a version: it slipped v8.0 to v8.1 to
 v8.2 for the same reason each time, and the blocker is registry credentials
-rather than code. See `[10.0.0]` in `CHANGELOG.md` for what v10.0 closed and
-what it knowingly left open — it is a major because upgrading requires an
-operator action, not because the v8 line is superseded.
+rather than code. Each major since v10.0 has been a major for the same kind of
+reason — upgrading requires an operator action — not because the v8 line is
+superseded. See the per-version sections of `CHANGELOG.md` for what each one
+closed and what it knowingly left open.
 
 This tracker is the at-a-glance view of what has landed across the v8 line and
 what is still open. It is deliberately short and dated. When it disagrees with
@@ -18,6 +19,23 @@ the tree, the tree wins — and the tracker is the thing to fix.
 > linked here for "v8.1 packaging work in flight" and a reader found a June
 > snapshot with no packaging in it. A tracker that is not updated is worse than
 > no tracker, because it is read as current.
+>
+> Its root-level predecessor `AISOC_V8_PROGRESS.md` is the sharper version of
+> the same lesson, and the reason issue
+> [#362](https://github.com/beenuar/AiSOC/issues/362) was closed rather than
+> refreshed. That issue existed so the wave-2 backlog would be readable
+> "without needing to read `AISOC_V8_PROGRESS.md`", and pointed at the file
+> anyway — a link that has returned **404 since 2026-06-30**, when
+> [#368](https://github.com/beenuar/AiSOC/pull/368) deleted the root tracker
+> and created this one in the same commit. Every item #362 listed is now
+> recorded here (wave-2, in the table below) or in
+> [`ROADMAP.md`](../../ROADMAP.md) (wave-3). Re-auditing before closing it was
+> worth doing rather than assuming: one gap it named — Lacework having no
+> config-snapshot writer — was recorded in neither file and is migrated into
+> the T1.2 row below, and the T3.6 row was itself wrong, still listing a
+> durable approval store that had already landed. A tracking issue for a
+> release four majors old is a tracker nobody reads; this file is the one to
+> keep current.
 
 ---
 
@@ -78,12 +96,12 @@ optional one.
 
 | T-ID | Item | What the audit found | Done |
 |------|------|----------------------|------|
-| T1.2 | Versioned config-snapshot writers, Neo4j `:CONFIGURED_AS {ts}` | The Neo4j writer is fully built. The Go provider called a route nobody serves, and could not have called the real one (it has no vault), so snapshots silently never ran while reporting themselves enabled. `is_current` / `valid_from` / `valid_to` were declared and never written, so the documented O(1) lookup matched zero edges. | yes |
+| T1.2 | Versioned config-snapshot writers, Neo4j `:CONFIGURED_AS {ts}` | The Neo4j writer is fully built. The Go provider called a route nobody serves, and could not have called the real one (it has no vault), so snapshots silently never ran while reporting themselves enabled. `is_current` / `valid_from` / `valid_to` were declared and never written, so the documented O(1) lookup matched zero edges. | partial — **Lacework has no `get_resource_config`**, so three of the four providers the ticket named are covered. Five connectors implement it (AWS Security Hub, Azure Defender, GCP SCC, GitHub, Okta); `lacework.py` is registered and does not. `AISOC_SNAPSHOT_ENABLED` is also off by default and no compose file sets it, so this runs on operator opt-in only. |
 | T2.3 | `LLMInputContract` across every sub-agent | Real and fail-closed in `services/agents`, covering 15 of 16 call sites. `services/api` had **no contract at all** across seven endpoints, and the module described as living there did not exist. The no-bypass gate could not see a raw-HTTP LLM call. | yes |
 | T3.2 | Effective-permissions resolvers (Azure / GCP / Okta / GWS) | **Already shipped** — all five exist, are registered and report `coverage: "full"`. The gap is the snapshot, not the resolver: no connector answers `__posture_snapshot__`, so four of five return 412. Docstrings still called them scaffolds. | audited; gap gated |
 | T3.3 | Attack-chain ranking + timeline UI | Grouping (fusion, Redis) and weighted ranking (API, Postgres) both exist as independent implementations that never exchange data. `AttackChainPanel` and `AttackStory.tsx` are honest about empty states; `InvestigationTimeline.tsx` rendered a fabricated investigation with no demo gate. | partial — fabrication gated, the two implementations remain separate |
 | T3.5 | Business-context rule engine | **Already shipped**, and the v8.0 Postgres fix is real. But the two evaluators disagreed on `not`, so one console-accepted rule silently discarded that tenant's entire rule set at triage, suppressions included. | yes |
-| T3.6 | ChatOps coverage | Every piece existed; three had no caller. Slack Block Kit approvals worked only as a reply to the analyst's own slash command, the Teams card factory had zero senders, and the signed email link pointed at a route that did not exist. Worse: approvals **authorized nobody**. | partial — authorization and the email route fixed; proactive card push and a durable approval store remain |
+| T3.6 | ChatOps coverage | Every piece existed; three had no caller. Slack Block Kit approvals worked only as a reply to the analyst's own slash command, the Teams card factory had zero senders, and the signed email link pointed at a route that did not exist. Worse: approvals **authorized nobody**. | partial — authorization, the email route and the durable approval store are all done; the Teams proactive card push remains. The durable store was recorded here as outstanding after it had landed: `PostgresTimerStore` is wired at `services/slack-bot/app/main.py` behind migration `062_approval_timers.sql`. The genuine remainder is narrower than "Teams" — `approval_card()` in `services/teams-bot/app/cards.py` has no caller outside its own tests, and `services/teams-bot/app/main.py` exposes only inbound routes, so there is no outbound path for an Adaptive Card. The proactive Teams path that does exist (`services/actions/app/executors/chatops.py`) sends a legacy Connector Card. |
 
 ### Release integrity
 
@@ -125,8 +143,8 @@ script.
 | README rewritten for adoption | done |
 | Consolidated `Makefile` | done |
 | The three packages that could not be built at the v8.1.0 tag | done |
-| CrowdStrike has no normalizer profile and uses the generic one | open — recorded in the reality audit |
-| OpenSearch is started by `full` and read by nothing | open — recorded, not drawn into a diagram |
+| CrowdStrike has no normalizer profile and uses the generic one | withdrawn — the wrong diagnosis. The connector does take the canonical path; the real faults were an unread `behaviors[].user_name` and a canonical field map that recognised only `actor`. Both fixed in v9.0 — see `docs/audit/REPOSITORY_REALITY.md` |
+| OpenSearch is started by `full` and read by nothing | withdrawn — checked against `services/api`, which holds no OpenSearch client, and never against `services/threatintel`, which uses one unconditionally. Retracted in `docs/audit/REPOSITORY_REALITY.md` under "Correction (v9.0)" |
 
 ---
 

@@ -31,16 +31,28 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("DATABASE_URL", "PURPLE_TEAM_DATABASE_URL"),
     )
 
-    # Caldera integration
+    # Caldera integration. The key has no default on purpose: it used to be
+    # the literal `ADMIN123`, which is Caldera's own published first-run
+    # credential, so a deployment that never configured Caldera still built a
+    # client holding it and pointed that client at whatever `caldera_url`
+    # resolved to. The failure mode was not "purple-team does not work", it
+    # was "purple-team authenticates to a Caldera instance with the default
+    # password", which succeeds against any Caldera nobody rotated.
     caldera_url: str = "http://localhost:8888"
-    caldera_api_key: str = "ADMIN123"
+    caldera_api_key: str = ""
 
     # Atomic Red Team
     art_repo_path: str = "/opt/atomic-red-team"
     art_atomics_path: str = "/opt/atomic-red-team/atomics"
 
-    # ATT&CK STIX bundle URL (for coverage mapping)
-    attack_stix_url: str = "https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json"
+    # There used to be an ``attack_stix_url`` here, defaulting to the MITRE CTI
+    # bundle on a public CDN "for coverage mapping". Nothing in this service
+    # ever read it — not the coverage mapper, not the drift scheduler, not the
+    # routes. A dead setting is not harmless when its default is an external
+    # host: it is documented, it is settable, and it makes reaching a CDN look
+    # like the decision somebody already took. The services that do need the
+    # bundle (``agents``, ``ingest``) read it from ``ATTCK_DATA_PATH`` on disk.
+    # If coverage mapping ever needs it here, take the same local-file route.
 
     # OTel
     otel_endpoint: str = "http://localhost:4317"

@@ -12,6 +12,7 @@ import structlog
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
 from app.core.config import settings
+from app.core.kafka_security import kafka_client_kwargs
 from app.models.alert import FusionDecision, RawAlert
 from app.services.alert_sink import AlertSink, PersistOutcome, PersistResult
 from app.services.detection_engine import DetectionEngine
@@ -20,6 +21,7 @@ from app.services.event_schema import validate_event
 from app.services.fusion_engine import FusionEngine
 from app.services.lake_writer import LakeWriter
 from app.services.promoter import promote_normalized_event
+from app.services.tenant_overlay import OverlayCache
 from app.services.ueba_signal import UebaSignalCache
 from app.services.windowed_detection import WindowedDetectionEngine
 
@@ -54,6 +56,7 @@ class FusionWorker:
         detector: DetectionEngine | None = None,
         windowed_detector: WindowedDetectionEngine | None = None,
         ueba_cache: UebaSignalCache | None = None,
+        overlays: OverlayCache | None = None,
     ) -> None:
         self._engine = engine
         self._sink = sink
@@ -61,6 +64,9 @@ class FusionWorker:
         self._detector = detector
         self._windowed = windowed_detector
         self._ueba_cache = ueba_cache
+        #: Per-tenant detection tuning (parity 5.4). Optional, so a
+        #: deployment that passes nothing behaves exactly as before.
+        self._overlays = overlays
         # A poison message must never vanish silently; default to a structured
         # logging DLQ so persistence-free deployments still get the signal.
         self._dlq: DeadLetterQueue = dlq or LoggingDLQ()
@@ -105,10 +111,12 @@ class FusionWorker:
             # commit an in-flight message before processing finishes.
             enable_auto_commit=False,
             value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+            **kafka_client_kwargs(),
         )
         self._producer = AIOKafkaProducer(
             bootstrap_servers=settings.kafka_bootstrap_servers,
             value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+            **kafka_client_kwargs(),
         )
         await self._consumer.start()
         await self._producer.start()
@@ -176,7 +184,7 @@ class FusionWorker:
                 if not self._running:
                     break
                 try:
-                    await self._process_message(msg.value, topic=msg.topic)
+                    await self._process_message(msg.value, topic=msg.topic, partition=msg.partition, offset=msg.offset)
                 except Exception as exc:
                     _METRICS["errors"] += 1
                     logger.error("Failed to process message", error=str(exc), exc_info=True)
@@ -215,8 +223,16 @@ class FusionWorker:
         schema_version: str = "v1",
         source_event_id: str | None = None,
         tenant_id: str | None = None,
+        partition: int | None = None,
+        offset: int | None = None,
     ) -> None:
-        """Route a poison message to the DLQ instead of dropping it silently."""
+        """Route a poison message to the DLQ instead of dropping it silently.
+
+        ``partition`` and ``offset`` are carried through because the excerpt
+        stored alongside them is a triage record, not the event: replaying a
+        refused message means re-reading it from Kafka, and these are the only
+        way back to it (deferral 5b).
+        """
         _METRICS["dead_lettered"] += 1
         await safe_record(
             self._dlq,
@@ -227,10 +243,14 @@ class FusionWorker:
                 payload=payload,
                 source_event_id=source_event_id,
                 tenant_id=tenant_id,
+                partition=partition,
+                offset=offset,
             ),
         )
 
-    async def _process_message(self, payload: dict, topic: str | None = None) -> None:
+    async def _process_message(
+        self, payload: dict, topic: str | None = None, partition: int | None = None, offset: int | None = None
+    ) -> None:
         resolved_topic = topic or settings.kafka_topic_alerts_raw
 
         # Phase A4 — UEBA anomaly stream: warm the per-entity signal cache and
@@ -256,6 +276,8 @@ class FusionWorker:
                 schema_version=validation.schema_version,
                 source_event_id=validation.source_event_id,
                 tenant_id=validation.tenant_id,
+                partition=partition,
+                offset=offset,
             )
             return
 
@@ -270,7 +292,14 @@ class FusionWorker:
             # event. Each firing rule becomes a RawAlert routed through fusion,
             # so telemetry that isn't a vendor-asserted finding still alerts.
             if self._detector is not None:
-                for hit in self._detector.evaluate(payload):
+                # Parity 5.4. Without the overlay this evaluated the shared
+                # corpus and nothing else, so a tenant who disabled a noisy
+                # rule in the console kept receiving its alerts while the
+                # console showed it disabled.
+                overlay = None
+                if self._overlays is not None and validation.tenant_id:
+                    overlay = await self._overlays.get(str(validation.tenant_id))
+                for hit in self._detector.evaluate(payload, overlay):
                     det_alert = self._detector.build_alert(payload, hit)
                     if det_alert is not None:
                         _METRICS["detected"] += 1
@@ -306,6 +335,8 @@ class FusionWorker:
                     schema_version=validation.schema_version,
                     source_event_id=validation.source_event_id,
                     tenant_id=validation.tenant_id,
+                    partition=partition,
+                    offset=offset,
                 )
                 return
 

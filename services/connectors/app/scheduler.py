@@ -442,14 +442,20 @@ class ConnectorScheduler:
             await self._record_failure(target.id)
             return
 
-        # Seed the connector's ingest checkpoint (#529) if it supports one, so a
-        # restart resumes from the last-accepted event instead of re-scanning.
-        setter = getattr(connector, "set_checkpoint", None)
-        if callable(setter):
-            try:
-                setter((target.connector_config or {}).get("checkpoint"))
-            except Exception:  # never let checkpoint seeding break a poll
-                logger.debug("connector.scheduler.checkpoint_seed_failed id=%s", connector_id)
+        # Seed the connector's ingest checkpoint (#529) so a restart resumes
+        # from the last-accepted event instead of re-scanning.
+        #
+        # This used to be `getattr(connector, "set_checkpoint", None)`. The
+        # method is on BaseConnector now (10b), so the call is direct — and
+        # the reason that matters is that the getattr had no failing state.
+        # It was simply absent on eighty-three of the eighty-four connectors,
+        # so the seed silently did nothing for almost all of them at
+        # `logger.debug`, and nothing could report which. Whether a connector
+        # checkpoints is now a question its class answers.
+        try:
+            connector.set_checkpoint((target.connector_config or {}).get("checkpoint"))
+        except Exception:  # never let checkpoint seeding break a poll
+            logger.debug("connector.scheduler.checkpoint_seed_failed id=%s", connector_id)
 
         # The schema lives in connector_config; use it for fetch lookback.
         # We deliberately default to the same poll interval, so a 5-min
@@ -481,6 +487,18 @@ class ConnectorScheduler:
             )
             await self._record_failure(target.id)
             return
+
+        # A scanner's findings are asset state, not events. The alert path
+        # above carries neither the asset nor the CVE a vulnerability row
+        # needs, which is why `asset_vulnerabilities` stayed empty on every
+        # deployment and KEV exposure answered "no vulnerability data" for
+        # every tenant whose scanner was Tenable. Connectors that can answer
+        # the question opt in by defining `fetch_vulnerability_findings`.
+        #
+        # Deliberately outside the `try` around `fetch_alerts` and in its own:
+        # a scanner sync that fails must not cost the poll its events, and a
+        # fetch that fails must not be reported as a successful sync.
+        await self._sync_vulnerability_findings(connector, target)
 
         # Normalize defensively: connectors *should* normalize themselves
         # in fetch_alerts, but we double-tap so a connector that returns
@@ -573,14 +591,12 @@ class ConnectorScheduler:
         # Advance the persisted checkpoint only now that ingest has accepted the
         # batch (#529). A failed push returned earlier, so reaching here means
         # the page was accepted — this is the "advance only after accept" rule.
-        getter = getattr(connector, "get_checkpoint", None)
-        if callable(getter):
-            try:
-                new_checkpoint = getter()
-            except Exception:  # never let checkpoint bookkeeping break a poll
-                new_checkpoint = None
-            if isinstance(new_checkpoint, dict) and new_checkpoint:
-                await self._record_checkpoint(target.id, new_checkpoint)
+        try:
+            new_checkpoint = connector.get_checkpoint()
+        except Exception:  # never let checkpoint bookkeeping break a poll
+            new_checkpoint = None
+        if isinstance(new_checkpoint, dict) and new_checkpoint:
+            await self._record_checkpoint(target.id, new_checkpoint)
 
         # If drift was detected, persist that fact *before* marking the
         # poll successful so the UI reflects "drifted" status alongside
@@ -773,6 +789,54 @@ class ConnectorScheduler:
             logger.debug(
                 "connector.scheduler.record_checkpoint_failed id=%s",
                 connector_id,
+            )
+
+    async def _sync_vulnerability_findings(self, connector: Any, target: Any) -> None:
+        """Materialise a scanner's findings as vulnerability rows, if it has any.
+
+        Fix-pass item 5.2. Written here rather than posted to the API because
+        the service principal is deliberately read-only -- its own docstring
+        says anything that changes the database is absent on purpose -- and
+        this service already holds both a database engine and the tenant id it
+        is polling for.
+        """
+        fetch = getattr(connector, "fetch_vulnerability_findings", None)
+        if fetch is None:
+            return
+
+        try:
+            findings = await fetch()
+        except Exception:
+            logger.exception(
+                "connector.scheduler.vulnerability_fetch_failed id=%s type=%s",
+                target.id,
+                target.connector_type,
+            )
+            return
+
+        if not findings:
+            return
+
+        try:
+            from app.vulnerabilities import sync_findings
+
+            counts = await sync_findings(
+                self._engine,
+                tenant_id=target.tenant_id,
+                findings=findings,
+            )
+            logger.info(
+                "connector.scheduler.vulnerabilities_synced id=%s inserted=%d touched=%d skipped=%d",
+                target.id,
+                counts["findings_inserted"],
+                counts["findings_touched"],
+                counts["skipped"],
+            )
+        except Exception:
+            logger.exception(
+                "connector.scheduler.vulnerability_sync_failed id=%s type=%s",
+                target.id,
+                target.connector_type,
             )
 
     async def _record_failure(self, connector_id: uuid.UUID) -> None:

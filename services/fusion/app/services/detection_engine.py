@@ -19,10 +19,18 @@ as a JSON string. The native ``match_when`` specs were authored against exactly
 those flat connector fields, so ``matches(rule.match_when, json.loads(raw_data))``
 is the correct evaluation contract.
 
-Performance: rules are indexed by ``product`` so an event only evaluates its
-own product's rules plus product-agnostic rules, keeping per-event work far
-below the full 817-rule corpus. The engine is pure/synchronous; the consumer
-calls it inline (the corpus is small and the matcher is regex/dict work).
+Performance: every event is evaluated against the **whole corpus**. A
+product-based pre-filter was tried and removed, because connector product
+names do not line up with spec products (``aws_cloudtrail`` against ``aws``,
+``crowdstrike_falcon`` against ``edr``) and any such filter silently drops
+real matches. See ``_candidates``, which returns ``self._rules`` unchanged
+and records that reasoning. The full pass is cheap because the matcher
+short-circuits on the first absent field, so a benign event touches almost
+no rule past its first clause. The engine is pure and synchronous; the
+consumer calls it inline.
+
+Indexing by log source is parity plan 6.9, and it has to solve the
+product-name mapping first.
 """
 
 from __future__ import annotations
@@ -161,8 +169,19 @@ class DetectionEngine:
         # Fall back to the OCSF top level (some connectors emit flat OCSF).
         return ocsf if isinstance(ocsf, dict) else {}
 
-    def evaluate(self, message: dict[str, Any]) -> list[DetectionHit]:
-        """Return every rule that fires on this normalized-event message."""
+    def evaluate(self, message: dict[str, Any], overlay: Any | None = None) -> list[DetectionHit]:
+        """Return every rule that fires on this normalized-event message.
+
+        `overlay` is the tenant's tuning (parity 5.4). Without it this
+        engine evaluated the shared corpus and nothing else, so a tenant
+        who disabled a noisy rule in the console kept receiving its alerts
+        while the console showed it disabled.
+
+        Applied **after** the match rather than by filtering the candidate
+        list, so a suppressed hit can be recorded with the tuning that
+        suppressed it. "No alert" with no explanation is indistinguishable
+        from a rule that simply did not match.
+        """
         ocsf = message.get("ocsf_event")
         if not isinstance(ocsf, dict):
             return []
@@ -172,10 +191,41 @@ class DetectionEngine:
         # values were already present and nothing was computing the answer,
         # so those rules could never fire.
         fields = enrich(fields, self._derived_wanted)
+
+        # Parity 5.5. 15 rules read an `<x>_in_allowlist` boolean that
+        # nothing computed, so they could never fire. The answer is per
+        # tenant, which is why it comes from the overlay rather than from
+        # the shared derived-field pass: a global allowlist would make one
+        # tenant's exceptions apply to everybody.
+        #
+        # An unconfigured allowlist contributes **no key**, not False. A
+        # `not_in_allowlist` clause against a missing key would be true for
+        # every event, which is the negation-flips-on-absence failure the
+        # Sigma import already recorded.
+        if overlay is not None:
+            derived = overlay.derived_allowlist_fields(fields)
+            if derived:
+                fields = {**fields, **derived}
+
         hits: list[DetectionHit] = []
         for rule in self._candidates(""):
             try:
                 if matches(rule["match_when"], fields):
+                    if overlay is not None:
+                        suppressed = overlay.suppresses(rule["id"], fields)
+                        if suppressed is None:
+                            suppressed = overlay.raises_severity_floor(rule["id"], str(rule.get("severity") or ""))
+                        if suppressed:
+                            # Info, not debug. A tenant asking why they
+                            # stopped seeing a detection gets the tuning,
+                            # its author and its reason from the log.
+                            logger.info(
+                                "detection_engine.suppressed_by_tenant_tuning",
+                                rule=rule["id"],
+                                tenant=getattr(overlay, "tenant_id", ""),
+                                reason=suppressed,
+                            )
+                            continue
                     hits.append(
                         DetectionHit(
                             rule_id=rule["id"],

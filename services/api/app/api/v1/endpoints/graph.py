@@ -10,14 +10,15 @@ import uuid
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from app.api.v1.deps import CurrentUser, DBSession, get_current_user, require_permission
+from app.api.v1.endpoints.alert_writeback import service_token_valid
 from app.services import graph_service
 from app.services.context_import import import_context
-from app.services.incident_context import get_incident_context
+from app.services.incident_context import get_identity_context_for_accounts, get_incident_context
 from app.services.investigation_tools import BACKED_TOOLS, TOOLS, dispatch
 
 logger = logging.getLogger(__name__)
@@ -667,13 +668,18 @@ async def list_investigation_tools(
     }
 
 
+# `lake:query` because that is literally what a pivot is: `dispatch` runs a
+# typed primitive against the tenant's event lake and returns rows from it.
+# The tenant comes from the session, so this was never a cross-tenant read —
+# it was a `viewer`, a role deliberately given no lake access at all, reading
+# raw events through a route that only checked for a session.
 @router.post(
     "/investigate/query",
     summary="Run one typed investigation primitive against the event lake",
 )
 async def run_investigation_tool(
     request: InvestigationToolRequest,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: Annotated[CurrentUser, Depends(require_permission("lake:query"))],
 ) -> dict[str, Any]:
     """Execute one pivot. Tenant comes from the session, never the request."""
     result = await dispatch(request.tool, str(current_user.tenant_id), request.args)
@@ -862,6 +868,13 @@ async def get_mitre_coverage_compat(
 # ─── Write Endpoints ──────────────────────────────────────────────────────────
 
 
+# The four entity upserts below require `settings:write`, the same permission
+# as `/context/import` above. They write the graph every investigation reads as
+# fact, and `upsert_alert_graph` links an alert to hosts, users, IOCs and ATT&CK
+# techniques — a forged link is not a visibly bad row, it is a wrong conclusion
+# nothing downstream re-derives. No first-party caller posts here: the platform
+# writes this graph in-process through `app.services.graph_service`, so these
+# routes exist for integrations, which authenticate with a scoped API key.
 @router.post(
     "/entities/host",
     status_code=status.HTTP_201_CREATED,
@@ -869,7 +882,7 @@ async def get_mitre_coverage_compat(
 )
 async def upsert_host(
     payload: UpsertHostRequest,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: Annotated[CurrentUser, Depends(require_permission("settings:write"))],
 ) -> dict[str, str]:
     """Create or update a Host node in the knowledge graph."""
     await graph_service.upsert_host(
@@ -890,7 +903,7 @@ async def upsert_host(
 )
 async def upsert_user(
     payload: UpsertUserRequest,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: Annotated[CurrentUser, Depends(require_permission("settings:write"))],
 ) -> dict[str, str]:
     """Create or update a User node in the knowledge graph."""
     await graph_service.upsert_user(
@@ -911,7 +924,7 @@ async def upsert_user(
 )
 async def upsert_alert_graph(
     payload: UpsertAlertGraphRequest,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: Annotated[CurrentUser, Depends(require_permission("settings:write"))],
 ) -> dict[str, str]:
     """
     Create or update an Alert node and link it to Host, User, IOC, and Technique nodes.
@@ -937,7 +950,7 @@ async def upsert_alert_graph(
 )
 async def upsert_case_graph(
     payload: UpsertCaseGraphRequest,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: Annotated[CurrentUser, Depends(require_permission("settings:write"))],
 ) -> dict[str, str]:
     """Create or update a Case node and link it to Alert nodes."""
     await graph_service.upsert_case_node(
@@ -948,3 +961,118 @@ async def upsert_case_graph(
         alert_ids=payload.alert_ids,
     )
     return {"status": "ok", "case_id": payload.case_id}
+
+
+# ---------------------------------------------------------------------------
+# Internal route: identity context for the agents service
+# ---------------------------------------------------------------------------
+
+
+class IdentityContextResponse(BaseModel):
+    tenant_id: str
+    as_of: datetime | None
+    identities: list[dict[str, Any]]
+    #: Rows refused for carrying an import stamp later than the cutoff.
+    excluded_after_cutoff: int
+    #: Rows served whose age the cutoff could not meaningfully test. For this
+    #: source that is **every row served**, and the reason is in the route's
+    #: docstring: an ``Employee`` node carries when it was imported, never
+    #: when the fact it records became true.
+    without_timestamp: int
+
+
+@router.get(
+    "/identity-context",
+    response_model=IdentityContextResponse,
+    include_in_schema=False,
+    summary="Who is behind these accounts, for the agents service, as of a point in time",
+)
+async def identity_context_for_triage(
+    tenant_id: uuid.UUID,
+    accounts: Annotated[list[str], Query()],
+    as_of: datetime | None = None,
+    limit: Annotated[int, Query(ge=1, le=25)] = 5,
+    x_aisoc_service_token: Annotated[str | None, Header()] = None,
+) -> IdentityContextResponse:
+    """HR and directory context for the principals an alert names.
+
+    Gap-closure Phase 6.3. Distinct from ``/incident-context/{alert_id}``
+    above, which traverses from an ``Alert`` node: triage runs before that node
+    exists, and a replayed historical finding never has one, so the only
+    version of this question triage can ask is keyed on the account names.
+
+    **The cutoff here is weaker than the other two, and that is published
+    rather than smoothed over.** An ``Employee`` node carries ``updated_at``,
+    which ``context_import`` sets when a directory or CMDB snapshot was
+    loaded. That is an *import* stamp, not a business-effective one. A record
+    imported yesterday may describe an employee who left last year, and a
+    record imported before the split may since have been updated in place to
+    reflect a change that happened after it.
+
+    So both things are done and both are reported. Rows whose import stamp is
+    provably later than the cutoff are refused, because that much can be
+    established. Every row that survives is counted as
+    ``without_timestamp``, because surviving an import-time cutoff is not
+    evidence that the fact predates the split. Claiming a tighter freeze than
+    the data supports is the failure this programme keeps recording; the
+    precedent is ``statements_without_timestamp``, published for a store where
+    the count is always the whole set.
+
+    Service-token only, and ``tenant_id`` is the scope rather than a narrowing
+    of one, for the same reasons as the sibling internal routes.
+    """
+    if not service_token_valid(x_aisoc_service_token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="this route is reachable only by an AiSOC service holding the shared service token",
+        )
+
+    rows = await get_identity_context_for_accounts(str(tenant_id), list(accounts), limit=limit)
+
+    kept: list[dict[str, Any]] = []
+    excluded = 0
+    for row in rows:
+        imported = _imported_at(row.get("imported_at"))
+        if as_of is not None and imported is not None and imported > as_of:
+            excluded += 1
+            continue
+        kept.append(row)
+
+    return IdentityContextResponse(
+        tenant_id=str(tenant_id),
+        as_of=as_of,
+        identities=kept,
+        excluded_after_cutoff=excluded,
+        # Every served row, not just the ones with no stamp at all. See the
+        # docstring: the stamp that exists does not answer the question the
+        # cutoff is asking.
+        without_timestamp=len(kept),
+    )
+
+
+def _imported_at(value: Any) -> datetime | None:
+    """The import stamp as a comparable instant, or ``None``.
+
+    The driver returns a Neo4j ``DateTime`` for ``datetime()`` properties and
+    a string for anything a loader wrote as text, so both are read. A value
+    that parses as neither is treated as absent, which lands the row in the
+    kept set and therefore in the untestable count, which is the conservative
+    direction for a freeze that already declares itself partial.
+    """
+    if value is None:
+        return None
+    to_native = getattr(value, "to_native", None)
+    if callable(to_native):
+        try:
+            value = to_native()
+        except Exception:  # noqa: BLE001 - a driver type that will not convert is an absent stamp
+            return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    return None

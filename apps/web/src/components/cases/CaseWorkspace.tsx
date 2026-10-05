@@ -24,19 +24,7 @@ import useSWR from 'swr';
 import { clsx } from 'clsx';
 import { format, formatDistanceToNow } from 'date-fns';
 import toast from 'react-hot-toast';
-import {
-  casesApi,
-  graphApi,
-  realtimeApi,
-  type AttackChainTimeline,
-  type AttackChainWindow,
-  type Case,
-  type CaseAttackPath,
-  type CaseSeverity,
-  type CaseStatus,
-  type CaseTask,
-  type CaseTimelineEvent,
-} from '@/lib/api';
+import { apiFetch, type AttackChainTimeline, type AttackChainWindow, type Case, type CaseAttackPath, casesApi, type CaseSeverity, type CaseStatus, type CaseTask, type CaseTimelineEvent, graphApi, realtimeApi } from '@/lib/api';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { ErrorState } from '@/components/ui/ErrorState';
 import { EmptyState } from '@/components/ui/EmptyState';
@@ -76,7 +64,7 @@ function buildDemoCase(id: string): Case {
       "Multiple high-severity alerts indicate an attacker pivoted from " +
       "WIN-FIN-DB01 to BACKUP-SRV-12 using compromised service account credentials. " +
       "Behavior consistent with T1021.002 (SMB/Windows Admin Shares).",
-    status: 'in_progress',
+    status: 'investigating',
     severity: 'critical',
     assignee: 'sasha.lin@example.com',
     alertIds: ['alert-9012', 'alert-9013', 'alert-9019', 'alert-9024'],
@@ -165,18 +153,26 @@ const SEVERITY_BADGE: Record<CaseSeverity, string> = {
   low: 'bg-blue-500/15 text-blue-300 ring-blue-500/30',
 };
 
+// Keyed on the six states the database actually permits. These used to name
+// `open`, `in_progress` and `pending` -- none of which `aisoc_cases` allows --
+// and omit `new`, `triaged`, `investigating` and `contained`, which is where a
+// case spends nearly all of its life. A real case rendered `undefined` as its
+// label and had no dot colour, while `Record<CaseStatus, …>` called the maps
+// exhaustive because the union was wrong in the same direction.
 const STATUS_LABEL: Record<CaseStatus, string> = {
-  open: 'Open',
-  in_progress: 'In progress',
-  pending: 'Pending',
+  new: 'New',
+  triaged: 'Triaged',
+  investigating: 'Investigating',
+  contained: 'Contained',
   resolved: 'Resolved',
   closed: 'Closed',
 };
 
 const STATUS_DOT: Record<CaseStatus, string> = {
-  open: 'bg-slate-400',
-  in_progress: 'bg-blue-400 animate-pulse',
-  pending: 'bg-amber-400',
+  new: 'bg-slate-400',
+  triaged: 'bg-sky-400',
+  investigating: 'bg-blue-400 animate-pulse',
+  contained: 'bg-amber-400',
   resolved: 'bg-emerald-400',
   closed: 'bg-slate-600',
 };
@@ -338,6 +334,8 @@ export function CaseWorkspace({ caseId }: { caseId: string }) {
   }, [data, useFallback, caseId]);
 
   // ─── Investigation state ───────────────────────────────────────────────────
+  const [fetchedTimeline, setFetchedTimeline] = useState<CaseTimelineEvent[]>([]);
+
   const [investigating, setInvestigating] = useState(false);
   const [investigationRunId, setInvestigationRunId] = useState<string | null>(null);
   const [investigationStatus, setInvestigationStatus] = useState<string>('idle');
@@ -362,6 +360,57 @@ export function CaseWorkspace({ caseId }: { caseId: string }) {
   }, []);
 
   useEffect(() => () => { stopPolling(); closeWs(); }, [stopPolling, closeWs]);
+
+  // The case detail payload carries no timeline; the dedicated
+  // /cases/{id}/timeline endpoint synthesises opened/status/investigation
+  // events. Fetch it so the Overview timeline is never blank by silence.
+  useEffect(() => {
+    let cancelled = false;
+    casesApi.getTimeline(caseId).then((res) => {
+      if (!cancelled && Array.isArray(res?.events)) setFetchedTimeline(res.events);
+    }).catch(() => { /* overview falls back to inline timeline */ });
+    return () => { cancelled = true; };
+  }, [caseId]);
+
+  // Restore the latest terminal run on mount — run state lives only in
+  // memory, so a refresh left the Investigation tab on its idle prompt even
+  // though completed runs exist server-side (the ledger fetched its own list
+  // and therefore looked fine).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await apiFetch(`/api/v1/cases/${caseId}/investigations`);
+        if (!resp.ok || cancelled) return;
+        const body = (await resp.json()) as { runs?: Array<Record<string, unknown>> };
+        const runs = body.runs ?? [];
+        const latest = runs.find(
+          (r) => typeof r?.run_id === "string" && (r.status === "completed" || r.status === "failed"),
+        );
+        if (!latest || cancelled) return;
+        const runId = String(latest.run_id);
+        let skip = false;
+        setInvestigationRunId((prev) => {
+          if (prev) skip = true;
+          return prev ?? runId;
+        });
+        if (skip) return;
+        setInvestigationStatus(String(latest.status ?? "completed"));
+        const inv = (await casesApi.getInvestigation(caseId, runId)) as Record<string, unknown>;
+        if (cancelled) return;
+        setInvestigationData(inv);
+        setInvestigationStatus(String(inv.status ?? latest.status ?? "completed"));
+        if (inv.status === "completed") {
+          const rep = await apiFetch(`/api/v1/cases/${caseId}/investigations/${runId}/report.md`);
+          if (!cancelled && rep.ok) setReportMd(await rep.text());
+        }
+      } catch {
+        /* best-effort restore; tab falls back to its idle prompt */
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [caseId]);
 
   /** Connect to the realtime service WebSocket for this run_id */
   const connectWs = useCallback((runId: string) => {
@@ -406,7 +455,7 @@ export function CaseWorkspace({ caseId }: { caseId: string }) {
               setInvestigating(false);
               toast.success('Investigation complete — report ready');
               // Fetch the Markdown report
-              fetch(`/api/v1/cases/${caseId}/investigations/${runId}/report.md`)
+              apiFetch(`/api/v1/cases/${caseId}/investigations/${runId}/report.md`)
                 .then((r) => r.ok ? r.text() : '')
                 .then((md) => { if (md) setReportMd(md); })
                 .catch(() => { /* best-effort */ });
@@ -462,7 +511,7 @@ export function CaseWorkspace({ caseId }: { caseId: string }) {
             if (inv.status === 'completed') {
               toast.success('Investigation complete — report ready');
               try {
-                const resp = await fetch(`/api/v1/cases/${caseId}/investigations/${result.run_id}/report.md`);
+                const resp = await apiFetch(`/api/v1/cases/${caseId}/investigations/${result.run_id}/report.md`);
                 if (resp.ok) setReportMd(await resp.text());
               } catch { /* best-effort */ }
             } else {
@@ -519,8 +568,19 @@ export function CaseWorkspace({ caseId }: { caseId: string }) {
     setStatusUpdating(true);
     void mutate({ ...caseRecord, status }, { revalidate: false });
     try {
-      await casesApi.update(caseRecord.id, { status });
-      toast.success(`Status set to ${STATUS_LABEL[status]}`);
+      // Backwards moves are refused by the forward-only PATCH ladder (422);
+      // route them through the explicit reopen endpoint instead.
+      const LADDER = ['new', 'triaged', 'investigating', 'contained', 'resolved', 'closed'] as const;
+      if (LADDER.indexOf(status as (typeof LADDER)[number]) < LADDER.indexOf(previous as (typeof LADDER)[number])) {
+        await casesApi.reopen(caseRecord.id, {
+          reason: `Reopened to ${STATUS_LABEL[status]} from analyst console`,
+          status: status === 'new' || status === 'triaged' ? status : 'investigating',
+        });
+        toast.success(`Case reopened — ${STATUS_LABEL[status]}`);
+      } else {
+        await casesApi.update(caseRecord.id, { status });
+        toast.success(`Status set to ${STATUS_LABEL[status]}`);
+      }
     } catch (e: unknown) {
       // The optimistic mutation has to come back off. Leaving it applied
       // showed a status the database does not have, on the one screen an
@@ -628,7 +688,8 @@ export function CaseWorkspace({ caseId }: { caseId: string }) {
     );
   }
 
-  const sortedTimeline = [...(caseRecord.timeline ?? [])].sort(
+  const sortedTimeline = [...new Map([...fetchedTimeline, ...(caseRecord.timeline ?? [])]
+    .map((e) => [e.id, e])).values()].sort(
     (a, b) =>
       new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
   );
@@ -705,7 +766,21 @@ export function CaseWorkspace({ caseId }: { caseId: string }) {
               disabled={statusUpdating}
               className="rounded-md border border-slate-700/70 bg-slate-900/60 px-2 py-1.5 text-xs text-slate-200 focus:border-emerald-500/40 focus:outline-none"
             >
-              {(['open', 'in_progress', 'pending', 'resolved', 'closed'] as CaseStatus[]).map(
+              {/*
+                  The three it used to offer -- open, in_progress, pending --
+                  are refused by the API, so every status change from this
+                  control failed validation.
+                */}
+                {(
+                  [
+                    'new',
+                    'triaged',
+                    'investigating',
+                    'contained',
+                    'resolved',
+                    'closed',
+                  ] as CaseStatus[]
+                ).map(
                 (s) => (
                   <option key={s} value={s}>
                     {STATUS_LABEL[s]}
@@ -1183,13 +1258,28 @@ function InvestigationPanel({
           <h4 className="text-xs font-semibold uppercase tracking-wide text-amber-300">Response</h4>
           {responder?.summary != null && <p className="text-xs text-slate-400">{String(responder.summary)}</p>}
           {Array.isArray(responder?.recommended_actions) && (
-            <ul className="space-y-1">
-              {(responder.recommended_actions as string[]).slice(0, 4).map((action, i) => (
-                <li key={i} className="flex items-start gap-1.5 text-xs text-slate-300">
-                  <span className="mt-0.5 h-1.5 w-1.5 flex-none rounded-full bg-amber-400" />
-                  {action}
-                </li>
-              ))}
+            <ul className="space-y-1.5">
+              {(responder.recommended_actions as Array<unknown>).slice(0, 4).map((raw, i) => {
+                const a = (raw ?? {}) as Record<string, unknown>;
+                const text = typeof raw === "string" ? raw : String(a.action ?? "");
+                const prio = typeof a.priority === "number" ? a.priority : null;
+                const risk = a.risk != null ? String(a.risk) : null;
+                return (
+                  <li key={i} className="flex items-start gap-1.5 text-xs text-slate-300">
+                    <span className="mt-0.5 h-1.5 w-1.5 flex-none rounded-full bg-amber-400" />
+                    <span>
+                      {prio != null && <span className="mr-1 text-[10px] font-semibold text-amber-300">P{prio}</span>}
+                      {text}
+                      {risk != null && risk.toLowerCase() !== "low" && (
+                        <span className="ml-1 rounded bg-red-500/10 px-1 py-0.5 text-[9px] uppercase text-red-300 ring-1 ring-red-500/20">{risk}</span>
+                      )}
+                      {a.rationale != null && String(a.rationale).length > 0 && (
+                        <span className="block text-[10px] text-slate-500">{String(a.rationale)}</span>
+                      )}
+                    </span>
+                  </li>
+                );
+              })}
             </ul>
           )}
           {responder?.risk_level != null && (

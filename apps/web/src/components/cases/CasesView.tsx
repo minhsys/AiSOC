@@ -57,13 +57,19 @@ const SEVERITY_CONFIG = {
   low: { label: 'Low', className: 'text-blue-400 bg-blue-500/10 border-blue-500/20' },
 };
 
+// Keyed on the six states `aisoc_cases` permits. It used to name `open`,
+// `in_progress` and `pending` -- all refused by the table's CHECK -- and omit
+// the four a case actually passes through, so every real row fell through to
+// the `?? STATUS_CONFIG.open` fallback below and the list showed every case
+// as "Open" whatever it was.
 const STATUS_CONFIG: Record<
   Case['status'],
   { label: string; className: string; dot: string }
 > = {
-  open: { label: 'Open', className: 'text-gray-300 bg-gray-700/50 border-gray-600/50', dot: 'bg-gray-400' },
-  in_progress: { label: 'In Progress', className: 'text-blue-300 bg-blue-500/10 border-blue-500/20', dot: 'bg-blue-400 animate-pulse' },
-  pending: { label: 'Pending', className: 'text-amber-300 bg-amber-500/10 border-amber-500/20', dot: 'bg-amber-400' },
+  new: { label: 'New', className: 'text-gray-300 bg-gray-700/50 border-gray-600/50', dot: 'bg-gray-400' },
+  triaged: { label: 'Triaged', className: 'text-sky-300 bg-sky-500/10 border-sky-500/20', dot: 'bg-sky-400' },
+  investigating: { label: 'Investigating', className: 'text-blue-300 bg-blue-500/10 border-blue-500/20', dot: 'bg-blue-400 animate-pulse' },
+  contained: { label: 'Contained', className: 'text-amber-300 bg-amber-500/10 border-amber-500/20', dot: 'bg-amber-400' },
   resolved: { label: 'Resolved', className: 'text-green-300 bg-green-500/10 border-green-500/20', dot: 'bg-green-400' },
   closed: { label: 'Closed', className: 'text-gray-500 bg-gray-800/50 border-gray-700/50', dot: 'bg-gray-600' },
 };
@@ -74,7 +80,7 @@ function CaseCard({ c }: { c: Case }) {
   const sev = SEVERITY_CONFIG[c.severity] ?? SEVERITY_CONFIG.medium;
   // Defensive: if normalization missed an unexpected status string, fall back
   // to "open" styling so the entire list never blanks the page.
-  const sts = STATUS_CONFIG[c.status] ?? STATUS_CONFIG.open;
+  const sts = STATUS_CONFIG[c.status] ?? STATUS_CONFIG.new;
   const displayId = c.caseNumber ?? `${c.id ?? ''}`.slice(-6);
   const detailHref = `/cases/${encodeURIComponent(c.caseNumber ?? c.id)}`;
 
@@ -139,28 +145,19 @@ function CaseCard({ c }: { c: Case }) {
 
 type FilterStatus = Case['status'] | 'all';
 
-interface CasesViewProps {
-  /**
-   * Optional pre-fetched cases from a Server Component. When provided, these
-   * are rendered on first paint (no flash of mock data) and SWR revalidates
-   * in the background. When omitted (e.g. dev/local without API access),
-   * deterministic mock data is used so the layout stays stable for SSR.
-   */
-  initialCases?: CasesResponse;
-}
-
-export function CasesView({ initialCases }: CasesViewProps = {}) {
+export function CasesView() {
   const [statusFilter, setStatusFilter] = useState<FilterStatus>('all');
   const [severityFilter, setSeverityFilter] = useState<Case['severity'] | 'all'>('all');
   const [search, setSearch] = useState('');
 
-  // Real server-rendered cases are not sample data, and the gate that
-  // withholds one must not withhold the other. Folding both into a single
-  // `fallback` and passing that through `demoFallback` returned `undefined`
-  // outside the hosted demo *regardless of whether SSR data was supplied* —
-  // so the server fetch in `cases/page.tsx` was made, awaited and discarded
-  // on every non-demo deployment, which is the flash of empty content the
-  // prop exists to prevent.
+  // This view took an `initialCases` prop fed by a server-side fetch in
+  // `cases/page.tsx`. That fetch sent no credential and a build-time tenant
+  // id, so it returned one fixed tenant's cases to whoever loaded the page,
+  // and it only returned anything at all because an uncredentialed request
+  // resolved to a demo administrator. A server render has no session to
+  // borrow, so it was removed rather than repaired; the list now loads
+  // through the credentialed client on mount, under the caller's own
+  // identity.
   const sampleCases = demoFallback<CasesResponse>({
     cases: MOCK_CASES,
     total: MOCK_CASES.length,
@@ -168,14 +165,11 @@ export function CasesView({ initialCases }: CasesViewProps = {}) {
     pageSize: MOCK_CASES.length,
   });
 
-  const { data: casesData, isLoading } = useSWR(
+  const { data: casesData, error, isLoading } = useSWR(
     ['cases', statusFilter, severityFilter],
     () => casesApi.list({ status: statusFilter !== 'all' ? statusFilter : undefined }),
     {
-      fallbackData: initialCases ?? sampleCases,
-      // Supplying `fallbackData` is enough to stop SWR revalidating on mount,
-      // which would turn the SSR snapshot into what the view permanently
-      // shows rather than its first paint.
+      fallbackData: sampleCases,
       revalidateOnMount: true,
     }
   );
@@ -189,13 +183,19 @@ export function CasesView({ initialCases }: CasesViewProps = {}) {
   // The list above already falls back to `[]`; this counted MOCK_CASES, so a
   // failed request rendered an empty table under stat cards claiming 18 cases.
   const allCases = casesData?.cases ?? [];
-  const statCounts = {
-    all: allCases.length,
-    open: allCases.filter(c => c.status === 'open').length,
-    in_progress: allCases.filter(c => c.status === 'in_progress').length,
-    resolved: allCases.filter(c => c.status === 'resolved').length,
-    closed: allCases.filter(c => c.status === 'closed').length,
-  };
+  // Substituting `[]` for MOCK_CASES stopped the fabrication but moved the
+  // defect: the grid sits above the `isLoading` branch, so five confident
+  // zeros rendered on first paint and stayed there when the read failed.
+  const countsUnknown = !casesData;
+  const statCounts: Record<string, number | null> = countsUnknown
+    ? { all: null, new: null, investigating: null, resolved: null, closed: null }
+    : {
+        all: allCases.length,
+        new: allCases.filter(c => c.status === 'new').length,
+        investigating: allCases.filter(c => c.status === 'investigating').length,
+        resolved: allCases.filter(c => c.status === 'resolved').length,
+        closed: allCases.filter(c => c.status === 'closed').length,
+      };
 
   return (
     <div className="space-y-5">
@@ -224,7 +224,14 @@ export function CasesView({ initialCases }: CasesViewProps = {}) {
 
       {/* Stats */}
       <div className="grid grid-cols-5 gap-3">
-        {(['all', 'open', 'in_progress', 'resolved', 'closed'] as const).map((s) => {
+        {/*
+          Five tabs for a five-column grid, naming states that exist. These
+          were `open` and `in_progress`, which `aisoc_cases` forbids, so both
+          counters read zero on every deployment and neither filter returned
+          anything. `triaged` and `contained` show on each row rather than as
+          their own tab.
+        */}
+        {(['all', 'new', 'investigating', 'resolved', 'closed'] as const).map((s) => {
           return (
             <button
               key={s}
@@ -234,7 +241,9 @@ export function CasesView({ initialCases }: CasesViewProps = {}) {
                 statusFilter === s ? 'border-blue-500/50 bg-blue-500/5' : 'border-gray-800/60 hover:border-gray-700'
               )}
             >
-              <p className="text-2xl font-bold text-gray-100">{statCounts[s]}</p>
+              <p className={clsx('text-2xl font-bold', statCounts[s] === null ? 'text-gray-600' : 'text-gray-100')}>
+                {statCounts[s] === null ? '—' : statCounts[s]}
+              </p>
               <p className="text-xs text-gray-500 mt-0.5 capitalize">
                 {s === 'all' ? 'All Cases' : s.replace('_', ' ')}
               </p>
@@ -290,7 +299,17 @@ export function CasesView({ initialCases }: CasesViewProps = {}) {
           <option value="low">Low</option>
         </select>
 
-        <span className="text-xs text-gray-500">{cases.length} cases</span>
+        {/* The same `countsUnknown` the five stat cards above already honour.
+            This one printed `0 cases` beside their five em-dashes, so the
+            page gave two different answers about the same unread list — and
+            the confident one was the wrong one, because a zero reads as
+            measured-and-none rather than not-measured. */}
+        <span
+          className="text-xs text-gray-500"
+          title={countsUnknown ? 'The case service has not answered, so there is no count to show.' : undefined}
+        >
+          {countsUnknown ? '— cases' : `${cases.length} cases`}
+        </span>
       </div>
 
       {/* Cases List */}
@@ -298,6 +317,12 @@ export function CasesView({ initialCases }: CasesViewProps = {}) {
         <div className="flex items-center justify-center h-48">
           <div className="w-6 h-6 border-2 border-blue-500/30 border-t-blue-500 rounded-full animate-spin" />
         </div>
+      ) : error && !casesData ? (
+        <EmptyState
+          icon={EmptyStateIcons.case}
+          title="Could not load cases"
+          description="The case service did not answer. This is not a report that no cases exist — retry, or check the API is reachable."
+        />
       ) : cases.length === 0 ? (
         // WS-F5 — distinguish "filter miss" from "no cases ever". The former
         // gets a "clear filters" CTA; the latter explains what cases are and

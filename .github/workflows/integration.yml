@@ -51,8 +51,14 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: integration-${{ github.ref }}
-  cancel-in-progress: true
+  # Supersede a pull request's own earlier runs; never supersede a push.
+  # Only a branch's head commit needs grading, but every commit that lands
+  # on a protected branch must be graded — and `cancel-in-progress: false`
+  # alone does not achieve that, because a run left *pending* in a busy
+  # group is cancelled when the next one queues. Gate:
+  # scripts/check_workflow_concurrency.py
+  group: integration-${{ github.ref }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -67,11 +73,27 @@ jobs:
     name: What this change touches
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # The push exemption is written here, in the expression, as well as in the
+    # shell below that computes the other half. Two reasons it is worth saying
+    # twice.
+    #
+    # It is the only form a reader — or a gate — can *evaluate*. A promise
+    # made inside a `run:` block is invisible to static analysis, so the
+    # guarantee "every commit that lands is graded in full" could be deleted
+    # from the shell without anything noticing. Spelled here it cannot:
+    # scripts/check_required_check_substance.py resolves this expression
+    # under a simulated push and requires the steps below to come out
+    # unconditional.
+    #
+    # And it is belt and braces. Either mechanism alone is sufficient; losing
+    # both at once takes two edits, in two places, each of which fails that
+    # gate.
     outputs:
-      spine: ${{ steps.areas.outputs.spine }}
-      migrations: ${{ steps.areas.outputs.migrations }}
-      backup: ${{ steps.areas.outputs.backup }}
-      upgrade: ${{ steps.areas.outputs.upgrade }}
+      spine: ${{ github.event_name == 'push' || steps.areas.outputs.spine }}
+      migrations: ${{ github.event_name == 'push' || steps.areas.outputs.migrations }}
+      backup: ${{ github.event_name == 'push' || steps.areas.outputs.backup }}
+      upgrade: ${{ github.event_name == 'push' || steps.areas.outputs.upgrade }}
+      replay: ${{ github.event_name == 'push' || steps.areas.outputs.replay }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -83,13 +105,18 @@ jobs:
           set -euo pipefail
 
           spine_paths='services/ingest/ services/fusion/ services/realtime/ docker-compose.yml scripts/integration/ .github/workflows/integration.yml'
-          migration_paths='services/api/migrations/ services/api/app/scripts/run_migrations.py services/ueba/alembic/ services/api/tests/test_mssp_portfolio_isolation.py tests/isolation/test_postgres_rls.py scripts/check_runtime_db_role.py .github/workflows/integration.yml'
+          migration_paths='services/api/migrations/ services/api/app/scripts/run_migrations.py services/ueba/alembic/ services/api/tests/test_mssp_portfolio_isolation.py tests/isolation/test_postgres_rls.py tests/isolation/test_mssp_rls_live.py scripts/check_runtime_db_role.py .github/workflows/integration.yml'
           # backup_crypt.py was missing from the old filter, and it is where
           # every byte of the AES-256-GCM implementation lives — so a change
           # to the encryption itself did not run the gate that proves the
           # encryption works.
           backup_paths='scripts/backup.sh scripts/restore.sh scripts/backup_crypt.py .github/workflows/integration.yml'
           upgrade_paths='services/api/migrations/ services/api/app/scripts/run_migrations.py .github/workflows/integration.yml'
+          # Replay evaluation spans four services, the CLI and the scorer, and
+          # the only thing that proves the whole chain is the end-to-end run.
+          # Every tree it crosses is listed, because a change to any one of
+          # them can break a link none of the unit suites can see.
+          replay_paths='services/api/app/services/replay_evaluation/ services/api/app/api/v1/endpoints/evaluations.py services/api/app/_vendor/aisoc_benchmark/ services/agents/app/replay/ services/agents/app/api/replay_router.py services/actions/app/api/replay_history_router.py services/actions/app/services/alert_history.py services/connectors/app/api/router.py packages/aisoc-benchmark/ packages/aisoc-cli/ tests/e2e/test_replay_cli_end_to_end.py .github/workflows/integration.yml services/agents/app/workers/fused_alert_consumer.py services/agents/app/replay/shadow.py services/actions/app/clients/ services/ingest/internal/normalizer/ services/agents/app/closure/'
 
           base_ref=""
           if [ -n "${{ github.base_ref }}" ]; then
@@ -100,13 +127,28 @@ jobs:
           fi
 
           emit_all_true() {
-            for area in spine migrations backup upgrade; do
+            for area in spine migrations backup upgrade replay; do
               echo "${area}=true" >> "$GITHUB_OUTPUT"
             done
           }
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "manual dispatch: running every area"
+            emit_all_true
+            exit 0
+          fi
+          # A push runs every area, whatever its own commits happened to touch.
+          #
+          # Filtering by diff is right for a pull request and wrong for the
+          # branch everything lands on. A push to main diffs only the commits
+          # in that push, and squash merges rarely touch services/fusion or
+          # services/ingest, so the spine skipped on almost every merge: its
+          # last real run on main was 4 August. A job that has not executed in
+          # seven weeks is not a gate, it is a green tick from a tree nobody
+          # has since tested — and it hid a broken ClickHouse assertion for the
+          # whole of that window.
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "push to ${{ github.ref_name }}: running every area"
             emit_all_true
             exit 0
           fi
@@ -139,6 +181,7 @@ jobs:
           decide migrations  "${migration_paths}"
           decide backup      "${backup_paths}"
           decide upgrade     "${upgrade_paths}"
+          decide replay      "${replay_paths}"
 
   # ── The spine, end to end ──────────────────────────────────────────────────
   spine:
@@ -183,10 +226,36 @@ jobs:
             printf '\nAISOC_VERSION=%s\n' "${AISOC_VERSION}" >> .env
           fi
 
+          # Copying .env.example leaves every generated secret empty, which is
+          # what `make up` runs ensure_env.py to fix. Without it this job
+          # provisions an environment no real deployment ever has: v12.0.0 made
+          # an empty AISOC_REALTIME_JWT_SECRET fatal — the ticket endpoint
+          # answers 503 and the realtime edge rejects every connection, by
+          # design — and the spine test failed at mint_ws_ticket. It was not
+          # caught on main because this job is path-filtered and had not run on
+          # a commit that triggers it since that release.
+          python3 scripts/ensure_env.py
+          python3 scripts/ensure_env.py --check
+
+          # The two `full`-profile flags live in .env rather than in one step's
+          # env block, so every compose invocation in this job reads the same
+          # configuration. They were set on the boot step alone, and the chaos
+          # steps further down run `docker compose up -d fusion` without them:
+          # compose substitutes the `:-false` default, and the restarted fusion
+          # came back with `lake_writer: false`. Measured on a local stack —
+          # the worker logs `"lake_writer": true` on first boot and
+          # `"lake_writer": false` after the chaos restart. The lake assertion
+          # runs before the chaos steps so it did not notice, which is exactly
+          # what makes it worth fixing now: the configuration under test
+          # changed halfway through the job and nothing said so.
+          printf 'AISOC_LAKE_WRITER_ENABLED=true\nAISOC_GRAPH_ENABLED=true\n' >> .env
+
           token="$(openssl rand -hex 32)"
           echo "::add-mask::$token"
           # Written into .env so compose substitutes it into the ingest and
           # connectors services; exported so the spine test presents it.
+          # Overwrites the value ensure_env just generated, deliberately: the
+          # test has to present the same token the services verify.
           sed -i "s|^AISOC_SERVICE_TOKEN=.*|AISOC_SERVICE_TOKEN=${token}|" .env
           grep -q "^AISOC_SERVICE_TOKEN=${token}$" .env || {
             echo "::error::AISOC_SERVICE_TOKEN was not written into .env — check that .env.example still declares it"
@@ -211,10 +280,10 @@ jobs:
       # The two flags travel with the profile: the lake writer and the graph
       # writer target stores that only exist in `full`, and in CORE they
       # default off rather than retrying against a host that is not there.
+      # They are written into .env by the seed step above so that every
+      # compose invocation in this job — including the chaos restarts — boots
+      # the same configuration this job claims to be testing.
       - name: Boot stack (full profile — this job asserts on the lake)
-        env:
-          AISOC_LAKE_WRITER_ENABLED: "true"
-          AISOC_GRAPH_ENABLED: "true"
         run: docker compose --profile full up -d
 
       # The credential must be refused when it is absent, or the spine test
@@ -250,6 +319,39 @@ jobs:
           fi
           echo "confirmed: /v1/ingest refused an unauthenticated push with $code"
 
+      # The spine test reads the API and mints a realtime ticket. Both used
+      # to succeed with no credential, because an uncredentialed request
+      # resolved to a demo administrator and the compose file defaulted to a
+      # development-class environment. It no longer does, so they need one.
+      #
+      # Obtained by signing in rather than by `mint_api_token`, because this
+      # job deliberately pulls the API image from GHCR `:main` (it builds only
+      # fusion and ingest-worker from PR source) and a command added in this
+      # pull request is not in that image. Logging in works against any API
+      # image, which is the property that matters for a job whose images are
+      # deliberately mixed.
+      - name: Sign in for the credential the spine test needs
+        run: |
+          set -euo pipefail
+          password="ci-$(openssl rand -hex 16)"
+          echo "::add-mask::$password"
+          AISOC_ADMIN_PASSWORD="$password" docker compose run --rm -T \
+            -e AISOC_ADMIN_PASSWORD="$password" api \
+            python -m app.scripts.bootstrap_admin --reset-password >/dev/null 2>&1 || \
+            AISOC_ADMIN_PASSWORD="$password" docker compose run --rm -T \
+              -e AISOC_ADMIN_PASSWORD="$password" api \
+              python -m app.scripts.bootstrap_admin >/dev/null 2>&1
+          token="$(curl -sf -X POST http://localhost:8000/api/v1/auth/login \
+            -H 'Content-Type: application/json' \
+            -d "{\"email\":\"admin@aisoc.internal\",\"password\":\"$password\"}" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')"
+          if [ -z "$token" ]; then
+            echo "::error::could not sign in for an API token"
+            exit 1
+          fi
+          echo "::add-mask::$token"
+          echo "AISOC_API_TOKEN=$token" >> "$GITHUB_ENV"
+
       - name: Run spine test
         run: python3 scripts/integration/spine_test.py
 
@@ -259,16 +361,65 @@ jobs:
       # fusion worker runs a periodic-flush ticker so a low-traffic batch is
       # never stranded). Queryability (count > 0), not exact-once, is the
       # claim — MergeTree does not dedup and a Kafka replay may duplicate.
+      # #985 fixed the credential itself and documents the root cause in the
+      # step below. What this adds is the same distinction *inside* the loop.
+      # The pre-flight probe catches a password that is wrong from the start;
+      # it cannot catch a table or a database that is missing, and the old
+      # `2>/dev/null || echo 0` reported those as an empty lake too. So a
+      # failed query and an empty lake are now different answers at every
+      # attempt, and the faults no amount of retrying can clear stop the loop
+      # and name themselves rather than being counted as a zero thirty times
+      # over and blamed on the raw-events stream.
       - name: Assert events landed in the ClickHouse lake
         run: |
           set -euo pipefail
+          # Read the password out of `.env` rather than hard-coding it. The
+          # literal `clickhouse_dev_secret` was right for as long as
+          # `.env.example` shipped it; `ensure_env.py` now generates a real
+          # one, so the client authenticated against a server that had moved
+          # on. `2>/dev/null || echo 0` then turned "wrong password" into a
+          # row count of zero, and the step reported that the lake was never
+          # populated — naming a subsystem that was working.
+          #
+          # sed, not `grep | cut`: under `set -euo pipefail` a grep that
+          # matches nothing exits 1 and takes the whole step with it, before
+          # the check below can say which variable was missing. `sed -n` is
+          # silent-and-zero on an absent key, so an absent one reaches the
+          # diagnostic that describes it.
+          CH_PASS="$(sed -n 's/^CLICKHOUSE_PASSWORD=//p' .env | tail -1)"
+          [ -n "${CH_PASS}" ] || { echo "::error::CLICKHOUSE_PASSWORD is not set in .env, so compose cannot have set one on the server either"; exit 1; }
+          echo "::add-mask::${CH_PASS}"
+
+          # Prove the client can authenticate before interpreting a count.
+          # A failed query and an empty table must not produce the same number.
+          docker compose exec -T clickhouse clickhouse-client \
+            --user aisoc --password "${CH_PASS}" --query 'SELECT 1' >/dev/null \
+            || { echo "::error::could not authenticate to ClickHouse as aisoc — the lake assertion below could not have run"; \
+                 docker compose logs --tail=40 --no-color clickhouse || true; exit 1; }
+
           ok=""
           for i in $(seq 1 30); do
-            N="$(docker compose exec -T clickhouse clickhouse-client \
-                  --user aisoc --password clickhouse_dev_secret \
-                  --query 'SELECT count() FROM aisoc.raw_events' 2>/dev/null || echo 0)"
-            echo "lake row count (attempt ${i}): ${N}"
-            if [ "${N:-0}" -gt 0 ]; then ok=1; break; fi
+            if N="$(docker compose exec -T clickhouse clickhouse-client \
+                      --user aisoc --password "${CH_PASS}" \
+                      --query 'SELECT count() FROM aisoc.raw_events' 2>/tmp/ch.err)"; then
+              N="$(printf '%s' "${N}" | tr -d '[:space:]')"
+              case "${N}" in
+                ''|*[!0-9]*)
+                  echo "::error::ClickHouse answered with something that is not a row count: '${N}'"
+                  exit 1
+                  ;;
+              esac
+              echo "lake row count (attempt ${i}): ${N}"
+              if [ "${N}" -gt 0 ]; then ok=1; break; fi
+            elif grep -qE 'AUTHENTICATION_FAILED|ACCESS_DENIED|UNKNOWN_TABLE|UNKNOWN_DATABASE' /tmp/ch.err; then
+              echo "::error::ClickHouse refused the query, so the lake was never asked how many rows it holds — this says nothing about the raw-events stream"
+              cat /tmp/ch.err
+              exit 1
+            else
+              # Only "not reachable yet" is worth waiting out: clickhouse has no
+              # healthcheck in compose, so it can still be booting here.
+              echo "clickhouse not answering yet (attempt ${i}): $(tr '\n' ' ' < /tmp/ch.err | tail -c 200)"
+            fi
             sleep 2
           done
           [ -n "${ok}" ] \
@@ -327,12 +478,45 @@ jobs:
             || { echo "::error::graph-at-ingest was not enabled by default"; tail -60 /tmp/ingest-worker.log || true; exit 1; }
 
           echo "── graph has nodes after the spine flowed ──"
+          # Same treatment as the ClickHouse assertion above, for the same
+          # reasons and then one more. This probe hardcoded `neo4j_dev_secret`
+          # too; it still happens to be right only because ensure_env.py does
+          # not generate NEO4J_PASSWORD, so .env leaves it unset and compose
+          # falls back to that default — one entry in the generated table away
+          # from failing exactly as ClickHouse did.
+          #
+          # Worse, `tr -dc '0-9'` deleted every non-digit from whatever came
+          # back, so an authentication error became the empty string and read
+          # as zero nodes — and an error message that happened to contain a
+          # digit would have been read as a node count and passed the gate.
+          # An error must not be able to look like either verdict.
+          # sed for the same reason as above, and it matters more here: .env
+          # carries no NEO4J_PASSWORD line at all, so `grep | cut` exits 1 on
+          # every run and `set -e` would kill this step before it reached the
+          # graph. Measured — that is what the first draft of this fix did.
+          neo4j_password="$(sed -n 's/^NEO4J_PASSWORD=//p' .env | tail -1)"
+          neo4j_password="${neo4j_password:-neo4j_dev_secret}"
+
           ok=""
           for i in $(seq 1 30); do
-            N="$(docker compose exec -T neo4j cypher-shell -u neo4j -p neo4j_dev_secret --format plain \
-                  'MATCH (n) RETURN count(n)' 2>/dev/null | tail -1 | tr -dc '0-9' || echo 0)"
-            echo "graph node count (attempt ${i}): ${N:-0}"
-            if [ "${N:-0}" -gt 0 ]; then ok=1; break; fi
+            if N="$(docker compose exec -T neo4j cypher-shell -u neo4j -p "${neo4j_password}" \
+                      --format plain 'MATCH (n) RETURN count(n)' 2>/tmp/neo4j.err)"; then
+              N="$(printf '%s' "${N}" | tail -1 | tr -d '[:space:]')"
+              case "${N}" in
+                ''|*[!0-9]*)
+                  echo "::error::neo4j answered with something that is not a node count: '${N}'"
+                  exit 1
+                  ;;
+              esac
+              echo "graph node count (attempt ${i}): ${N}"
+              if [ "${N}" -gt 0 ]; then ok=1; break; fi
+            elif grep -qiE 'unauthorized|authentication|credentials' /tmp/neo4j.err; then
+              echo "::error::neo4j refused the query, so the graph was never asked how many nodes it holds — this says nothing about graph-at-ingest"
+              cat /tmp/neo4j.err
+              exit 1
+            else
+              echo "neo4j not answering yet (attempt ${i}): $(tr '\n' ' ' < /tmp/neo4j.err | tail -c 200)"
+            fi
             sleep 2
           done
           [ -n "${ok}" ] || { echo "::error::graph-at-ingest produced no nodes from the live stream"; \
@@ -411,6 +595,106 @@ jobs:
       - name: Teardown
         if: always()
         run: docker compose down -v --remove-orphans
+
+  # ── Replay evaluation, end to end ──────────────────────────────────────────
+  # Phase 1's acceptance bar: the CLI, run against a mocked Splunk ES holding
+  # 200 recorded closed notables, produces a report that reproduces byte for
+  # byte on a second run with the deterministic model path.
+  #
+  # It cannot be a unit test in any service's suite. The chain crosses
+  # `services/actions` (the SIEM credentials and the closed-finding readers),
+  # `services/connectors` (the production `normalize()`), `services/agents`
+  # (triage) and `services/api` (the orchestration, the vault and the tenant
+  # session), and all four package their code as a top-level `app`, so one
+  # process can hold exactly one of them. The harness starts each from the
+  # working tree rather than from a published image, so this proves the code
+  # in the diff.
+  #
+  # The end-to-end run is also what found the defect that made this necessary:
+  # `POST /connectors/{id}/normalize` shipped with no caller and its client
+  # built a URL missing the prefix the connectors service mounts under, so
+  # every request would have 404'd. Three green unit suites could not see it.
+  #
+  # AISOC_REPLAY_E2E_REQUIRED turns an unreachable database into a failure
+  # rather than a skip, for the same reason as the jobs below: a gate that
+  # quietly declines to run looks identical to one that passed.
+  replay-e2e:
+    name: Replay evaluation (CLI to API to report, four services)
+    needs: changes
+    if: needs.changes.outputs.replay == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: aisoc
+          POSTGRES_PASSWORD: aisoc_ci_secret
+          POSTGRES_DB: aisoc
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aisoc"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # The two roles the default deployment ships. The services connect as
+      # aisoc_app, which is DML-only and which the RLS policies apply to;
+      # aisoc is the owner and runs DDL and nothing else. Wiring this job as a
+      # single superuser would measure a role nothing runs as, which is what
+      # `check_runtime_db_role.py` refuses.
+      AISOC_E2E_DATABASE_URL: postgresql+asyncpg://aisoc_app:aisoc_app_ci_secret@localhost:5432/aisoc
+      AISOC_E2E_DATABASE_MIGRATION_URL: postgresql+asyncpg://aisoc:aisoc_ci_secret@localhost:5432/aisoc
+      AISOC_APP_DB_PASSWORD: aisoc_app_ci_secret
+      AISOC_REPLAY_E2E_REQUIRED: '1'
+      ENVIRONMENT: development
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      # The union of what the four services import on this path. Same version
+      # bounds as ci.yml's per-service jobs, because a chain that only works
+      # on a different resolution is not the chain that ships.
+      #
+      # `mcp` is here because `app/main.py` imports the replay router, which
+      # reaches `deep_investigation`, which imports `app.mcp.tools` at module
+      # scope. It was added to the agents service and to ci.yml's agents job
+      # and not to this list, and this job only runs when the replay paths
+      # change, so the first pull request to touch them since was the first to
+      # see the agents service fail to boot at all. That is the stale-green
+      # shape: a path-filtered job cannot report a breaker it never ran for.
+      # Pinned exactly, matching `services/agents/pyproject.toml`.
+      - name: Install the four services' shared dependencies
+        run: >-
+          pip install --quiet
+          pytest pytest-asyncio uvicorn
+          "fastapi>=0.117,<0.142" "pydantic[email]" pydantic-settings "sqlalchemy[asyncio]" asyncpg
+          structlog "PyJWT>=2.8,<3" "cryptography>=46,<51" "passlib[bcrypt]" tenacity pyyaml
+          prometheus-client "opentelemetry-sdk" "opentelemetry-api"
+          "opentelemetry-exporter-otlp-proto-grpc"
+          "opentelemetry-instrumentation-fastapi"
+          "opentelemetry-instrumentation-httpx"
+          "strawberry-graphql[fastapi]"
+          neo4j redis celery httpx aiofiles email-validator
+          "sqlglot>=30,<31" aiosqlite "croniter>=2.0,<7.0"
+          aiokafka apscheduler qdrant-client bcrypt
+          langgraph langchain-core langchain-openai
+          click rich jsonschema
+          "mcp==1.30.0"
+
+      # The CLI is driven as an installed console script would be, off its own
+      # source tree, so the command under test is the one the package ships.
+      - name: Replay evaluation, CLI to API to report
+        run: python -m pytest tests/e2e/test_replay_cli_end_to_end.py -v --tb=short
+
+      - name: Service logs on failure
+        if: failure()
+        run: for log in .e2e-*.log; do echo "::group::${log}"; tail -n 200 "${log}"; echo "::endgroup::"; done
 
   # ── Migration correctness ──────────────────────────────────────────────────
   migrations:
@@ -527,6 +811,81 @@ jobs:
         env:
           POSTGRES_RLS_ISOLATION_REQUIRED: '1'
         run: python -m pytest tests/isolation/test_postgres_rls.py -v --tb=short
+
+      # The suite above discovers tables by looking for a column literally
+      # named `tenant_id`, so every `mssp_*` table was invisible to it — they
+      # name their tenants `parent_tenant_id`/`child_tenant_id` — and six of
+      # the seven carried no policy at all for as long as that blind spot
+      # lasted. They also cannot be asserted the same way: an MSSP row joins
+      # two tenants and *both* must read it, so the shape is "exactly one of
+      # two seeded rows from four directions, and zero from a fifth tenant".
+      - name: MSSP row-level security isolation (live, two portfolios)
+        env:
+          POSTGRES_RLS_ISOLATION_REQUIRED: '1'
+        run: python -m pytest tests/isolation/test_mssp_rls_live.py -v --tb=short
+
+      # `POST /alerts/{id}/explain` logged `audit: failed to compute hash chain`
+      # on every call against a default install, and the audit row was not
+      # merely unchained — it was never written. A best-effort cost INSERT
+      # failed, the caller caught the Python exception, and PostgreSQL had
+      # already aborted the transaction, so every later statement including
+      # the audit INSERT failed too.
+      #
+      # The abort is a PostgreSQL behaviour. SQLite does not have it, so the
+      # unit suite exercises the savepoint mechanics and cannot reproduce the
+      # defect; this runs the reproduction against a real database.
+      # POSTGRES_ABORT_SEMANTICS_REQUIRED turns an unreachable database into a
+      # failure rather than a skip, for the same reason as the job above.
+      - name: A failed optional write does not delete the audit row (live)
+        env:
+          POSTGRES_ABORT_SEMANTICS_REQUIRED: '1'
+          # The suite imports `app.db.best_effort`, and this job runs from the
+          # repository root where `app` is not importable — the API service is
+          # not pip-installed here. Same answer the alembic steps below use.
+          PYTHONPATH: services/api
+        run: python -m pytest services/api/tests/test_audit_chain_survives_a_failed_write.py -v --tb=short
+
+      # Gap-closure Phase 2.3's "Done when", run rather than reasoned about: a
+      # test tenant with 20 shadow decisions cannot enable auto-close, can
+      # once the thresholds are met, and is demoted when injected
+      # disagreements cross the drift threshold.
+      #
+      # It belongs here and nowhere else. The unit suites prove the arithmetic
+      # and prove the statements are built correctly, and between them they
+      # would still miss the failure that matters most: an aggregate that
+      # counts something slightly different from what the evaluator expects.
+      # The SQL and the evaluator agree by convention, and a convention is
+      # what drifts. Only a real Postgres executing the real statement over
+      # real rows closes that. It is also the only place the hash chain over
+      # the transitions can be verified, since it is computed on insert from
+      # the previous row for the same tenant.
+      #
+      # AUTONOMY_PROMOTION_LIVE_REQUIRED turns an unreachable database into a
+      # failure rather than a skip, for the same reason as the two jobs above.
+      - name: Evidence-gated autonomy, end to end (live Postgres)
+        working-directory: services/api
+        env:
+          AUTONOMY_PROMOTION_LIVE_REQUIRED: '1'
+        run: python -m pytest ../../tests/isolation/test_autonomy_promotion_live.py -v --tb=short
+
+      # Gap-closure Phase 6.3. A replay freezes the knowledge base with a
+      # predicate in SQL rather than with a captured set, so every offline
+      # test of that freeze proves the reader *asks* for a cutoff and none of
+      # them proves the store applies one. The statement is PostgreSQL —
+      # to_tsvector, ts_rank, FILTER, LATERAL — so it does not parse in the
+      # API's SQLite suite at all.
+      #
+      # It runs the route's own `triage_retrieval_sql`. The first version of
+      # this test formatted the template with its own copy of the cutoff
+      # clause and kept passing after the clause was deleted from the route,
+      # which is why the builder is a function with two callers.
+      #
+      # KB_CUTOFF_LIVE_REQUIRED turns an unreachable database into a failure
+      # rather than a skip, for the same reason as the jobs above.
+      - name: Knowledge-base retrieval cutoff filters and reports what it refused (live Postgres)
+        env:
+          KB_CUTOFF_LIVE_REQUIRED: '1'
+        run: python -m pytest tests/isolation/test_kb_retrieval_cutoff_live.py -v --tb=short
 
       # The static half of this gate runs on every PR in security.yml. This is
       # the half that can only be answered by a database: the role the

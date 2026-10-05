@@ -114,7 +114,9 @@ SSRF allow-list entry, and is commented as such.
 | Ingest inbox webhooks | **FIXED in v9.0** | Routes mounted only when `DATABASE_DSN` was set and compose never set it; the templates were also not copied into the runtime image, so even with a DSN every template resolved 503. Templates are now `go:embed`-ed into the binary — a directory cannot be missing from an image — and compose sets the DSN. The on-disk path remains as an operator override. |
 | Fuse-time enrichment | **FIXED in v8.1.1** | Defaulted to `http://localhost:8082`, which inside the fusion container is fusion itself. Every enrichment call failed and the failure was swallowed at `DEBUG`. Now points at the `enrichment` service and is a declared `full`-profile capability. |
 | Investigation → response | **PARTIAL, by design** | Nothing automatically dispatches to `services/actions`. Response is copilot-default and human-initiated. This is intentional, but it means the pipeline terminates at triage. |
+| Knowledge base → triage | **FIXED in gap-closure 6.3** | `services/api/app/api/v1/endpoints/knowledge_base.py` has indexed runbooks, playbooks and SOPs since the knowledge base shipped, and nothing in `services/agents` read any of it: a tenant that wrote down how to handle an alert still got a verdict produced in ignorance of the document. Auto-triage now retrieves the matching chunks through `GET /kb/runbooks/for-triage`, fences them as untrusted evidence, and records a citation per chunk that resolves to a document id and chunk index. Point-in-time during a replay by a server-side `as_of` rather than by snapshot capture, and the number of chunks the cutoff refused is published, so a freeze that did nothing is distinguishable from one that did. |
 | `aisoc.alerts.raw` | **EXTERNAL ENTRYPOINT** | Previously recorded as dead because no in-repo producer exists. That is what an entrypoint is: fusion subscribes, schema-validates against the pinned `v1` RawAlert envelope, and dead-letters poison, so an external system can push a vendor alert straight into fusion. Covered by `test_event_schema.py` and `test_consumer_dlq.py`, and documented in `docs/runbooks/kafka-consumer-lag.md`. |
+| `aisoc.threat_intel` (`NEW_IOC`) | **FIXED in Phase 8.1** | `services/threatintel` published a `NEW_IOC` event for every newly-seen indicator and nothing subscribed, so an indicator the CISA KEV catalogue published was never checked against any customer's recorded history. `services/api`'s `retro_hunt_consumer` now consumes it and sweeps each opted-in tenant's lake and connected SIEMs. Two names had to be reconciled: the pipeline's constructor defaults the topic to `threat-intel-events`, which is unreachable because the service's lifespan overrides it with `KAFKA_TOPIC_THREAT_INTEL` (`aisoc.threat_intel`), so a consumer written against the signature would have read an empty topic and stayed healthy. `check_ioc_lake_mapping.py` now compares the producer's setting with the consumer's. Off by default at the deployment level and again per tenant. |
 | `aisoc.vulnerability_matches` | **OPT-IN EXPORT** | Ingest produced it by default and nothing consumed it — fusion gets vulnerability context by calling the enrichment service at fuse time. `VULN_CORREL_ENABLED` now defaults to `false`, so a stock deployment no longer downloads the CISA KEV catalogue at boot to publish into a topic with no reader. It stays available for an external consumer. |
 
 ### Detection
@@ -124,6 +126,7 @@ SSRF allow-list entry, and is commented as such.
 | Rules the engine loads | **2603** | **WORKING** — each was replayed through its real connector and the real engine and watched to fire |
 | Detection rules on disk | **6991** | the rest are imports in languages with **no evaluator** here (Splunk SPL, Chronicle YARA-L, CAR pseudocode); the engine never reads them |
 | YAML files under `detections/` | **7016** | the extra 25 are response playbooks, not rules — see `detections/playbooks/` |
+| Hunts under `hunts/` | **68** | **WORKING** — each replayed against a synthetic scenario and observed to fire, and each graded in the other direction too. Not a claim a hunt fires on a given deployment's telemetry, which depends on whether its connectors emit the fields the hunt names. The negative half of that grading was satisfiable without testing anything until Phase 8.4: a negative drawn from a different log source never fires on any hunt, so `check_hunt_scenarios.py` now requires it to differ from its positive in exactly one indicator field. It found 8 violations on first run, 3 in the 5 hunts that predate the phase |
 
 The gap matters and has been published both ways in the past. `make stats`
 reports the first two numbers side by side so they cannot be conflated again.
@@ -165,6 +168,63 @@ These were not visible from the code alone:
    order rather than as extra map entries, because Go randomises map
    iteration and three entries pointing at one destination would pick a
    different winner per process.
+5. **A deactivated user's API keys kept authenticating.** Not visible from a
+   session test, which is what anyone would have run: `get_current_user`
+   re-reads `users.is_active` per request, so deactivating did stop sessions
+   immediately. `_resolve_api_key` took a different path. It looked up the
+   owning user with `is_active == True` and, when that returned nothing, fell
+   through to a generic `api_service` role instead of refusing, so every key
+   a departing principal had minted for themselves went on working
+   indefinitely. Fixed in Phase 13.1, alongside a session-revocation
+   timestamp checked against a new `iat` claim, because the `is_active` check
+   is reversible: re-enabling an account resurrected any token minted before
+   the deactivation that had not yet expired.
+
+---
+
+## Identity and provisioning
+
+**SCIM 2.0 — WORKING, no external dependency to verify against in CI.**
+`/scim/v2` on the API service serves Users, Groups, ServiceProviderConfig,
+ResourceTypes and Schemas, authenticated by a per-tenant bearer token held as
+a SHA-256 digest. What is proven in CI is that the handlers behave correctly
+against request bodies transcribed from Okta and Microsoft Entra ID
+provisioning, including the five shapes where the two providers disagree.
+
+What that does **not** prove, and is worth stating plainly: no live identity
+provider has been pointed at this build. The payloads are synthetic
+reproductions of documented request shapes, not captures from a running
+integration, so a provider quirk outside those five would not be caught here.
+The honest claim is that the implementation handles both dialects as
+documented, not that either vendor's connector has been run against it end to
+end.
+
+OIDC (`services/api/app/auth/oidc.py`, PKCE on by default) and SAML
+(`services/api/app/auth/saml.py`) handle sign-in and predate this work.
+Provisioning and sign-in are separate concerns: SCIM creates and removes the
+principal, OIDC or SAML authenticates them.
+
+---
+
+## White-label and usage metering
+
+**White-label — WORKING on two of five surfaces, and the tracker says which.**
+Console and the executive digest in HTML and PDF carry a white-labelled
+organisation's product name, palette and logo, asserted in CI. Email approvals
+and ChatOps resolve the same `sender_name` from the same resolver and have **no
+end-to-end test**, so they are recorded as unverified rather than working. The
+plan lists five surfaces and its own acceptance names two; marking the item
+done because a field resolves would be the failure this audit exists to catch.
+
+Brand assets are held as bytes in Postgres and served from this deployment.
+Nothing is fetched from a third-party URL, in the console or in the
+server-side PDF renderer. Uploaded SVGs are rewritten against an allowlist and
+a document declaring a DTD or an entity is refused before parsing.
+
+**Usage metering — WORKING, and it equals the rows by construction.** Ten
+meters, each a query against the table holding the evidence, with no counter
+table to drift. `events_ingested` is the one meter with no source on a CORE
+deployment and reports "not measured" with its reason rather than zero.
 
 ---
 
@@ -199,7 +259,7 @@ unless `AISOC_ALLOW_SEED=1`.
 
 | Component | Status |
 |---|---|
-| `services/demo-producer` | **DEMO-ONLY**. Emits randomised vendor events into the real ingest API. Not in any compose profile; invoked manually. |
+| `services/demo-producer` | **DEMO-ONLY** in its default mode: randomised vendor events into the real ingest API, not in any compose profile, invoked manually. `--load` is **WORKING** and is not demo data: it is the generator `scripts/perf/load_harness.py` drives, and its events are attributable per event so the harness can time each one to the alert it became. |
 | `seed_demo.py` | **DEMO-ONLY**. 15 hand-written incidents plus randomised alerts. |
 | `services/agents/app/api/hunt_search.py` | **DEMO-ONLY** but honest — returns `source: "sample"` and a notice saying it does not query the lake. |
 | `services/agents/app/api/copilot.py` | **PARTIAL** — real LLM path with a key; returns `source: "template"` and a notice without one. |
@@ -215,8 +275,36 @@ Stated rather than guessed:
   available. The deterministic offline path was exercised. Every published
   benchmark row is labelled `substrate: true` and must not be read as live
   agent accuracy.
-- **Kubernetes/Helm deployment** was not exercised in this audit. The chart
-  renders; whether it runs was not tested here.
+- **Kubernetes/Helm deployment: partly exercised on 2026-09-27, and only on
+  kind.** The chart was installed on a three-node kind cluster (Kubernetes
+  v1.34.0) on an Apple M5 Max with 8 CPUs and 15.6 GiB allocated to the
+  container runtime, using `values-ha.yaml` plus `ci/kind-values.yaml`. Three
+  Kafka brokers formed a KRaft quorum, two ingest and two fusion replicas came
+  up, the migration chain applied, 10,000 events pushed through the public
+  ingest endpoint all became alert rows, and a fusion pod destroyed mid-stream
+  cost neither a lost event nor a duplicated one. Figures:
+  `apps/docs/docs/operations/performance.md`.
+
+  **UNVERIFIED, in the same breath:** no managed Kubernetes service (EKS, GKE,
+  AKS) and no bare-metal cluster has been tried; kind nodes are containers on
+  one kernel, so this is not multi-machine evidence; no ingress controller or
+  cloud load balancer was in front of the release; PersistentVolumeClaims were
+  switched off for the run; NetworkPolicy enforcement needs a CNI that
+  implements it and was not exercised; managed PostgreSQL and ClickHouse were
+  not used, the run pointed at single ephemeral pods; and the longest run was
+  a few minutes, so nothing is known about sustained operation, compaction,
+  log growth or rolling upgrades. **"The chart installs and survives a pod
+  kill on kind" is not "Kubernetes is production-ready."**
+
+  Four defects were found by running it, none of which rendering could have
+  shown: `KAFKA_BOOTSTRAP_SERVERS` was set on the UEBA deployment and nowhere
+  else, so ingest and fusion defaulted to `localhost:9092` and the spine was
+  installed but not connected; the first batch after an install was lost to
+  Kafka auto-creation; readiness probes pointed at `/health`, which answers
+  200 regardless of whether the consumer is attached, instead of `/readyz`,
+  which reports the subscription; and `ueba.enabled` had no reader, so
+  switching UEBA off still scheduled it. All four are fixed and gated by
+  `helm.yml`.
 - **Whether migrations 050–053 apply** on an existing volume was not traced.
   Compose mounts `services/api/migrations` as `docker-entrypoint-initdb.d`,
   which runs only on a *fresh* volume. On a clean install the schema is
@@ -227,7 +315,7 @@ Stated rather than guessed:
 ## Reproducing this audit
 
 ```bash
-make up          # CORE profile: 14 long-running services (+ a one-shot model pull)
+make up          # CORE profile: 16 long-running services (+ a one-shot model pull)
 make doctor      # every dependency probed, not just "running"
 make smoke       # one real event through the real pipeline
 make stats       # recount every published figure from the tree

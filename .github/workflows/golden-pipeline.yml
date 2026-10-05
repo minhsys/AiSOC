@@ -23,8 +23,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: golden-pipeline-${{ github.ref }}
-  cancel-in-progress: true
+  # Supersede a pull request's own earlier runs; never supersede a push.
+  # Only a branch's head commit needs grading, but every commit that lands
+  # on a protected branch must be graded — and `cancel-in-progress: false`
+  # alone does not achieve that, because a run left *pending* in a busy
+  # group is cancelled when the next one queues. Gate:
+  # scripts/check_workflow_concurrency.py
+  group: golden-pipeline-${{ github.ref }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   golden:
@@ -50,6 +56,20 @@ jobs:
           echo "before: $(df -h / | awk 'NR==2{print $4}') free"
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
           echo "after:  $(df -h / | awk 'NR==2{print $4}') free"
+
+      - name: Generate the secrets the stack needs
+        run: |
+          set -euo pipefail
+          cp .env.example .env
+          # `make up` runs this, and the stack now needs it to boot: with
+          # ENVIRONMENT defaulting to production, ingest refuses to start
+          # without a JWT_SECRET and the API refuses without METRICS_TOKEN.
+          # That is the services being right — ingest previously started on a
+          # literal published in this repository — but a workflow that copies
+          # `.env.example` and stops has provisioned an environment no real
+          # deployment ever has.
+          python3 scripts/ensure_env.py
+          python3 scripts/ensure_env.py --check
 
       - name: Build the CORE images from this commit
         run: |
@@ -158,6 +178,24 @@ jobs:
             exit 1
           fi
           echo "confirmed: a second mint reused the existing push token"
+
+      # The alert reads need a credential too. They used to succeed with none,
+      # because an uncredentialed request resolved to a demo administrator in
+      # a development-class environment and every documented path produced
+      # one — so this workflow was reading the API as an anonymous admin
+      # without anybody having decided that. Minted through the shipped
+      # command, for the same reason the ingest token is.
+      - name: Mint the API credential the alert reads need
+        run: |
+          set -euo pipefail
+          docker compose run --rm -T api python -m app.scripts.bootstrap_admin >/dev/null 2>&1 || true
+          token="$(docker compose run --rm -T api python -m app.scripts.mint_api_token --quiet)"
+          if [ -z "$token" ]; then
+            echo "::error::mint_api_token printed nothing"
+            exit 1
+          fi
+          echo "::add-mask::$token"
+          echo "AISOC_API_TOKEN=$token" >> "$GITHUB_ENV"
 
       - name: Golden pipeline — one real event end to end
         run: python3 tests/e2e/golden_pipeline/run_golden_pipeline.py

@@ -46,6 +46,7 @@ import { Skeleton } from '@/components/ui/Skeleton';
 import { ErrorState } from '@/components/ui/ErrorState';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { AutonomyPolicyPanel } from '@/components/settings/AutonomyPolicy';
+import { RetroHuntSettingsPanel } from './RetroHuntSettings';
 import { useTheme, type ThemePreference } from '@/components/theme/ThemeProvider';
 import { canUseDemoData } from '@/lib/demoFallback';
 
@@ -402,7 +403,12 @@ export function SettingsView() {
               {tab === 'profile' && <ProfilePanel />}
               {tab === 'workspace' && <WorkspacePanel />}
               {tab === 'integrations' && <IntegrationsPanel />}
-              {tab === 'autonomy' && <AutonomyPolicyPanel />}
+              {tab === 'autonomy' && (
+                <div className="space-y-10">
+                  <AutonomyPolicyPanel />
+                  <RetroHuntSettingsPanel />
+                </div>
+              )}
               {tab === 'api-keys' && <ApiKeysPanel />}
               {tab === 'notifications' && <NotificationsPanel />}
               {tab === 'appearance' && <AppearancePanel />}
@@ -1817,6 +1823,7 @@ function BYOKCard({
 }) {
   const [editing, setEditing] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [testing, setTesting] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
   const [provider, setProvider] = useState<LlmWritableProvider>('openai');
@@ -1901,6 +1908,29 @@ function BYOKCard({
     setEditing(false);
   };
 
+  // One real call with the saved credential. Reports four outcomes, and
+  // `unverified` is deliberately not an error: an air-gapped deployment
+  // refusing the egress is the posture working, and a red toast there would
+  // send an operator to rotate a key that is fine.
+  const onTestClick = async () => {
+    setTesting(true);
+    try {
+      const result = await deploymentApi.testLlmCredential();
+      const where = result.model ? ` (${result.model})` : '';
+      if (result.outcome === 'ok') {
+        toast.success(`${result.detail}${where}`);
+      } else if (result.outcome === 'unverified') {
+        toast(result.detail);
+      } else {
+        toast.error(result.detail);
+      }
+    } catch (err) {
+      toast.error(extractApiDetail(err, 'Could not test the credential.'));
+    } finally {
+      setTesting(false);
+    }
+  };
+
   const onDeleteClick = async () => {
     if (!confirmingDelete) {
       setConfirmingDelete(true);
@@ -1963,6 +1993,14 @@ function BYOKCard({
             </p>
           </div>
           <div className="flex shrink-0 gap-2">
+            <button
+              type="button"
+              onClick={onTestClick}
+              disabled={testing || submitting}
+              className="rounded-md border border-gray-700 bg-gray-900 px-3 py-1.5 text-xs font-medium text-gray-200 hover:bg-gray-800 disabled:opacity-50"
+            >
+              {testing ? 'Testing…' : 'Test'}
+            </button>
             <button
               type="button"
               onClick={() => setEditing(true)}

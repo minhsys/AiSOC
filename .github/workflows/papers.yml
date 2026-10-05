@@ -26,6 +26,11 @@ on:
     branches: [main]
     paths:
       - "apps/web/content/papers/**.md"
+      # Papers embed console captures, so refreshing a screenshot
+      # changes the rendered PDF while leaving every other path here
+      # untouched — the published PDF would keep showing the old
+      # console and nothing would say so.
+      - "apps/web/public/screenshots/**"
       - "apps/web/public/papers/render-manifest.json"
       - "scripts/render_white_paper.py"
       - "Makefile"
@@ -33,6 +38,11 @@ on:
   pull_request:
     paths:
       - "apps/web/content/papers/**.md"
+      # Papers embed console captures, so refreshing a screenshot
+      # changes the rendered PDF while leaving every other path here
+      # untouched — the published PDF would keep showing the old
+      # console and nothing would say so.
+      - "apps/web/public/screenshots/**"
       - "apps/web/public/papers/render-manifest.json"
       - "scripts/render_white_paper.py"
       - "Makefile"
@@ -43,8 +53,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: papers-${{ github.ref }}
-  cancel-in-progress: true
+  # Supersede a pull request's own earlier runs; never supersede a push.
+  # Only a branch's head commit needs grading, but every commit that lands
+  # on a protected branch must be graded — and `cancel-in-progress: false`
+  # alone does not achieve that, because a run left *pending* in a busy
+  # group is cancelled when the next one queues. Gate:
+  # scripts/check_workflow_concurrency.py
+  group: papers-${{ github.ref }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   render:

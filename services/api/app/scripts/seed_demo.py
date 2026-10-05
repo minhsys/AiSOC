@@ -298,7 +298,7 @@ _REALISTIC_INCIDENTS: list[dict] = [
             "being isolated."
         ),
         "severity": "critical",
-        "status": "in_progress",
+        "status": "investigating",
         "host": "WIN-FIN-DB01",
         "user": "svc-backup@example.com",
         "src_ip": "203.0.113.42",
@@ -507,7 +507,7 @@ _REALISTIC_INCIDENTS: list[dict] = [
             "login + MFA-push approval from a never-seen device."
         ),
         "severity": "high",
-        "status": "in_progress",
+        "status": "investigating",
         "host": "WIN-HR-DESKTOP",
         "user": "alice@example.com",
         "src_ip": "45.155.205.88",
@@ -576,7 +576,7 @@ _REALISTIC_INCIDENTS: list[dict] = [
             "from a non-corp IP. Key has been disabled."
         ),
         "severity": "high",
-        "status": "in_progress",
+        "status": "investigating",
         "host": "ec2-build-worker-09",
         "user": "iam-user/build-runner",
         "src_ip": "104.244.42.193",
@@ -690,7 +690,7 @@ _REALISTIC_INCIDENTS: list[dict] = [
             "was unpublished from the registry 18 minutes after install."
         ),
         "severity": "high",
-        "status": "in_progress",
+        "status": "investigating",
         "host": "LIN-K8S-NODE-03",
         "user": "ci-runner",
         "src_ip": "5.39.222.7",
@@ -759,7 +759,7 @@ _REALISTIC_INCIDENTS: list[dict] = [
             "with TXT-record payloads to `azonly-cdn.io`."
         ),
         "severity": "critical",
-        "status": "in_progress",
+        "status": "investigating",
         "host": "WIN-DEVOPS-LT",
         "user": "carol@example.com",
         "src_ip": "10.0.5.27",
@@ -840,7 +840,7 @@ _REALISTIC_INCIDENTS: list[dict] = [
             "rejected the call but the attempt is high-confidence."
         ),
         "severity": "critical",
-        "status": "open",
+        "status": "new",
         "host": "WIN-DEVOPS-LT",
         "user": "carol@example.com",
         "src_ip": "10.0.5.27",
@@ -937,7 +937,7 @@ _REALISTIC_INCIDENTS: list[dict] = [
             "on the node. Detected by Falco, validated via kube-audit + auditd."
         ),
         "severity": "critical",
-        "status": "in_progress",
+        "status": "investigating",
         "host": "LIN-K8S-NODE-03",
         "user": "system:serviceaccount:dev:builder-sa",
         "src_ip": "10.0.4.91",
@@ -998,7 +998,7 @@ _REALISTIC_INCIDENTS: list[dict] = [
             "180 MB. Matches dnscat2 behaviour."
         ),
         "severity": "high",
-        "status": "in_progress",
+        "status": "investigating",
         "host": "MAC-SARAH-LT",
         "user": "sarah@example.com",
         "src_ip": "10.0.6.19",
@@ -1133,7 +1133,7 @@ _REALISTIC_INCIDENTS: list[dict] = [
             "approved on the 21st prompt, granting access from a Russia-based IP."
         ),
         "severity": "high",
-        "status": "in_progress",
+        "status": "investigating",
         "host": "MAC-EVE-LT",
         "user": "eve@example.com",
         "src_ip": "5.188.86.69",
@@ -1195,16 +1195,16 @@ _REALISTIC_INCIDENTS: list[dict] = [
             "connection to DC01. Host has been isolated."
         ),
         "severity": "high",
-        "status": "open",
+        "status": "new",
         "host": "WIN-PROD-WEB02",
         "user": "administrator",
-        "src_ip": "185.220.101.6",
+        "src_ip": "198.51.100.6",
         "tactic_ids": ["TA0006", "TA0008"],
         "technique_ids": ["T1110.001", "T1021.001"],
         "tags": ["brute-force", "rdp", "tor", "lateral"],
         "alerts": [
             {
-                "title": "WinEventLog: 1,247 failed 4625 logons from 185.220.101.6",
+                "title": "WinEventLog: 1,247 failed 4625 logons from 198.51.100.6",
                 "severity": "high",
                 "source": "Windows Security",
                 "category": "siem",
@@ -1216,7 +1216,7 @@ _REALISTIC_INCIDENTS: list[dict] = [
                     "FailureReason": "Unknown user name or bad password.",
                     "TargetUserName": "administrator",
                     "WorkstationName": "kali",
-                    "IpAddress": "185.220.101.6",
+                    "IpAddress": "198.51.100.6",
                     "LogonType": 10,
                     "failure_count": 1_247,
                 },
@@ -1233,7 +1233,7 @@ _REALISTIC_INCIDENTS: list[dict] = [
                     "EventCode": 4624,
                     "LogonType": 10,
                     "TargetUserName": "administrator",
-                    "IpAddress": "185.220.101.6",
+                    "IpAddress": "198.51.100.6",
                     "AuthenticationPackageName": "Negotiate",
                 },
             },
@@ -2025,7 +2025,7 @@ async def _seed_realistic_incidents(session, tenant: Tenant) -> tuple[int, int, 
                     "incident_key": incident["key"],
                     "alerts": [str(a.id) for a in incident_alerts],
                 },
-                is_automated=True,
+                actor_type="system",
                 created_at=case_when,
             )
         )
@@ -2047,7 +2047,7 @@ async def _seed_realistic_incidents(session, tenant: Tenant) -> tuple[int, int, 
                         "actor": "playbook-engine",
                         "playbook_run": playbook_run,
                     },
-                    is_automated=True,
+                    actor_type="system",
                     created_at=case_when + timedelta(minutes=2),
                 )
             )
@@ -2355,7 +2355,7 @@ async def _seed_alerts_and_cases(session, tenant: Tenant, *, alert_count: int = 
                 event_type="created",
                 content="Case opened by AI alert fusion service.",
                 event_metadata={"actor": "system", "alerts": case.alert_ids},
-                is_automated=True,
+                actor_type="system",
                 created_at=case.created_at,
             )
         )
@@ -2363,9 +2363,8 @@ async def _seed_alerts_and_cases(session, tenant: Tenant, *, alert_count: int = 
             CaseTask(
                 case_id=case.id,
                 tenant_id=case.tenant_id,
-                title="Triage and contain",
-                description="Confirm scope, isolate affected hosts, capture artifacts.",
-                status="pending",
+                title="Triage and contain: confirm scope, isolate affected hosts, capture artifacts",
+                status="todo",
                 created_at=case.created_at,
             )
         )
@@ -2541,7 +2540,7 @@ _DEMO_QUICK_INCIDENTS: list[dict] = [
             "forwarding rule that hides external mail."
         ),
         "severity": "high",
-        "status": "in_progress",
+        "status": "investigating",
         "host": "MAC-ALICE-LT",
         "user": "alice@example.com",
         "src_ip": "185.199.108.153",
@@ -2632,7 +2631,7 @@ _DEMO_QUICK_INCIDENTS: list[dict] = [
             "from `corp-hr-backups`. Key has not yet been disabled."
         ),
         "severity": "critical",
-        "status": "in_progress",
+        "status": "investigating",
         "host": "ec2-build-worker-09",
         "user": "iam-user/build-runner",
         "src_ip": "104.244.42.193",
@@ -2722,7 +2721,7 @@ _DEMO_QUICK_INCIDENTS: list[dict] = [
             "account. DLP egress proxy blocked the second batch."
         ),
         "severity": "high",
-        "status": "in_progress",
+        "status": "investigating",
         "host": "WIN-HR-DESKTOP",
         "user": "dave@example.com",
         "src_ip": "10.42.7.119",
@@ -2808,7 +2807,7 @@ _DEMO_QUICK_INCIDENTS: list[dict] = [
             "is queued."
         ),
         "severity": "critical",
-        "status": "in_progress",
+        "status": "investigating",
         "host": "WIN-FIN-DB01",
         "user": "svc-backup@example.com",
         "src_ip": "10.42.1.87",
@@ -3148,7 +3147,7 @@ async def _seed_demo_quick(
                     "connector_sources": incident["connector_sources"],
                     "alerts": [str(a.id) for a in incident_alerts],
                 },
-                is_automated=True,
+                actor_type="system",
                 created_at=case_when,
             )
         )
@@ -3214,7 +3213,7 @@ _REANCHOR_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
             "snoozed_until",
         ),
     ),
-    ("cases", ("created_at", "updated_at", "closed_at", "assigned_at", "sla_deadline")),
+    ("aisoc_cases", ("created_at", "updated_at", "closed_at", "assigned_at", "sla_deadline")),
     ("case_tasks", ("created_at", "due_date", "completed_at")),
     ("case_timeline", ("created_at",)),
     ("remediation_gate_log", ("created_at",)),
